@@ -1,0 +1,38 @@
+# Container image for the WOW2 revival server.
+#
+#   podman build -t wow2-server -f packaging/Containerfile .
+#   podman run --rm \
+#       -p 3074:3074/tcp -p 3074:3074/udp \
+#       -v ./wow2-data:/data:Z \
+#       -v ./wow2-server.toml:/etc/wow2-server.toml:ro \
+#       wow2-server
+#
+# PUBLISH BOTH PROTOCOLS ON 3074. The game uses TCP for auth and the lobby and
+# UDP for bdDiscovery and the NAT introduction, on the same port number.
+# Publishing only TCP gives you a sign-in that works and a game browser that
+# never finds anything -- which reads like a matchmaking bug and is not one.
+
+FROM python:3.12-slim
+
+# rhash is not optional. Tiger192 is the hash the entire auth path is built on
+# and no Python stdlib provides it, so the server shells out to this binary.
+# Without it every login proof is wrong and nobody can sign in.
+RUN apt-get update \
+ && apt-get install -y --no-install-recommends rhash \
+ && rm -rf /var/lib/apt/lists/*
+
+WORKDIR /src
+COPY pyproject.toml README.md ./
+COPY tools/ ./tools/
+RUN pip install --no-cache-dir .
+
+RUN useradd --system --home /data --create-home wow2
+USER wow2
+WORKDIR /data
+
+ENV WOW2_CONFIG=/etc/wow2-server.toml \
+    WOW2_DATA_DIR=/data \
+    PYTHONUNBUFFERED=1
+
+EXPOSE 3074/tcp 3074/udp
+ENTRYPOINT ["wow2-server"]

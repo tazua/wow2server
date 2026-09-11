@@ -1,0 +1,17 @@
+# Runtime state: session logs, the JSON databases the server re-reads per
+# request, uploaded blobs. None of it is source.
+/wow2-data/
+/capture/
+
+# An operator's real config. The committed file is wow2-server.example.toml.
+/wow2-server.toml
+
+# Build output
+/build/
+/dist/
+/*.egg-info/
+
+# Python
+__pycache__/
+*.py[cod]
+/.venv/

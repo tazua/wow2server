@@ -1,0 +1,56 @@
+# systemd unit for the WOW2 revival server.
+#
+#   sudo useradd --system --home /var/lib/wow2-server --create-home wow2
+#   sudo cp wow2-server.example.toml /etc/wow2-server.toml    # and EDIT it
+#   sudo cp packaging/wow2-server.service /etc/systemd/system/
+#   sudo systemctl enable --now wow2-server
+#
+# The game talks to ONE port for everything -- auth TCP, the LSG TCP connection
+# and bdDiscovery UDP -- and it is 3074. Above 1024, so this does not run as root.
+#
+# EDIT /etc/wow2-server.toml FIRST. The built-in default
+# `accounts.shared_password_fallback = true` is a DEVELOPMENT default: it lets an
+# account with no stored credential sign in on a shared password. A deployment
+# wants it false.
+
+[Unit]
+Description=WOW2 revival server (Demonware auth/lobby for Worms Open Warfare 2)
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=wow2
+Group=wow2
+WorkingDirectory=/var/lib/wow2-server
+Environment=WOW2_CONFIG=/etc/wow2-server.toml
+ExecStart=/usr/local/bin/wow2-server
+Restart=on-failure
+RestartSec=5
+
+# The server writes JSON databases and uploaded blobs under storage.data_dir, and
+# nothing else. Everything below is what it does not need.
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=strict
+ProtectHome=true
+ReadWritePaths=/var/lib/wow2-server
+ProtectKernelTunables=true
+ProtectKernelModules=true
+ProtectControlGroups=true
+RestrictAddressFamilies=AF_INET AF_INET6 AF_UNIX
+RestrictNamespaces=true
+LockPersonality=true
+
+# NOTE: no MemoryDenyWriteExecute -- CPython's own allocator trips it on some
+# builds, and a unit that refuses to start is worse than one hardening flag short.
+SystemCallFilter=@system-service
+SystemCallErrorNumber=EPERM
+
+# `rhash` is a RUNTIME dependency, not a convenience. Tiger192 is the hash this
+# whole auth path is built on and no Python stdlib provides it, so the server
+# shells out to the binary. Without it every login proof is wrong and nobody can
+# sign in.   Debian/Ubuntu: apt install rhash     Arch: pacman -S rhash
+
+[Install]
+WantedBy=multi-user.target

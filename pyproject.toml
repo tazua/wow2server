@@ -1,0 +1,45 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "wow2-server"
+version = "0.1.0"
+description = "Reimplementation of the Demonware auth/lobby servers for Worms Open Warfare 2 (PSP)"
+readme = "README.md"
+requires-python = ">=3.11"          # tomllib
+license = "MIT"
+authors = [{ name = "tazua" }]
+keywords = ["demonware", "psp", "worms", "game-server", "reverse-engineering"]
+classifiers = [
+    "Programming Language :: Python :: 3",
+    "Topic :: Games/Entertainment",
+    "Topic :: System :: Networking",
+]
+
+# The SERVER's dependencies only. The rig tooling needs more -- websocket-client
+# to drive PPSSPP's debugger and opencv for the screen observer -- and a
+# deployment has no use for either, so they are an extra rather than a
+# requirement. `rhash` is a system binary (tools/authserver.py shells out to it
+# for Tiger192, which no Python stdlib provides).
+dependencies = ["pycryptodome>=3.19"]
+
+[project.urls]
+Homepage = "https://github.com/tazua/wow2server"
+
+[project.scripts]
+wow2-server = "wow2.authserver:cli"
+
+# The modules live in tools/ and import each other flatly (each one puts its own
+# directory on sys.path first), so they install as a package directory without
+# any rewriting: `wow2.authserver` inserts the installed `wow2/` directory and
+# `import bdproto` resolves inside it exactly as it does in the source tree.
+[tool.setuptools]
+# `packages` must be EXPLICIT here. Auto-discovery finds nothing, because there
+# is no `wow2/` directory to find -- the mapping is what creates it, and find
+# runs before the mapping applies. The wheel built cleanly and shipped only the
+# entry point, which fails at import rather than at install.
+packages = ["wow2"]
+
+[tool.setuptools.package-data]
+wow2 = ["nsdns-names"]

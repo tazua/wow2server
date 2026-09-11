@@ -1,0 +1,101 @@
+# WOW2 server -- deployment configuration.
+#
+# Copy to `wow2-server.toml` (next to this file, or anywhere and point
+# WOW2_CONFIG at it) and edit. Every value below is the built-in default, so an
+# empty file and no file at all behave identically.
+#
+#   WOW2_CONFIG=/etc/wow2-server.toml wow2-server
+#
+# Precedence: environment > this file > built-in defaults. The environment wins
+# so that existing WOW2_* invocations keep working unchanged.
+#
+# ONLY DEPLOYMENT SETTINGS LIVE HERE. The ~40 other WOW2_* switches
+# (WOW2_NO_PUSH, WOW2_LSG_HOLD, WOW2_FRIEND_ROWS, ...) are research tools for
+# bisecting a protocol failure -- they are deliberately NOT config, because a
+# config file invites someone to deploy with one of them set.
+#
+# TOML has no bare words: every string needs quotes. `level = info` is a parse
+# error and the server refuses to start rather than quietly using defaults you
+# did not choose.
+
+[server]
+# The game resolves *.demonware.net to this machine and talks to ONE port: auth
+# TCP, the LSG TCP connection and bdDiscovery UDP all live on it.
+bind = "0.0.0.0"
+port = 3074
+
+[accounts]
+# When an account has no stored credential, accept the shared password.
+#
+# TRUE is the development default and is what lets the eight-console rig sign in
+# with an empty credential store -- every console's name is known, so its login
+# handle resolves, and the shared password covers the rest.
+#
+# A DEPLOYMENT SHOULD SET THIS FALSE. With it false, only an account that
+# actually created itself (auth 0x00, which stores Tiger192(password)) can sign
+# in, and an unknown handle is answered with a key it cannot possibly hold.
+shared_password_fallback = true
+
+# How to answer create-account. "success" creates the account; "name_exists"
+# answers 707, which makes the client log in instead (the returning-user
+# experiment from Phase 11).
+create_mode = "success"
+
+[logging]
+# A full hexdump of every message. This is how the protocol was reversed and it
+# is the single biggest reason a session log grows without bound -- turn it off
+# for anything long-running.
+hexdumps = true
+
+# "debug" logs every read, every message body and every reply. "info" keeps one
+# line per RPC and drops the per-packet noise, which is most of the volume.
+level = "debug"
+
+[nat]
+# Carry the peer session through the server instead of relying on a NAT punch.
+#
+# FALSE is right on a LAN and on any network where hole punching works: the
+# direct path is free and always faster. Measured (Phase 35), the introduction
+# broker relays correctly in both directions and CARRIER-GRADE NAT DEFEATS IT
+# ANYWAY, because each console's mapping was created by talking to the SERVER
+# while the punch arrives from the OTHER CONSOLE.
+#
+# TRUE gives every console a UDP socket here and tells it that socket is its own
+# public address, so both consoles only ever exchange packets with us. That works
+# for every NAT type including symmetric, because every packet a console receives
+# comes from an address it has itself sent to. A full match has been played
+# through it (Phase 36).
+#
+# IT IS ALL-OR-NOTHING per deployment, not per session: the address a console
+# publishes is decided when it signs in, before anyone knows whether a punch
+# would have worked.
+relay = false
+
+# One port per console, so 32 is 16 simultaneous two-player matches.
+#
+# ***OPEN THESE IN THE FIREWALL.*** They are as necessary as the main port and
+# nothing warns you: sign-in, hosting and the browser all work without them and
+# only the join fails. The server logs the range at startup.
+relay_port_base = 40000
+relay_ports = 32
+
+# Seconds a mailbox may sit idle before it can be handed to someone else. Only
+# consulted when the pool is full.
+relay_idle_timeout = 600
+
+# What to tell a console the server's address is. Empty means "ask the routing
+# table", which is right on the rig and on a VPS with one address. Set it when
+# the server is behind its own NAT, or has several addresses and the kernel
+# would pick the wrong one -- a console handed an address it cannot dial fails
+# at the join with nothing in the log to say why.
+# public_address = "203.0.113.10"
+
+[storage]
+# Where the JSON stores (stats, profiles, friends, teams, accounts) and uploaded
+# blobs live. The server re-reads the JSON stores per request on purpose: you can
+# edit a leaderboard with the server running and see it on the next screen.
+#
+# Left commented out because the default already does the right thing in both
+# places: <repo>/capture when run from a source checkout, ./wow2-data when
+# installed. Set it if you want the data somewhere else, such as /var/lib.
+# data_dir = "/var/lib/wow2-server"

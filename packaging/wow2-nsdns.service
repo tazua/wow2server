@@ -1,0 +1,52 @@
+# systemd unit for the WOW2 DNS responder.
+#
+# Real hardware needs this. The PSP has no /etc/hosts: the only way to point it
+# at your server is to set a DNS server in its network profile, and that server
+# has to answer the eight `*.demonware.net` names the game looks up. An emulator
+# does not -- a line in the host's /etc/hosts is enough -- which is why this can
+# be forgotten right up until the first console appears.
+#
+# The instance name is the address to answer WITH and to listen ON, so there is
+# nothing in this file to edit:
+#
+#   sudo cp packaging/wow2-nsdns.service /etc/systemd/system/
+#   sudo systemctl enable --now wow2-nsdns@203.0.113.10
+#
+# Binding to that address rather than 0.0.0.0 keeps it clear of systemd-resolved,
+# which holds 127.0.0.53:53 on Debian and Ubuntu and will otherwise refuse the
+# bind with EADDRINUSE.
+#
+# It answers those eight names and NXDOMAINs everything else, so it is useless to
+# anyone as an open resolver -- but it is still a public DNS server, so point it
+# at one address and open UDP 53 deliberately.
+
+[Unit]
+Description=WOW2 DNS responder (answers *.demonware.net with %i)
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=wow2
+Group=wow2
+ExecStart=/usr/local/bin/wow2-nsdns --bind %i --answer %i
+Restart=on-failure
+RestartSec=5
+
+# Port 53 is privileged and this is the only reason it would need root.
+AmbientCapabilities=CAP_NET_BIND_SERVICE
+CapabilityBoundingSet=CAP_NET_BIND_SERVICE
+
+# It reads one packaged list of names and writes nothing at all.
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=strict
+ProtectHome=true
+ProtectKernelTunables=true
+ProtectKernelModules=true
+ProtectControlGroups=true
+RestrictAddressFamilies=AF_INET AF_INET6
+MemoryDenyWriteExecute=true
+
+[Install]
+WantedBy=multi-user.target

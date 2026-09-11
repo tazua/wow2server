@@ -53,13 +53,26 @@ There is a systemd unit and a Containerfile in `packaging/`.
 ### Pointing the game at it
 
 The client resolves `*.demonware.net`, so on an emulator `/etc/hosts` is enough.
-Real hardware needs a DNS server: on the PSP go to Settings, Network Settings,
-your connection, Address Settings, Custom, DNS Setting, Manual, and point it at
-a resolver that answers those names. `nsdns.py` is included for that.
+
+**A PSP has no `/etc/hosts`.** The only way to point real hardware at your server
+is to set a DNS server in its network profile, so a deployment runs two
+processes, not one. `wow2-nsdns` is the second:
 
 ```bash
-sudo .venv/bin/python -m wow2.nsdns --bind 0.0.0.0 --answer <SERVER_IP>
+sudo wow2-nsdns --bind <SERVER_IP> --answer <SERVER_IP>
 ```
+
+Bind it to the public address rather than `0.0.0.0`: on Debian and Ubuntu,
+systemd-resolved holds `127.0.0.53:53` and will otherwise refuse the bind. There
+is a unit for it in `packaging/`, where the address is the instance name so there
+is nothing to edit:
+
+```bash
+sudo systemctl enable --now wow2-nsdns@<SERVER_IP>
+```
+
+On the console: Settings, Network Settings, your connection, Address Settings,
+Custom, DNS Setting, Manual.
 
 It answers eight names and returns NXDOMAIN for everything else, so it is no use
 to anyone as an open resolver. Two things will then look broken and aren't. The
@@ -68,9 +81,11 @@ anything outside those eight names. And on connect the game pushes about a
 hundred bytes of NAT/STUN struct at the auth port, where it makes no sense as a
 message; the server logs it and resynchronises past it.
 
-Open TCP 3074, UDP 3074 and UDP 53. Open only the TCP port and sign-in will
-work while the game browser stays empty forever, which looks like a matchmaking
-bug when it is a firewall.
+Open TCP 3074, UDP 3074 and UDP 53, plus the relay ports if you turn the relay
+on. Each one fails in a way that looks like something else: without UDP 3074 the
+game browser stays empty forever and reads like a matchmaking bug, without UDP 53
+a real console never gets as far as sending a packet, and without the relay ports
+everything works except the join.
 
 ## Configure
 

@@ -29,6 +29,10 @@ Homepage = "https://github.com/tazua/wow2server"
 
 [project.scripts]
 wow2-server = "wow2.authserver:cli"
+# Real hardware cannot be pointed at the server with /etc/hosts -- the PSP has
+# no such file -- so the DNS responder is part of a deployment, not a rig tool,
+# and it gets a console script like the server does.
+wow2-nsdns = "wow2.nsdns:main"
 
 # The modules live in tools/ and import each other flatly (each one puts its own
 # directory on sys.path first), so they install as a package directory without

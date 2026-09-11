@@ -1,5 +1,15 @@
 #!/usr/bin/env python3
-"""A four-record DNS server for an emulator network namespace.
+"""A tiny DNS server that points a console at this machine.
+
+TWO JOBS, and the second only became visible when real hardware turned up.
+**A PSP has no /etc/hosts**: the only way to redirect it is to set a DNS server
+in its network profile, so any deployment that wants real consoles runs this
+beside the game server -- `wow2-nsdns --bind <ip> --answer <ip>`, or the unit in
+`packaging/wow2-nsdns.service`. Bind it to the public address rather than
+0.0.0.0, or systemd-resolved's hold on 127.0.0.53:53 refuses the bind.
+
+The original job, for the rig:
+A four-record DNS server for an emulator network namespace.
 
 Why this exists: PPSSPP does not resolve the game's hostnames through
 getaddrinfo, so /etc/hosts alone does not redirect them. It sends real DNS

@@ -136,17 +136,35 @@ will accept. That is how the protocol works, and it took a while to believe.
 credential sign in using a shared password. Leave it on and anyone who knows a
 username can get in, so a deployment wants it false.
 
-Turn it off too early, though, and you can lock yourself out. An account only
-gets a stored credential when it is created or when its password changes, and a
-console that already has a WormNet account saved goes straight to login and
-never sends a create. So:
+An account gets a stored credential when it is **created**, and only then. That
+is the trap, and it is sharper than it looks. A console tells the server its name
+exactly once, in the create-account message. Every later message, including
+Change password, identifies the account by its **handle**, `Tiger192(name)[:8]`,
+which is a one-way hash. So a server that never saw the create, or that lost its
+store, can never learn the name again, and the console has no way to tell it.
+Change password answers 704 in that state.
+
+Only an operator who knows the name can fix it, with `wow2-account`:
+
+```bash
+wow2-account list                  # what the store holds, and what it is missing
+wow2-account handle player1b         # match a name against a handle from the log
+wow2-account set player1b            # prompts for the password, stores the digest
+```
+
+So, in order:
 
 1. Start with `shared_password_fallback = true`.
 2. Sign in. If the console creates a new account, the server picks up its name
    and credential on its own and you are done.
-3. If it reuses an old account, run Change password once on the console. That
-   writes the credential.
+3. If it reuses an account the store does not know, the log says so:
+   `login handle <hex> is not an account we know`. Run `wow2-account set <name>`
+   with the password that console uses.
 4. Set the option to false and restart.
+
+**Back the store up before you delete anything.** `accounts.json` is the only
+copy of every credential, and losing it means asking every player for their
+username and password by hand.
 
 ## Before you deploy
 

@@ -33,6 +33,10 @@ wow2-server = "wow2.authserver:cli"
 # no such file -- so the DNS responder is part of a deployment, not a rig tool,
 # and it gets a console script like the server does.
 wow2-nsdns = "wow2.nsdns:main"
+# The credential store needs an operator door: a console tells the server its
+# name ONCE, in the create message, and identifies itself by a one-way hash
+# ever after -- so a server that missed that message can never learn the name.
+wow2-account = "wow2.accountcli:main"
 
 # The modules live in tools/ and import each other flatly (each one puts its own
 # directory on sys.path first), so they install as a package directory without

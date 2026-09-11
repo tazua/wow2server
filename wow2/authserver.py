@@ -3850,7 +3850,20 @@ class AuthConnection(asyncio.Protocol):
                 pt = auth_payload_decrypt(req["ciphertext"], current, req["iv_seed"])
                 if name is None:
                     err = BD_AUTH_BAD_ACCOUNT
-                    log("    no account with that handle -> 704 BD_AUTH_BAD_ACCOUNT")
+                    # Say what to do, because this is a dead end for the
+                    # console and it cannot tell you so. A change-password
+                    # request names its account by HANDLE, which is a one-way
+                    # hash, and the name is only ever sent once -- in the create
+                    # message. So a server that missed that message, or lost its
+                    # store, can never learn the name from any later traffic,
+                    # and the console cannot write its own credential by any
+                    # route. Only the operator can, and only if a human
+                    # remembers the name.
+                    log("    no account with that handle -> 704 "
+                        "BD_AUTH_BAD_ACCOUNT")
+                    log("    (the name is not recoverable from a handle. If you "
+                        "know it: wow2-account set <name>, then have the console "
+                        "sign in with that password)")
                 elif pt is None:
                     # The magic did not come back, so the player mistyped their
                     # CURRENT password. A real answer, and the client has a string

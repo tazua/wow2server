@@ -26,10 +26,10 @@ lobby goes through `startTask`.
 |---:|---|---|---|---|---|
 | 1 | create clan | `?` | 1 row, no count -- one typed u64 team id | Clans -> Create new clan | served |
 | 3 | promote to administrator | `?` | bare | View clan -> a member row -> gamer menu | served |
-| 4 | remove from clan | `?` | bare | View clan -> a member row -> gamer menu | served |
+| 4 | remove from clan | `[u8 0][u64][u64]` | bare | View clan -> a member row -> gamer menu | served |
 | 5 | leave clan / disband clan | `?` | bare | Clans -> Leave clan | served |
-| 6 | send clan invite | `?` | bare | View clan -> a member row -> gamer menu | served |
-| 7 | decline clan invite | `?` | bare | View messages -> Decline clan invite | served |
+| 6 | send clan invite | `[u8 0][u64][u64]` | bare | View clan -> a member row -> gamer menu | served |
+| 7 | decline clan invite | `[u8 0][u64][u64]` | bare | View messages -> the invite -> DOWN -> Decline clan invite | served |
 | 8 | accept clan invite | `?` | bare | View messages -> Accept clan invite | served |
 | 10 | (not a clan verb) | `[u8 0][u64 gamer]` | bare | the block-a-gamer chain | served |
 | 20 | my clan memberships | `[u8 0]` | count+rows [u64 teamID][str name][u8] | every sign-in | served |
@@ -42,6 +42,7 @@ lobby goes through `startTask`.
 - **op 1** — create-OR-JOIN. Fired from a push whose team id does not resolve, the console CREATES a clan named from the message -- two junk clans were made that way (Phase 33c).
 - **op 5** — ONE op for both verbs, gamer = 0 in each; the server tells them apart by whether the caller owns the clan. There is no disband row anywhere in the game -- for an owner, Leave clan offers Transfer ownership and CIRCLE there is the step forward to Disband (Phase 40).
 - **op 6** — Files a mailbox row AND pushes type 13 if the target is online. The inbox is read once at sign-in and View messages does not re-fetch it, so without the push an invite to an online console is invisible until next time.
+- **op 7** — Driven for the first time in Phase 44 and the Phase 38 derivation held: same [u8 0][u64 teamId][u64 inviter] as the accept. The server pushes type 15 Creject, which renders in the inviter's inbox as '<name> declined your clan invite'. The decline row is one DOWN from Accept on an opened invite -- there is no separate screen.
 - **op 10** — No team id at all, and all ten %CLAN% verbs are placed elsewhere. Its only trigger is inside the block-a-gamer chain (0x08a0f948), one state after that chain fires Friends op 7 on the same gamer. Logged, not acted on.
 - **op 20** — Answering this with nothing is why a created clan did not survive a sign-in.
 - **op 21** — The trailing u8 is the ROLE, remapped at 0x089bf7cc: 0 = member, 1 = ADMINISTRATOR, 2 = owner. Serving 0 for the owner hid every administrator verb for six phases.
@@ -80,7 +81,7 @@ lobby goes through `startTask`.
 | op | what it is | request | reply | fired by | state |
 |---:|---|---|---|---|---|
 | 1 | download the inbox | `[u8 0][u32 0][u32 25][bool False][bool False]` | count+rows (one write_push_body each) | every sign-in -- and ONLY at sign-in | served |
-| 4 | delete a message | `?` | bare | accepting or declining anything, and every notification | served |
+| 4 | delete a message | `[u8 0][u64 44]` | bare | accepting or declining anything, and every notification | served |
 
 - **op 1** — View messages does NOT re-fetch, so a message filed while a console is online is invisible until next sign-in unless it is also pushed. The two trailing bools are hard-coded false at the single call site (0x0898d7dc / 0x0898d7e4); what they select is unknown.
 - **op 4** — A message that deletes itself is a NOTIFICATION; one that survives being read is a mailbox item. That difference is the whole distinction in the clan message family.
@@ -90,14 +91,14 @@ lobby goes through `startTask`.
 | op | what it is | request | reply | fired by | state |
 |---:|---|---|---|---|---|
 | 1 | CREATE my public profile | `[u8 0][i64 0][i64 0][i64 0][i64 0][f64 0.0][f64 0.0][i64 0][str ][i32 0]` | bare | every sign-in | served |
-| 2 | read a public profile | `?` | 1 row, no count | Player list -> a row -> View profile | served |
-| 3 | download MY private profile | `[u8 0]  (no parameters at all)` | 1 row, no count | NEVER FIRED -- and the gate is known | served |
-| 4 | upload my public profile | `[u8 0][i64][i64 0][i64 0][i64 0][f64][f64][i64 0][str ][i32 0]` | bare | every sign-in, and on editing a profile | served |
-| 5 | upload MY private profile | `[u8 0][i32 99]` | bare | every sign-in | served |
+| 2 | download a public profile | `[u8 0][u64]` | 1 row, no count | every sign-in once op 1 answers 800; Player list -> a row -> View profile | served |
+| 3 | download MY private profile | `[u8 0]` | 1 row, no count | every sign-in once op 1 answers 800 | served |
+| 4 | upload my public profile | `[u8 0][i64][i64][i64][i64][f64][f64][i64][str ][i32 0]` | bare | every sign-in, and on editing a profile | served |
+| 5 | upload MY private profile | `[u8 0][i32 99]` | bare | every sign-in where op 1 answers 0 (a profile the server has never seen); op 3 replaces it once the server holds one | served |
 
-- **op 1** — Ops 1/4/5 share ONE builder that writes `[u8 0]` and then calls a VIRTUAL serialiser on the record delegate, so the body is whatever the concrete class emits. op 1 and op 4 carry the same nine fields because they serialise the same OBJECT (net::tPublicProfile), not because one is a private copy. It runs BEFORE the record is populated -- every capture is all zeros while the op 4 a second later has the real coordinates -- so the server treats it as create and does not overwrite a profile that already exists.
+- **op 1** — Ops 1/4/5 share ONE builder that writes `[u8 0]` and then calls a VIRTUAL serialiser on the record delegate, so the body is whatever the concrete class emits. op 1 and op 4 carry the same nine fields because they serialise the same OBJECT (net::tPublicProfile), not because one is a private copy. It runs BEFORE the record is populated -- every capture is all zeros while the op 4 a second later has the real coordinates -- so the server treats it as create and does not overwrite a profile that already exists. ITS ERROR CODE IS LOAD-BEARING: 800 = BD_PROFILE_ALREADY_EXISTS makes the client DOWNLOAD (ops 2 and 3) instead of UPLOAD (ops 4 and 5). Answering 0 to every create is what kept ops 2 and 3 from ever firing -- Phase 44.
 - **op 2** — The arm hands the deserializer a hard-coded 1 (0x08c242a4), so a [u32 numResults] would land where the row's first field belongs. The deserialiser (0x089896c8) reads ONE u64 it discards and then the nine fields.
-- **op 3** — Served anyway: the whole shape is in the client's code. The deserialiser (0x08985ab0) reads [u64][i32] and DISCARDS BOTH, because net::tPrivateProfile is 0x28 bytes and carries no record fields. It has never fired because the step machine picks download-vs-upload from this->0x24, which is zero from the ctor and set in exactly one place: the op-1 reply handler, `0x24 = (X != 800)` at 0x089870d0. Every console has taken the upload branch. What X is was not determined, but 800 is the constant that handler also compares the bd task status against (0x08986d5c).
+- **op 3** — The deserialiser (0x08985ab0) reads [u64][i32] and DISCARDS BOTH, because net::tPrivateProfile is 0x28 bytes and carries no record fields. Cold until Phase 44: the step machine picks download-vs-upload from this->0x24, set in exactly one place -- the op-1 reply handler, `0x24 = (taskError != 800)` at 0x089870d0 -- and the private step copies that flag off the public profile (0x0898d380), so ONE error code decides both.
 - **op 4** — Fields [4] and [5] after the lead-in are LONGITUDE and LATITUDE -- proved by editing the store to 0,0 and watching the map pin move from Iceland to the Gulf of Guinea. They are the only two f64 writes in the whole image. The other seven fields are unidentified.
 - **op 5** — Content-free. net::tPrivateProfile::serialize (0x08985a60) writes one i32 whose value is the immediate `ori $s1, $zero, 0x63` -- 99, hard-coded, read from no object field. So the 99 is not a count, a limit or a version, and there is nothing here to store.
 

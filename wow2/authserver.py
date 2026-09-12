@@ -2253,6 +2253,11 @@ def session_key_is_ours(username: str, key: bytes) -> bool:
 
 PROFILE_DB = CAP / "profile-db.json"
 NO_PROFILES = os.environ.get("WOW2_NO_PROFILES") == "1"
+# Phase 44. The one BdErrorCode this server sends on purpose. 800 is not a
+# failure: it is the CREATE op's other success, and the client's own error->string
+# mapper names it (0x0898a2cc -> 0x08d37f98 "BD_PROFILE_ALREADY_EXISTS").
+BD_PROFILE_ALREADY_EXISTS = 800
+NO_PROFILE_EXISTS = os.environ.get("WOW2_NO_PROFILE_EXISTS") == "1"
 
 
 def profile_db() -> dict:
@@ -2320,9 +2325,20 @@ def profile_upload(dec: dict, who=None, peer_ip: str = "", create: bool = False)
     longitude and latitude. Storing it unconditionally would blank a good
     profile, so `create=True` only fills a record that does not exist yet.
 
-    The reply is unchanged either way: ops 1/4/5 collect results with a NULL
-    container (`move $a2, $zero` at 0x08986bec / 0x089889a0), so the bare
-    `err=0, 0 results` is correct and this adds only the store."""
+    The reply carries no ROWS either way: ops 1/4/5 collect results with a NULL
+    container (`move $a2, $zero` at 0x08986bec / 0x089889a0). But op 1's ERROR
+    CODE is load-bearing, and answering 0 to every create is what kept the whole
+    download half of the profile machine dark (Phase 44):
+
+        0x089870c8  xori $a0, $s3, 0x320     ; $s3 = the finished task's error
+        0x089870cc  sltu $a0, $zero, $a0     ;      code, read back through the
+        0x089870d0  sb   $a0, 0x24($s0)      ;      lazy getter 0x08c172b0
+        0x089870d8  beqz $a0, 0x89870fc      ; == 800 -> DOWNLOAD, else UPLOAD
+
+    and 800 is `BD_PROFILE_ALREADY_EXISTS`, which the client's own error->string
+    mapper names at 0x0898a2cc. So it is not a status to imitate, it is the
+    ordinary answer to "create this" when the thing is already there. A first
+    sign-in creates and uploads; every one after that downloads."""
     # account_for() FIRST: `who` is the identity the server ISSUES (1, 2, ...),
     # while every store on this rig is keyed by the CLIENT's 64-bit account id
     # (0x975367efa4bbebed and friends). Getting that precedence backwards files
@@ -2342,9 +2358,25 @@ def profile_upload(dec: dict, who=None, peer_ip: str = "", create: bool = False)
     key = f"{entity:016x}"
     name = (who[0] if who else "") or friend_name(friends_db(), entity)
     if create and key in d["public"]:
+        if NO_PROFILE_EXISTS:
+            log(f"  profile op1 (create): {name or key} already has a profile -- "
+                f"keeping it (WOW2_NO_PROFILE_EXISTS: answering err=0)")
+            return 0, None
         log(f"  profile op1 (create): {name or key} already has a profile -- "
-            f"keeping it (op 1 runs before the record is populated)")
-        return 0, None
+            f"answering BD_PROFILE_ALREADY_EXISTS (800), so the client DOWNLOADS "
+            f"it instead of uploading over it")
+        return 0, None, BD_PROFILE_ALREADY_EXISTS
+    # Tripwire, not a guard (Phase 44). Once op 1 answers 800 the client
+    # DOWNLOADS its profile instead of uploading, so a later op 4 should carry
+    # back what we served. If it ever carries all zeros over a populated record,
+    # our op-2 row is wrong and the profile is about to be blanked -- say so
+    # rather than let the store quietly lose longitude and latitude.
+    old = d["public"].get(key)
+    if (old and any(v for _t, v in
+                    [(f[0], f[1]) for f in old.get("fields", [])])
+            and not any(v for _t, v in fields)):
+        log(f"  *** PROFILE ABOUT TO BE BLANKED: {name or key} uploaded "
+            f"{len(fields)} empty fields over a populated record")
     d["public"][key] = {"name": name, "at": ts(),
                         "fields": [_field_to_json(t, v) for t, v in fields]}
     _jsave(PROFILE_DB, d)
@@ -2392,28 +2424,22 @@ def profile_read_private(dec: dict, who=None, peer_ip: str = ""):
     0 -- there is no private record to carry, the same way op 5 has nothing to
     upload.
 
-    WHY IT HAS NEVER FIRED, which is a lead rather than a mystery. The profile
-    step machine picks download-vs-upload from `this->0x24`, and `0x24` is zero
-    from the base ctor (0x08985f04). The ONLY place it is ever set is the op-1
-    reply handler:
+    WHY IT NEVER FIRED, and it was our doing. The profile step machine picks
+    download-vs-upload from `this->0x24`, zero from the base ctor (0x08985f04)
+    and written in exactly one place -- the op-1 reply handler, which sets it to
+    `(taskError != 800)` and branches on it at once (0x089870c8..0x089870d8).
+    The private step then copies that flag off the public profile (0x0898d380),
+    which is why ONE error code decides both.
 
-        0x089870c8  xori $a0, $s3, 0x320     ; 0x320 = 800
-        0x089870cc  sltu $a0, $zero, $a0
-        0x089870d0  sb   $a0, 0x24($s0)      ; 0x24 = (X != 800)
-        0x089870d8  beqz $a0, 0x89870fc      ; == 800 -> DOWNLOAD, else UPLOAD
-
-    and the private step copies that flag off the public profile (0x0898d380).
-    So every console has taken the UPLOAD branch on both profiles, which is
-    exactly what the request census shows: ops 1, 4 and 5 fire at every sign-in
-    and ops 2 and 3 never do. What `X` is was NOT determined -- `$s3` is written
-    fifteen times in that handler -- but 800 is the same constant the handler
-    compares the bd task status against at 0x08986d5c, so "make the op-1 reply
-    look like status 800" is the experiment. See ROADMAP A4.
+    800 is `BD_PROFILE_ALREADY_EXISTS`. This server answered every create with
+    err=0 ("made you a new one"), so every console took the UPLOAD branch on
+    both profiles -- exactly what the request census showed, ops 1/4/5 at every
+    sign-in and 2/3 never. `profile_upload()` answers 800 once a record exists.
     """
     lsg_request_noargs(dec, "profile op3")
     entity = account_for(peer_ip) or (who[1] if who else 0)
-    log(f"  profile op3 (read private) for 0x{entity:016x} -- FIRST EVER; the"
-        f" client discards both fields, so this is a formality")
+    log(f"  profile op3 (read private) for 0x{entity:016x} -- the client"
+        f" discards both fields, so this is a formality")
 
     def emit(w):
         # NO count: the same single-result arm op 2 uses. Both fields are read
@@ -4560,8 +4586,16 @@ class AuthConnection(asyncio.Protocol):
             err = int(os.environ.get("WOW2_LSG_ERR", "0"), 0)  # BdErrorCode 0 = NoError
             txn = self.next_txn
             self.next_txn += 1
-            nres, results = lsg_result_block(svc, op, dec, self.ident, self.peer_ip,
-                                             self.ident_key)
+            block = lsg_result_block(svc, op, dec, self.ident, self.peer_ip,
+                                     self.ident_key)
+            # A handler may return a THIRD element: the BdErrorCode for its own
+            # reply. Almost none do -- `err=0` is right for every RPC that simply
+            # worked -- but a *create* has a second successful outcome ("it was
+            # already there"), and the client branches on it. See profile_upload().
+            if len(block) == 3:
+                nres, results, err = block
+            else:
+                nres, results = block
             census_note(svc, op, dec)       # what did that handler NOT read?
             reply = build_lsg_taskreply_encrypted(session_key, transaction_id=txn,
                                                   error_code=err, operation_id=op or 0,

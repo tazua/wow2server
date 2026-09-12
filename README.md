@@ -33,6 +33,9 @@ with the service and opcode as immediate operands. So you can scan the game's
 executable and enumerate the whole surface instead of waiting to see what shows
 up on the wire. There are 45 call sites and all of them are answered.
 
+**`RPCS.md` is the reference table**: every opcode, what it is, its request
+layout, its reply shape, and which screen fires it.
+
 ## Install
 
 ```bash
@@ -264,6 +267,24 @@ under hundreds of players without a different backend.
 | `wow2/serverconfig.py` | deployment configuration |
 | `wow2/nsdns.py` | the small DNS responder for pointing consoles here |
 | `packaging/` | systemd unit, Containerfile |
+| `RPCS.md` | every opcode: request layout, reply shape, the screen that fires it |
+
+### What the server writes
+
+Everything lands in the data directory (`[paths] data_dir`, default `capture/`).
+Accounts, leaderboards, clans, friends, messages, profiles and uploaded files are
+the stores you would expect. One file is diagnostic rather than state:
+
+| file | what |
+|---|---|
+| `request-census.json` | every typed field the client has sent, per RPC, with the distinct values each has carried, and whether a handler read them all |
+
+That last one exists because the failure it catches is silent: a reply field of
+the right type in the right position carrying a wrong value produces no error on
+either side. The server decodes each request twice — once generically, once as
+its handler read it — and logs `*** UNREAD REQUEST FIELD` when those differ. It
+is also how the request layouts in `RPCS.md` are measured rather than guessed.
+Set `WOW2_NO_CENSUS=1` to turn it off.
 
 This repository holds the server on its own. The development rig that produced
 it drives PPSSPP over its debugger protocol, reads the game's screen by template

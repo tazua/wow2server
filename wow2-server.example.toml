@@ -90,6 +90,29 @@ relay_idle_timeout = 600
 # at the join with nothing in the log to say why.
 # public_address = "203.0.113.10"
 
+# ---- NAT TYPE DISCOVERY ------------------------------------------------
+# The game fires a three-test STUN probe at the `stun.*` names before it does
+# anything else, and until Phase 37 this server ignored all of it -- so every
+# console spent three seconds timing out at sign-in and learned nothing.
+#
+# Answering it costs one extra UDP port. Test 3's reply must leave a DIFFERENT
+# PORT than the one the request arrived on, because the client accepts that
+# reply from any source: answer it from the main port and it always arrives, so
+# every console reports MODERATE whatever its NAT actually is.
+nat_type = true
+nat_type_alt_port = 3078
+
+# A SECOND PUBLIC ADDRESS, if this deployment has one. Test 2 asks for a reply
+# from a different IP; a console that receives one is behind a full-cone NAT and
+# reports BD_NAT_OPEN.
+#
+# LEAVE IT EMPTY unless the address really is a different one. Answering test 2
+# from the address the console already talks to passes the client's check and
+# reports OPEN for a NAT that is only address-restricted -- and OPEN is the one
+# wrong answer that costs something, because it means "the direct path will
+# work". The server checks and refuses rather than over-report.
+# nat_type_alt_address = "203.0.113.11"
+
 [storage]
 # Where the JSON stores (stats, profiles, friends, teams, accounts) and uploaded
 # blobs live. The server re-reads the JSON stores per request on purpose: you can

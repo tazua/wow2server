@@ -87,6 +87,40 @@ game browser stays empty forever and reads like a matchmaking bug, without UDP 5
 a real console never gets as far as sending a packet, and without the relay ports
 everything works except the join.
 
+### The NAT type probe
+
+Before it does anything else the game runs a three-test STUN probe against those
+`stun.*` names, to work out what kind of NAT it is behind. The server answers it,
+which takes one extra UDP port:
+
+```toml
+[nat]
+nat_type = true
+nat_type_alt_port = 3078          # test 3's reply leaves from here
+```
+
+It has to be a different port from the main one. The client accepts test 3's
+reply from any source, so answering it from port 3074 would mean the reply always
+arrives and every console reported the same NAT type whatever it was actually
+behind.
+
+**It needs no firewall rule.** The console sends all three tests to the main
+port, and the alternate one is only an address to answer *from*, so outbound UDP
+is all it requires.
+
+If the machine has a **second public address**, name it and consoles behind a
+full-cone NAT will find that out:
+
+```toml
+nat_type_alt_address = "203.0.113.11"
+```
+
+Only set that if the address really is a different one. Answering from the
+address the console already talks to would pass the client's check and report an
+open NAT for one that is merely address-restricted, and that is the one wrong
+answer that costs something: it tells the console the direct path will work. The
+server compares and refuses rather than over-report.
+
 ## Configure
 
 ```bash

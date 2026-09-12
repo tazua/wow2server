@@ -113,6 +113,28 @@ DEFAULTS: dict[str, dict] = {
         # a VPS with one address. Set it when the server sits behind its own NAT
         # or has several addresses and the kernel would pick the wrong one.
         "public_address": "",
+        # ---- NAT TYPE DISCOVERY (the game's own three-test STUN probe) ----
+        # The client resolves the `stun.*` names before anything else and fires
+        # a 4-byte `0x14` probe at each of three tests; the reply tells it
+        # whether it is BD_NAT_OPEN / MODERATE / STRICT. Answering them costs
+        # one extra UDP port and is what makes test 3 mean anything: the client
+        # accepts a reply from ANY source, so answering every test from the main
+        # port declares MODERATE unconditionally, which is a guess dressed up as
+        # a measurement.
+        "nat_type": True,
+        # The port test 3's reply is sent FROM. Same address, different port --
+        # so the reply arrives only through a NAT that is address-restricted or
+        # better, which is exactly the distinction the test exists to make.
+        # OPEN THIS IN THE FIREWALL (outbound is enough; nothing binds a
+        # conversation to it).
+        "nat_type_alt_port": 3078,
+        # A SECOND PUBLIC ADDRESS, if the deployment has one. Test 2 asks for a
+        # reply from a different IP, and a console that gets one is behind a
+        # full-cone NAT -- BD_NAT_OPEN. Without a second address the test is
+        # unanswerable, so it is left to time out rather than answered from this
+        # one: replying from the same IP would pass the client's check and
+        # declare OPEN for a NAT that is only address-restricted.
+        "nat_type_alt_address": "",
     },
     "storage": {
         # Where the JSON stores and uploaded blobs live.
@@ -185,6 +207,10 @@ _ENV = {
     ("nat", "public_address"): ("WOW2_RELAY_PUBLIC_ADDRESS", str),
     ("nat", "relay_port_base"): ("WOW2_RELAY_PORT_BASE", int),
     ("nat", "relay_ports"): ("WOW2_RELAY_PORTS", int),
+    ("nat", "nat_type"): ("WOW2_NO_NAT_TYPE",
+                          lambda v: v in ("0", "false", "no", "off")),
+    ("nat", "nat_type_alt_port"): ("WOW2_NAT_TYPE_ALT_PORT", int),
+    ("nat", "nat_type_alt_address"): ("WOW2_NAT_TYPE_ALT_ADDRESS", str),
 }
 for (_sec, _key), (_env, _cast) in _ENV.items():
     _raw = os.environ.get(_env)
@@ -211,6 +237,17 @@ MAX_MSGS_PER_SEC = int(get("limits", "max_msgs_per_sec"))
 MAX_CONNS_PER_IP = int(get("limits", "max_conns_per_ip"))
 MAX_STREAM_BYTES = int(get("limits", "max_stream_bytes"))
 NAT_RELAY = bool(get("nat", "relay"))
+NAT_TYPE = bool(get("nat", "nat_type"))
+NAT_TYPE_ALT_PORT = int(get("nat", "nat_type_alt_port"))
+NAT_TYPE_ALT_ADDRESS = str(get("nat", "nat_type_alt_address"))
+
+
+def _nat_type_line() -> str:
+    if not NAT_TYPE:
+        return "  nat: type discovery off (consoles report no NAT type)\n"
+    alt = (f", test 2 from {NAT_TYPE_ALT_ADDRESS}" if NAT_TYPE_ALT_ADDRESS
+           else ", test 2 unanswerable (no second address)")
+    return f"  nat: type discovery ON, test 3 from UDP {NAT_TYPE_ALT_PORT}{alt}\n"
 
 
 def _nat_line() -> str:
@@ -235,6 +272,7 @@ def describe() -> str:
             f"  logging: level {LOG_LEVEL}, "
             f"hexdumps {'on' if HEXDUMPS else 'off'}\n"
             + _nat_line()
+            + _nat_type_line()
             + f"  limits: {MAX_MSGS_PER_SEC} msg/s per conn, "
             f"{MAX_CONNS_PER_IP} conns per address, "
             f"{MAX_STREAM_BYTES // 1024} KB per conn")

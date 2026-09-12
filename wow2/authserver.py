@@ -1540,22 +1540,69 @@ PUSH_BUDDY_REVOKED = 4
 PUSH_MATCH_INVITE = 5
 # The four ids that share the 0x100-byte class whose team id sits at +0xb8. The
 # clan message handlers read that offset, so the clan traffic is in here.
-CLAN_PUSH_TYPES = (17, 18, 28, 39)
-# 0 = DO NOT PUSH.
+# THE MESSAGE TYPE IDS ARE READ OFF THE CLIENT'S OWN DISPATCHER (Phase 38), not
+# guessed. `UserProfileMessageListScreen` turns a bd message into a UI row in
+# two hops, and both are jump tables:
 #
-# PHASE 26 rewrote write_push_body()'s clan arm from the disassembly: a clan
-# message is TEN fields, because base B (0x08c23190) and base A (0x08c23acc)
-# both open by calling the same super-base 0x08c299cc, which Phase 25 never
-# noticed. All three of Phase 25's attempts were short of that, which is
-# consistent with all three dropping the LSG connection ~450 ms after the inbox
-# reply. The new layout has NOT been tested on a console -- it was written while
-# the server had to stay up for other work -- so this stays 0 until someone
-# restarts the server and tries it. Set `"invite_push_type"` in
-# capture/teams-db.json to 17 (the likeliest id -- see CLAN_PUSH_TYPES) to try.
-# If a console then cannot sign in, clear `messages` in capture/friends-db.json
-# -- the message is re-sent from the mailbox at EVERY sign-in, so a bad one
-# bricks that account until it is deleted.
-CLAN_INVITE_PUSH_DEFAULT = 0
+#   0x0898c368  a2 = msg->type ; switch (a2 - 1) over 39 entries  -> a family
+#               handler:  1-10,34,35 buddy/match   13-28,37,39 CLAN
+#   0x0898f578  the buddy/match family's own switch (table 0x08d386a0)
+#   0x08990564  the CLAN family's own switch        (table 0x08d38728, type-13)
+#
+# and each arm constructs `UserProfileMessage(kind)` at 0x089808cc, whose kind
+# is what the detail screen switches on to decide which options to draw.
+#
+# The table VALIDATES ITSELF: types 1-4 come out Binvite/Baccept/Breject/Brevoke
+# and 5-7 come out Minvite/Maccept/Mreject, which are exactly the four buddy ids
+# and the match-invite id this server has been using successfully for phases.
+#
+#   13 Cinvite   14 Caccept   15 Creject   16 Cleft     17 Cadmin
+#   18 Ckicked   26 Cdisband  28 Cowner    39 Cordinary
+#
+# So the four ids Phases 25-33 spent months on -- 17, 18, 28, 39 -- are
+# MEMBERSHIP NOTIFICATIONS ("you are now an admin of X"), which is precisely
+# what Phase 33e deduced from their behaviour: resolve the clan, fetch its
+# members, delete the message. The reading was right and the id was never in
+# the set being guessed.
+PUSH_CLAN_INVITE = 13
+# The whole clan family, because the first switch routes all of these to the
+# handler that reads the two name fields at +0x30 and +0x78 -- i.e. they all use
+# base B's layout, not base A's.
+CLAN_PUSH_TYPES = tuple(range(13, 29)) + (37, 39)
+# ...of which these carry the 0x100-byte class's extra (u64, str64) tail. The
+# rest stop after base B at 0xb8. Derived, not guessed: of the 27 clan arms
+# exactly these four touch `+0xb8`, and they are precisely the four ids Phases
+# 25-33 were trying -- which is why the ten-field layout kept the connection
+# alive for them and dropped it for a ten-field type 13.
+CLAN_TAIL_TYPES = (17, 18, 28, 39)
+# ...and these carry a u16 payload length instead. Both lists are read off the
+# CLASS REGISTRY, not guessed: `0x08c1fffc` registers 44 message types, each
+# with a 4-byte factory whose vtable+0x14 allocates the real class, and the
+# malloc size names the layout --
+#
+#   0x70  base A                              2,3,4,6,7,9,10,11,12,34,35,36
+#   0x78  base A + u16 payload                1 (buddy invite), 8, 40
+#   0x80  base A + blob8 + u16 payload        5 (match invite)
+#   0xb8  base B  = A + [u64][str64]          14,15,16,20,21,24..27,37,38,41..44
+#   0xc0  base B + u16 payload                13 (CLAN INVITE), 22, 23
+#   0x100 base B + [u64][str64]               17,18,28,39
+#
+# Getting this wrong is not subtle and not visible: a row that over- or
+# under-reads makes the client drop the LSG connection ~450 ms after the reply,
+# with nothing on screen but "Connection Lost". A ten-field type 13 did it, and
+# so did an eight-field one.
+CLAN_BLOB_TYPES = (13, 22, 23)
+# `write_push_body()`'s clan arm is TEN fields, because base B (0x08c23190) and
+# base A (0x08c23acc) both open by calling the same super-base 0x08c299cc, which
+# Phase 25 never noticed -- all three of Phase 25's attempts were short of that,
+# which is consistent with all three dropping the LSG connection ~450 ms after
+# the inbox reply.
+#
+# 0 = DO NOT PUSH. Override per deployment with `"invite_push_type"` in
+# capture/teams-db.json. If a console cannot sign in after a change here, clear
+# `messages` in capture/friends-db.json -- the message is re-sent from the
+# mailbox at EVERY sign-in, so a bad one bricks that account until it is deleted.
+CLAN_INVITE_PUSH_DEFAULT = PUSH_CLAN_INVITE
 PUSH_MATCH_ACCEPTED = 6
 PUSH_MATCH_REJECTED = 7
 PUSH_NOW_ONLINE = 9
@@ -1641,17 +1688,25 @@ def write_push_body(w, type_id: int, msg_id: int, sender: int, sender_name: str,
     w.str_(sender_name, 63)           # +0x30  64-byte buffer including the NUL
 
     if type_id in CLAN_PUSH_TYPES:
-        # base B's extra pair (0x08c23314 -> +0x70, 0x08c23374 -> +0x78).
-        # WOW2_PUSH_MIDNAME replaces this string so an experiment can tell which
-        # of the two name slots the client actually reads (Phase 33c: a type-17
-        # push makes the console fire `Teams op 1` with SOME name, and the whole
-        # question is which field it took it from).
-        w.u64(target)
-        w.str_(os.environ.get("WOW2_PUSH_MIDNAME")
-               or target_name or sender_name, 63)
-        # the clan class's own tail (0x08c23920 -> +0xb8, 0x08c23980 -> +0xc0)
+        # base B's extra pair (0x08c23314 -> +0x70, 0x08c23374 -> +0x78): the
+        # CLAN this message is about, id then name. Proved with sentinels in
+        # Phase 33c -- a push whose +0x78 read "MIDDLE1" made the console fire
+        # `Teams op 1` for a clan called MIDDLE1, while +0xc0 was ignored.
+        # WOW2_PUSH_MIDNAME still replaces it for that kind of experiment.
         w.u64(int.from_bytes(bytes(session_id[:8]).ljust(8, b"\x00"), "little"))
-        w.str_(os.environ.get("WOW2_PUSH_TAILNAME") or clan_name, 63)
+        w.str_(os.environ.get("WOW2_PUSH_MIDNAME") or clan_name, 63)
+        if type_id in CLAN_BLOB_TYPES:
+            # NINE fields. Base B plus a payload length, exactly the trailer
+            # type 1 uses -- `readTypeChecked(6)` then 16 bits into +0xb8 at
+            # 0x08c22f44, and `blez` at 0x08c22f98 means 0 ends the message.
+            w.u16(0)
+        elif type_id in CLAN_TAIL_TYPES:
+            # TEN. The 0x100-byte class's own tail
+            # (0x08c23920 -> +0xb8, 0x08c23980 -> +0xc0).
+            w.u64(target)
+            w.str_(os.environ.get("WOW2_PUSH_TAILNAME") or target_name
+                   or clan_name, 63)
+        # ...and everything else in the family stops at base B: EIGHT fields.
         return
 
     if type_id == PUSH_BUDDY_INVITE:
@@ -2703,79 +2758,46 @@ def team_of(entity: int) -> tuple[int, dict] | tuple[int, None]:
     return 0, None
 
 
-#: Seconds to wait before re-announcing a clan invite at sign-in. See the note in
-#: clan_invite_signin_push(): a push that lands during the sign-in RPC chain is
-#: ignored outright.
-SIGNIN_PUSH_DELAY_S = float(os.environ.get("WOW2_SIGNIN_PUSH_DELAY", "12"))
+def clan_invite_backfill(me: int, name: str, d: dict) -> None:
+    """Put a mailbox row behind any clan invite that has none, at sign-in.
 
+    `Teams op 20` -- "which clans am I in" -- is the FIRST clan RPC of every
+    sign-in and it arrives about two seconds before `bdMessaging op 1`, so a
+    message filed here is delivered by this same sign-in's inbox read. Measured:
+    op 20 at 04:19:38.2, op 1 at 04:19:40.5.
 
-def clan_invite_signin_push(me: int, name: str, d: dict) -> None:
-    """Re-announce any clan invite waiting for this account, at sign-in.
-
-    WHY: measured in Phase 33c, a console that is in NO clan fires `Teams op 20`
-    at sign-in and **never fires op 24** -- so it never asks whether anyone has
-    invited it, and an invite sent while it was offline is never delivered. A
-    console already in a clan does fire op 24, which is what made this look like
-    a rendering problem for several phases.
-
-    A live push does make a non-member fire op 24 (op 6 -> push -> op 24, 1.08 s,
-    and the row is served). So the fix is the same shape as the buddy path, which
-    already reaches a client two ways -- live as a push, and again from the inbox
-    at sign-in. This is the sign-in half for clans.
-
-    Hooked on op 20 because that is the op EVERY console fires at sign-in, and by
-    the time it arrives the connection has bound its account, so the push routes
-    by name. `WOW2_NO_CLAN_SIGNIN_PUSH=1` reverts.
-
-    THE DELAY MATTERS. At 1 s the push lands in the middle of the sign-in RPC
-    chain -- `Friends op 5` and `Profile op 4` were still in flight -- and the
-    console ignored it completely: connection kept, no `op 24`, nothing on
-    screen. The same push type provokes `op 24` 1.08 s later when it arrives at
-    an idle console after `Teams op 6`. So this waits for the chain to finish.
-    `WOW2_SIGNIN_PUSH_DELAY` to retune.
+    THIS USED TO PUSH, AND IT SHOULD NOT. Before Phase 38 the clan invite had no
+    working message type, so a proposal could only sit in `proposals` where the
+    invited console never looked -- and the workaround was to fire a live push
+    12 s after sign-in, timed to miss the RPC chain. Now that type 13 works,
+    `teams_invite()` files a mailbox row when the invite is made and the inbox
+    delivers it whether the target was online or not. All that is left for this
+    to do is repair a store written before that, and pushing as WELL as filing
+    puts the invite in the inbox TWICE -- which is exactly what the first live
+    test showed on screen.
     """
-    # OFF BY DEFAULT, and deliberately so. It genuinely delivers the invite -- the
-    # console fetches the clan, reads its proposals and deletes the message -- but
-    # it does not COMPLETE: nothing renders, the invited account never joins, and
-    # the notification is consumed. Worse, a type-17 push whose team id does not
-    # resolve makes the client CREATE a clan named from the message (two junk
-    # clans were made during Phase 33c proving that). Shipping a half-finished
-    # feature that mutates client state is not worth it; the finding is.
-    if os.environ.get("WOW2_CLAN_SIGNIN_PUSH") != "1":
-        return
-    ptype = int(d.get("invite_push_type", CLAN_INVITE_PUSH_DEFAULT))
-    if not ptype:
+    if os.environ.get("WOW2_NO_CLAN_BACKFILL") == "1":
         return
     mine = f"{me:016x}"
     fd = friends_db()
+    have = {(m.get("from"), m.get("clan")) for m in messages_for(me)
+            if int(m.get("type", 0)) == PUSH_CLAN_INVITE}
     for tid, rec in d["teams"].items():
         if mine in rec.get("members", []):
             continue
         for pr in rec.get("proposals", []):
             if pr.get("to") != mine:
                 continue
+            cname = rec.get("name", "")
+            if (pr.get("from"), cname) in have:
+                continue
             inviter = int(pr["from"], 16)
             iname = pr.get("from_name") or fd["names"].get(pr["from"], "")
-            blob = int(tid, 16).to_bytes(8, "little")
-            log(f"  (clan invite waiting for {name}: {rec.get('name')!r} from "
-                f"{iname!r} -- re-announcing at sign-in, push type {ptype})")
-            cname = rec.get("name", "")
-            mid = message_add(me, ptype, inviter, iname, blob, cname)
-            # The CLAN goes in the middle pair (+0x70/+0x78), not the tail.
-            # Proved with sentinels: a type-17 push whose +0x78 read "MIDDLE1"
-            # made the console fire `Teams op 1` for a clan called MIDDLE1, while
-            # +0xc0 ("TAILAA1") was ignored. `Teams op 1` is create-OR-JOIN by
-            # name, so naming the real clan here is what makes the invited
-            # console actually join it.
-            try:
-                asyncio.get_event_loop().call_later(
-                    SIGNIN_PUSH_DELAY_S,
-                    lambda t=inviter, n=iname, m=mid, b=blob, c=cname,
-                    tid_=int(tid, 16): push_to_account(me, ptype, t, n, m, b, c,
-                                                       target=tid_, target_name=c))
-            except RuntimeError:
-                pass
-            return
+            log(f"  (clan invite waiting for {name}: {cname!r} from {iname!r} "
+                f"-- no mailbox row, filing one now so this sign-in's inbox "
+                f"read delivers it)")
+            message_add(me, PUSH_CLAN_INVITE, inviter, iname,
+                        int(tid, 16).to_bytes(8, "little"), cname)
 
 
 def teams_memberships_result(dec: dict, who=None, peer_ip: str = ""):
@@ -2799,7 +2821,7 @@ def teams_memberships_result(dec: dict, who=None, peer_ip: str = ""):
     log(f"  teams op20 (memberships) for {name} 0x{me:016x}: {len(rows)} clan(s)"
         + (" -> " + ", ".join(f"{n!r} 0x{t:016x}{' owner' if o else ''}"
                               for t, n, o in rows) if rows else ""))
-    clan_invite_signin_push(me, name, d)
+    clan_invite_backfill(me, name, d)
 
     def emit(w):
         # NO count here: build_lsg_taskreply_encrypted already wrote the
@@ -2936,6 +2958,53 @@ def teams_invite(dec: dict, who=None, peer_ip: str = ""):
     mid = message_add(target, ptype, me, name, blob, cname)
     push_to_account(target, ptype, me, name, mid, blob, cname,
                     target=target, target_name=tname)
+    return 0, None
+
+
+def teams_answer_invite(accept: bool, dec: dict, who=None, peer_ip: str = ""):
+    """Teams op 8 (accept) / op 7 (decline) -- answer a clan invitation.
+
+    `[u8 0][u64 teamId][u64 inviter]`, the same shape as `op 6` and the same
+    convention as `Friends op 2`: the request names the OTHER party, not itself.
+    Measured on the wire the moment `Accept clan invite` was finally reachable
+    (Phase 38) -- op 8 fires, then `Messaging op 4` deletes the invite, exactly
+    as a buddy accept does.
+
+    Neither reads results: Teams op 7 and 8 are both on the dispatcher's
+    "reads nothing" arm (`0x08c29874`), so the bare `err=0, 0 results` is
+    correct and the work here is purely the server's own bookkeeping.
+    """
+    me = account_for(peer_ip)
+    name = (who or (rigconfig.USERNAME, 0))[0]
+    verb = "ACCEPT" if accept else "DECLINE"
+    try:
+        r = lsg_request_params(dec)
+        r.u8()
+        tid = r.u64()
+        inviter = r.u64()
+    except Exception as e:
+        log(f"  (teams op{8 if accept else 7} decode failed: {e})")
+        return 0, None
+    d = teams_db()
+    key = f"{tid:016x}"
+    rec = d["teams"].get(key)
+    mine = f"{me:016x}"
+    if rec is None:
+        log(f"  teams op{8 if accept else 7} ({verb} CLAN INVITE): no such clan "
+            f"0x{key} -- ignored")
+        return 0, None
+    props = rec.get("proposals", [])
+    had = any(p.get("to") == mine for p in props)
+    rec["proposals"] = [p for p in props if p.get("to") != mine]
+    if accept and mine not in rec.setdefault("members", []):
+        rec["members"].append(mine)
+    _jsave(TEAMS_DB, d)
+    log(f"  teams op{8 if accept else 7} ({verb} CLAN INVITE): {name} "
+        f"0x{mine} {'joins' if accept else 'declines'} {rec.get('name')!r} "
+        f"0x{key} (invited by 0x{inviter:016x}"
+        + ("" if had else ", but no proposal was on file")
+        + f") -- {len(rec['members'])} member(s), "
+        f"{len(rec['proposals'])} proposal(s) left")
     return 0, None
 
 
@@ -3157,6 +3226,88 @@ def storage_upload_result(dec: dict, who=None, peer_ip: str = ""):
     return None, emit
 
 
+def storage_overwrite_result(dec: dict, who=None, peer_ip: str = ""):
+    """Storage op 2 -- replace a file's contents, by id.
+
+    `[u8 0][u64 fileId][blob data]`, read straight off the request builder at
+    `0x08c26e18` (ROADMAP A3): `tag 3` + a zero byte, `tag 0xa` + 64 bits, then
+    `tag 0x13` + `tag 8` length + the bytes.
+
+    READS NOTHING. The reply dispatcher (`0x08c27490`) sends only ops 1 and 5 to
+    the single-result arm and ops 7/8 to the row arm; 2, 3, 4 and 6 fall through
+    to the exit. So the bare `err=0, 0 results` is right, and unlike op 1 there
+    is no id to hand back.
+    """
+    me = account_for(peer_ip)
+    try:
+        r = lsg_request_params(dec)
+        r.u8()
+        fid = r.u64()
+        data = r.blob()
+    except Exception as e:
+        log(f"  (storage op2 decode failed: {e})")
+        return 0, None
+    d = _jload(STORAGE_DB, {})
+    files = d.setdefault("files", [])
+    rec = next((f for f in files if int(f.get("id", 0) or 0) == fid), None)
+    if rec is None:
+        log(f"  storage op2 (OVERWRITE): no file 0x{fid:x} -- ignored")
+        return 0, None
+    owner = int(rec.get("owner", 0) or 0)
+    if owner and owner != me:
+        log(f"  storage op2 (OVERWRITE): file 0x{fid:x} {rec.get('name')!r} "
+            f"belongs to 0x{owner:016x}, not 0x{me:016x} -- REFUSED")
+        return 0, None
+    blob_name = rec.get("file") or f"{fid:x}-{rec.get('name', 'file')}"
+    try:
+        STORAGE_DIR.mkdir(parents=True, exist_ok=True)
+        tmp = STORAGE_DIR / f"{blob_name}.tmp-{os.getpid()}"
+        tmp.write_bytes(data)
+        os.replace(tmp, STORAGE_DIR / blob_name)
+    except OSError as e:
+        log(f"  (storage op2 could not write {blob_name}: {e})")
+        return 0, None
+    was = int(rec.get("size", 0) or 0)
+    rec["size"] = len(data)
+    _jsave(STORAGE_DB, d)
+    log(f"  storage op2 (OVERWRITE): file 0x{fid:x} {rec.get('name')!r} "
+        f"{was} -> {len(data)} bytes, from 0x{me:016x}")
+    return 0, None
+
+
+def storage_delete_result(dec: dict, who=None, peer_ip: str = ""):
+    """Storage op 4 -- delete a file by id. `[u8 0][u64 fileId]`
+    (builder `0x08c26f48`). Reads nothing, same as op 2.
+    """
+    me = account_for(peer_ip)
+    try:
+        r = lsg_request_params(dec)
+        r.u8()
+        fid = r.u64()
+    except Exception as e:
+        log(f"  (storage op4 decode failed: {e})")
+        return 0, None
+    d = _jload(STORAGE_DB, {})
+    files = d.setdefault("files", [])
+    rec = next((f for f in files if int(f.get("id", 0) or 0) == fid), None)
+    if rec is None:
+        log(f"  storage op4 (DELETE): no file 0x{fid:x} -- ignored")
+        return 0, None
+    owner = int(rec.get("owner", 0) or 0)
+    if owner and owner != me:
+        log(f"  storage op4 (DELETE): file 0x{fid:x} {rec.get('name')!r} "
+            f"belongs to 0x{owner:016x}, not 0x{me:016x} -- REFUSED")
+        return 0, None
+    files[:] = [f for f in files if int(f.get("id", 0) or 0) != fid]
+    _jsave(STORAGE_DB, d)
+    # The blob is kept. A delete here removes the file from every listing, which
+    # is what the client asked for; leaving the bytes on disk costs nothing and
+    # has twice saved a landscape that was deleted from the wrong console.
+    log(f"  storage op4 (DELETE): file 0x{fid:x} {rec.get('name')!r} removed by "
+        f"0x{me:016x} ({len(files)} file(s) left; the blob is kept on disk)")
+    return 0, None
+
+
 def teams_create_result(dec: dict, who=None, peer_ip: str = ""):
     """Teams op 1 -- create a clan. Returns exactly ONE result: [u64 teamID].
 
@@ -3267,6 +3418,8 @@ def lsg_result_block(svc: int, op: int, dec: dict,
         return teams_members_result(dec, who, ident_key)
     if svc == LSG_SERVICE_TEAMS and op == 6:
         return teams_invite(dec, who, ident_key)
+    if svc == LSG_SERVICE_TEAMS and op in (7, 8):
+        return teams_answer_invite(op == 8, dec, who, ident_key)
     if svc == LSG_SERVICE_TEAMS and op == 24:
         return teams_proposals_result(dec, who, ident_key)
     if svc == LSG_SERVICE_STORAGE and op in (7, 8):
@@ -3275,6 +3428,10 @@ def lsg_result_block(svc: int, op: int, dec: dict,
         return storage_get_result(dec, who, ident_key)
     if svc == LSG_SERVICE_STORAGE and op == 1:
         return storage_upload_result(dec, who, ident_key)
+    if svc == LSG_SERVICE_STORAGE and op == 2:
+        return storage_overwrite_result(dec, who, ident_key)
+    if svc == LSG_SERVICE_STORAGE and op == 4:
+        return storage_delete_result(dec, who, ident_key)
     return 0, None
 
 
@@ -3956,6 +4113,27 @@ def discovered_self(ip: str) -> str:
     return rigconfig.NETNS_BRIDGE_IP
 
 
+def server_address_for(client_ip: str) -> str:
+    """OUR address, as the console at `client_ip` reaches us.
+
+    Not to be confused with `discovered_self()`, which answers the opposite
+    question -- what to tell the console ITS address is. Mixing the two hands a
+    console its own address as the server's, and it is not always a harmless
+    mistake: the NAT type probe SENDS test 3 to whatever we name here, so a
+    console told "the server is you" probes itself and the test silently never
+    happens.
+    """
+    ip = natrelay.server_addr_for(client_ip)
+    # The rig's bridge correction, for the same reason as in discovered_self():
+    # loopback is right for the host console and useless to every namespaced
+    # one. An operator who set `public_address` explicitly is never second-
+    # guessed.
+    if (ip.startswith("127.") and BRIDGE_UP and not NO_SELF_REWRITE
+            and not natrelay.PUBLIC_ADDRESS):
+        ip = rigconfig.NETNS_BRIDGE_IP
+    return ip
+
+
 def discovered_endpoint(addr: tuple[str, int]) -> tuple[str, int]:
     """The (ip, port) to tell a console its own public address is.
 
@@ -3973,18 +4151,84 @@ def discovered_endpoint(addr: tuple[str, int]) -> tuple[str, int]:
     mb = natrelay.RELAY.mailbox_for(addr)
     if mb is None:
         return discovered_self(addr[0]), addr[1]
-    ip = natrelay.server_addr_for(addr[0])
-    # Same correction discovered_self() makes, for the same reason and one level
-    # up: the address has to be reachable by the console's FUTURE PEER, not by
-    # the console itself. A loopback client would otherwise be told the server is
-    # at 127.0.0.1, and the namespaced joiner it is about to play would dial its
-    # own empty loopback. On a deployment this branch never fires -- the route
-    # lookup returns the public address and there is no bridge -- and an operator
-    # who set `public_address` explicitly is never second-guessed.
-    if (ip.startswith("127.") and BRIDGE_UP and not NO_SELF_REWRITE
-            and not natrelay.PUBLIC_ADDRESS):
-        ip = rigconfig.NETNS_BRIDGE_IP
-    return ip, mb.port
+    # The mailbox is on US, so the address has to be ours -- and reachable by the
+    # console's FUTURE PEER, not by the console itself. A loopback client would
+    # otherwise be told the server is at 127.0.0.1, and the namespaced joiner it
+    # is about to play would dial its own empty loopback.
+    return server_address_for(addr[0]), mb.port
+
+
+# ---------------------------------------------------------------- NAT TYPE
+# The game's own three-test STUN probe, `bdNATTypeDiscoveryClient`. It fires at
+# the `stun.*` names, which our DNS points here, and we ignored every packet --
+# so the console spent three timeouts at startup and learned nothing.
+#
+# THE REQUEST IS FOUR BYTES: [u8 0x14][u16 2][u8 changeFlags], built by the
+# constructor at 0x08c93974 (`sb 0x14; sh 2, +2; sw flags, +4`) and written by
+# the serialiser at 0x08c93990 as 1 + 2 + 1 bytes. The flags are RFC 3489's
+# CHANGE-REQUEST bits, read straight off the three call sites:
+#
+#   test 1  flags 0   plain binding request     -> MAPPED + CHANGED
+#   test 2  flags 3   change IP *and* port      -> reply received = BD_NAT_OPEN
+#   test 3  flags 2   change port only          -> reply received = BD_NAT_MODERATE
+#                                                  no reply         = BD_NAT_STRICT
+#
+# THE REPLY IS [u8 0x15][u16 2][bdAddr mapped][bdAddr changed] -- first the
+# console's own public address, then ours. The client stores them at +0x14 and
+# +0xc of the discovery object (0x08c92d3c) and then:
+#
+#   * test 2's reply is accepted only if its source IP EQUALS changed.ip and its
+#     source port DIFFERS from changed.port (0x08c92e84). So `changed` is what
+#     decides where test 2 may come from, and it is ours to choose.
+#   * test 3's reply is accepted from ANY source; the only check is that the
+#     mapped address still matches test 1's (0x08c92f20). Which is why answering
+#     test 3 from the MAIN port is worthless: it always arrives, so it always
+#     says MODERATE. The distinction the test exists to make is made by the
+#     SOURCE PORT, so the reply has to go out of a different socket.
+NAT_TYPE_REQ = 0x14
+NAT_TYPE_REPLY = 0x15
+NAT_CHANGE_NONE, NAT_CHANGE_PORT, NAT_CHANGE_BOTH = 0, 2, 3
+
+
+class NatTypeSocket(asyncio.DatagramProtocol):
+    """A send-only socket that exists purely for the address it sends FROM."""
+
+    def __init__(self, name: str):
+        self.name = name
+        self.t = None
+
+    def connection_made(self, transport):
+        self.t = transport
+
+    def datagram_received(self, data, addr):
+        # Nothing should ever dial these; a console only ever talks to the main
+        # port. Log it rather than drop it in silence -- if it happens, some
+        # assumption above is wrong.
+        log(f"UDP {addr[0]}:{addr[1]} -> {self.name} socket, {len(data)}B "
+            f"(unexpected): {data[:32].hex()}")
+
+
+NAT_TYPE_PORT_SOCK: NatTypeSocket | None = None   # same IP, different port
+NAT_TYPE_ADDR_SOCK: NatTypeSocket | None = None   # different IP and port
+
+
+def nat_type_changed_addr(addr: tuple[str, int]) -> tuple[str, int]:
+    """What to advertise as CHANGED. It does TWO jobs, and the second is easy to
+    miss: it is the address test 2's reply must come from, AND IT IS WHERE THE
+    CONSOLE SENDS TEST 3 (`addiu $a1, $a1, 0xc` at 0x08c929f8, against `+4` for
+    tests 1 and 2). Name an address the console cannot reach and test 3 is not
+    slow or rejected -- it never arrives anywhere, and the probe ends with no
+    NAT type at all.
+
+    With a second public address configured this names it, and test 2 becomes a
+    real full-cone test. Without one it names us, which is honest and still
+    useful -- test 3 comes back here and is answered from the alternate PORT --
+    and we then decline to answer test 2 rather than answer it from this address,
+    because a reply from the same IP passes the client's check and would declare
+    BD_NAT_OPEN for a NAT that is merely address-restricted.
+    """
+    alt = serverconfig.NAT_TYPE_ALT_ADDRESS
+    return (alt or server_address_for(addr[0])), serverconfig.PORT
 
 
 _UNKNOWN_UDP: list[tuple[str, bytes]] = []
@@ -4111,15 +4355,15 @@ class Discovery(asyncio.DatagramProtocol):
                 # create request carried these nine bytes back verbatim), so it
                 # is the only one that gets a relay mailbox.
                 reply = b"\x1f\x02\x00" + bd_addr(*discovered_endpoint(addr))
-            elif data[0] == 0x14:
+            elif data[0] == NAT_TYPE_REQ:
                 # A different socket asks this one -- measured on the rig, the
                 # 0x1e and the bdNAT keepalives both come from the game's bd
                 # socket on 3075 while 0x14 comes from an ephemeral port that
                 # then says nothing else at all. Handing it a mailbox would burn
                 # a port on a console that will never use it and invent a second
                 # peer at the same address, so it keeps the plain reflection.
-                reply = (b"\x15\x02\x00" + bd_addr(discovered_self(addr[0]), addr[1])
-                         + bd_addr("127.0.0.1", 3074))
+                self.nat_type(data, addr)
+                return
         if reply:
             self.t.sendto(reply, addr)
             log(f"UDP {peer} disc 0x{data[0]:02x} -> reply {reply.hex()}")
@@ -4164,6 +4408,71 @@ class Discovery(asyncio.DatagramProtocol):
                 fh.write(data)
         except OSError:
             pass
+
+    def nat_type(self, data: bytes, addr: tuple[str, int]) -> None:
+        """Answer one test of the console's NAT type probe.
+
+        The reply for test 3 goes out of a DIFFERENT SOCKET on purpose; see the
+        NAT TYPE block above for why answering it from here would turn the whole
+        probe into a constant.
+        """
+        peer = f"{addr[0]}:{addr[1]}"
+        flags = data[3] if len(data) > 3 else NAT_CHANGE_NONE
+        name = {NAT_CHANGE_NONE: "test 1", NAT_CHANGE_PORT: "test 3 (change port)",
+                NAT_CHANGE_BOTH: "test 2 (change ip+port)"}.get(flags, f"flags {flags}")
+        if not serverconfig.NAT_TYPE:
+            log(f"UDP {peer} NAT type {name} -- ignored (type discovery off)")
+            return
+        # MAPPED is always what the request arrived from. It is the same in every
+        # test because every test goes to this same socket, which is the point:
+        # the client compares test 3's against test 1's to catch a NAT that
+        # remapped underneath it.
+        mine = discovered_self(addr[0])
+        body = (bytes([NAT_TYPE_REPLY, 0x02, 0x00])
+                + bd_addr(mine, addr[1])
+                + bd_addr(*nat_type_changed_addr(addr)))
+        if flags == NAT_CHANGE_NONE:
+            sock, via = self.t, f"UDP {serverconfig.PORT}"
+        elif flags == NAT_CHANGE_PORT:
+            sock = NAT_TYPE_PORT_SOCK.t if NAT_TYPE_PORT_SOCK else None
+            via = f"UDP {serverconfig.NAT_TYPE_ALT_PORT}"
+        elif flags == NAT_CHANGE_BOTH:
+            sock = NAT_TYPE_ADDR_SOCK.t if NAT_TYPE_ADDR_SOCK else None
+            via = (f"{serverconfig.NAT_TYPE_ALT_ADDRESS} (ephemeral port)"
+                   if serverconfig.NAT_TYPE_ALT_ADDRESS
+                   else "second-public-address")
+            # A SECOND ADDRESS THAT IS THE FIRST ONE IS NOT A SECOND ADDRESS.
+            # The client only checks that the source IP equals the advertised
+            # CHANGED ip and the port differs -- so `alt = <our own address>`
+            # passes, and the console reports OPEN for a NAT that merely lets
+            # our IP back in on any port. That is the one wrong answer with a
+            # cost: OPEN means "skip the relay, punch directly", and the punch
+            # then fails. Refuse rather than over-report.
+            # Compare against both the routed answer and the raw one: the rig
+            # rewrites loopback to the bridge, so either alone can miss an
+            # operator who wrote the other form.
+            ours = {server_address_for(addr[0]), natrelay.server_addr_for(addr[0])}
+            if sock is not None and serverconfig.NAT_TYPE_ALT_ADDRESS in ours:
+                log(f"UDP {peer} NAT type {name} -- NOT answered: "
+                    f"nat_type_alt_address is {serverconfig.NAT_TYPE_ALT_ADDRESS}, "
+                    f"which is an address this console already reaches us on "
+                    f"({'/'.join(sorted(ours))}). Test 2 needs a DIFFERENT public "
+                    f"IP; answering from ours would report OPEN for an "
+                    f"address-restricted NAT")
+                return
+        else:
+            log(f"UDP {peer} NAT type {name} -- unknown change flags, ignored")
+            return
+        if sock is None:
+            # Not a failure: an unanswerable test is how the console learns its
+            # NAT is restrictive. Say so, because "no reply" and "no socket" look
+            # identical from the console and only one of them is a measurement.
+            log(f"UDP {peer} NAT type {name} -- NOT answered "
+                f"(no {via} socket; the console will retry, time out and "
+                f"fall through to the next test)")
+            return
+        sock.sendto(body, addr)
+        log(f"UDP {peer} NAT type {name} -> reply via {via}: {body.hex()}")
 
     def introduce(self, data, msg, addr):
         """Relay a NAT-traversal introduction to the peer the joiner asked for."""
@@ -4248,6 +4557,42 @@ def check_tiger() -> None:
             f"   Every login proof built with it would be wrong.")
 
 
+async def start_nat_type_sockets(loop, bind: str) -> None:
+    """Bind the extra source addresses the NAT type probe needs.
+
+    A bind that fails is logged and survived: the console then times that test
+    out and reports a more restrictive NAT, which is the safe direction to be
+    wrong in.
+    """
+    global NAT_TYPE_PORT_SOCK, NAT_TYPE_ADDR_SOCK
+    if not serverconfig.NAT_TYPE:
+        return
+    alt_port = serverconfig.NAT_TYPE_ALT_PORT
+    alt_addr = serverconfig.NAT_TYPE_ALT_ADDRESS
+    try:
+        _tr, NAT_TYPE_PORT_SOCK = await loop.create_datagram_endpoint(
+            lambda: NatTypeSocket("nat-type change-port"),
+            local_addr=(bind, alt_port))
+    except OSError as e:
+        log(f"!! NAT type: could not bind UDP {bind}:{alt_port} ({e}) -- test 3 "
+            f"will go unanswered, so every console reports STRICT")
+    if alt_addr:
+        # EPHEMERAL PORT, deliberately. It cannot share `alt_port`: with the
+        # usual bind of 0.0.0.0 the change-port socket above already holds that
+        # port on every address, including this one. And it does not need a
+        # fixed port -- the client's only requirement for test 2 is that the
+        # source port differs from the advertised CHANGED port, which is the
+        # main one. So there is nothing here for an operator to open or
+        # remember.
+        try:
+            _tr, NAT_TYPE_ADDR_SOCK = await loop.create_datagram_endpoint(
+                lambda: NatTypeSocket("nat-type change-addr"),
+                local_addr=(alt_addr, 0))
+        except OSError as e:
+            log(f"!! NAT type: could not bind UDP {alt_addr}:0 ({e}) -- "
+                f"test 2 will go unanswered, so no console can report OPEN")
+
+
 async def main():
     check_tiger()
     loop = asyncio.get_running_loop()
@@ -4256,6 +4601,7 @@ async def main():
     await loop.create_datagram_endpoint(lambda: Discovery(), local_addr=(bind, port))
     natrelay.set_logger(log)
     await natrelay.RELAY.start(bind)
+    await start_nat_type_sockets(loop, bind)
     log(f"WOW2 server up: TCP+UDP {bind}:{port}")
     for line in serverconfig.describe().split("\n"):
         log(line)

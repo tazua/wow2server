@@ -273,7 +273,18 @@ under hundreds of players without a different backend.
 
 Everything lands in the data directory (`[paths] data_dir`, default `capture/`).
 Accounts, leaderboards, clans, friends, messages, profiles and uploaded files are
-the stores you would expect. One file is diagnostic rather than state:
+the stores you would expect.
+
+Profiles are the one store with a subtlety worth knowing. A console asks the
+server to *create* its public profile at every sign-in, and the answer to that
+decides what happens next: answer "created" and the console uploads over
+whatever you hold, answer `BD_PROFILE_ALREADY_EXISTS` and it downloads yours
+instead. This server does the second once a record exists, so a profile edited
+on the server survives — except longitude and latitude, and six bits of two
+other fields, which the console always supplies itself. Set
+`WOW2_NO_PROFILE_EXISTS=1` to go back to upload-only.
+
+One file is diagnostic rather than state:
 
 | file | what |
 |---|---|

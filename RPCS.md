@@ -132,14 +132,20 @@ lobby goes through `startTask`.
 | 1 | upload a file | `[u8 0][bool False][str][bool False][blob]` | 1 row, no count -- one typed u64 file id | Upload flag; View shared schemes -> Upload; Take snapshot | served |
 | 2 | overwrite a file by id | `[u8 0][u64 fileId][blob]` | bare | the SAME button as op 1 | served |
 | 4 | delete a file by id | `[u8 0][u64 fileId]` | bare | NEVER FIRED | served |
-| 5 | fetch a file's bytes | `[u8 0][u64]` | 1 row, no count | opening anything in a storage list | served |
+| 5 | fetch a file's bytes | `[u8 0][u64]` | 1 file row + blob, no count | opening anything in a storage list | served |
 | 7 | list one user's files | `[u8 0][u64][u32 0][u16 128]` | count+rows | sign-in, and View shared landscapes / View shared schemes | served |
 | 8 | list the global files | `[u8 0][u32 0][u16 256]` | count+rows | sign-in -- Downloads draws what this returned | served |
 
 - **op 1** — The id must be NON-ZERO: 0 is the client's 'no id yet' sentinel, the same trap as the session id and security key. A THIRD caller was found in Phase 45: SQUARE on a rendered leaderboard is 'Take snapshot', which picks one of four slots and uploads scoreboard<0-3>.dat -- four names hard-coded in three ELF tables (0x08d3aff8, 0x08d3de58, 0x08d41378), each spelled with the public:\ prefix the client puts on a public row. The file is 'GAME', the board title, then [u64 rank][name NUL][u64 score] per row.
 - **op 2** — The choice is a cached file id at this->0x1c which op 1's own reply fills in, so the first upload of a name is op 1 and every one after it is op 2.
 - **op 4** — A net::tFile virtual, and no storage screen offers it. The only screen naming Net.Req.Delete is UserProfileDeleteScreen.cpp, so provoking it probably means deleting a user profile.
-- **op 5** — A MISS must still return one EMPTY blob: the hard-coded count turns '0 results' into a dropped LSG connection. 'Download scoreboard snapshots?' fires this once per slot the op 7 list holds -- Phase 29 recorded that modal as making no request at all, which was true only because there was nothing to fetch (Phase 45). OPEN (ROADMAP A13): the bytes go out, the connection holds, and the console keeps nothing -- the file node it fetched into is still flagged empty and the payload is nowhere in its RAM, so this reply may be missing something the result class wants beside the blob (Phase 46).
+- **op 5** — THE ROW IS A WHOLE FILE RECORD AND THE BLOB IS ITS LAST FIELD -- the same eight fields op 7/8 send, behind a leading u32 the container mallocs the payload buffer with:
+
+    [u32 bufferSize][u64 fileId][u32 created]
+    [u32 modified][bool private][bool][u64 owner]
+    [str name <=127][blob data]
+
+Answering with the blob alone (which this server did until Phase 47) makes the container fail on its first read, so it never builds an element and the count stays 0. That failure is SILENT: the game's own bdStorage poll calls the reply handler, not bd's LSG reply reader, so nothing drops and nothing logs -- the panel just draws [empty]. The client says so itself, in PPSSPP's log: 'Reading BLOB failed. Buffer too small', bdBitBuffer.inl:563. A MISS must still return one row, with an empty blob and a capacity of 0; the hard-coded count turns '0 results' into a dropped LSG connection. 'Download scoreboard snapshots?' fires this once per slot the op 7 list holds -- Phase 29 recorded that modal as making no request at all, which was true only because there was nothing to fetch (Phase 45).
 
 ## What a storage list will actually display
 

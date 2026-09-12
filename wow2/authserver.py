@@ -3833,7 +3833,41 @@ def storage_bytes(f: dict) -> bytes:
 def storage_get_result(dec: dict, who=None, peer_ip: str = ""):
     """Storage op 5 -- fetch one file's bytes. ONE row, and the arm at
     0x08c275bc calls the container with a hard-coded count of 1, so this reply
-    must NOT carry a numResults field (same trap as Teams op 1)."""
+    must NOT carry a numResults field (same trap as Teams op 1).
+
+    THE ROW IS A FULL FILE RECORD AND THE BLOB IS ITS LAST FIELD (Phase 47).
+    This used to answer with the blob alone, which is why `View scoreboard
+    snapshots` fetched its file and still drew four `[empty]` rows for four
+    phases -- ROADMAP A13. Read off the client, three hops:
+
+      container  0x08c25c00   (vtable 0x08dba638+0x14, built at 0x089949f8)
+                 per result: read a u32, malloc 0xb8, construct with that u32
+      ctor       0x08c26530   `this->0xa8 = u32` and `this->0xb0 = malloc(u32)`
+                              -- so the LEADING u32 IS THE BUFFER CAPACITY
+      element    0x08c26610   base 0x08c268ac reads the eight ordinary file
+                              fields, then a MANDATORY blob (tag 0x13); with no
+                              blob field `$s4` stays 0 and it returns false
+
+    and the capacity is load-bearing:
+
+        lw   $a0, 0xa8($s0)      capacity
+        sltu $a0, $a0, $s5       capacity < blobLen ?
+        beqz $a0, 0x8c26760      no  -> store the length, read the bytes
+                                 yes -> "Reading BLOB failed. Buffer too small"
+                                        (0x08d6af10), skip the read, return false
+
+    With no leading u32 the container's very first read fails, so it never even
+    constructs an element and the count stays 0. **That failure is SILENT**: it
+    is the game's own `bdStorage` poll (0x089949c4) that calls the reply handler,
+    not the LSG reply reader, so a bad body here neither drops the connection nor
+    logs anything -- the download simply returns false and the node keeps its
+    `[empty]` bit. The rig's usual oracle (does the console stay connected?)
+    cannot see this class of bug at all; cf. `tools/blindspots.py`.
+
+    The eight fields are exactly `storage_list_result`'s row, in the same order,
+    which is the independent check: that row has worked since Phase 27.
+    WOW2_STORAGE_BLOB_ONLY=1 restores the blob-only reply for a bisect.
+    """
     try:
         r = lsg_request_params(dec)
         r.u8()                              # the [u8 0] lead-in, constant on every RPC
@@ -3843,16 +3877,29 @@ def storage_get_result(dec: dict, who=None, peer_ip: str = ""):
         return 0, None
     f = next((x for x in storage_files() if int(x.get("id", 0)) == fid), None)
     body = storage_bytes(f) if f else b""
+    blob_only = os.environ.get("WOW2_STORAGE_BLOB_ONLY") == "1"
     log(f"  storage op5 (get file 0x{fid:x}): "
-        + (f"{f.get('name')!r} {len(body)} bytes" if f else "no such file"))
+        + (f"{f.get('name')!r} {len(body)} bytes" if f else "no such file")
+        + (" [BLOB ONLY]" if blob_only else ""))
 
     def emit(w):
+        if not blob_only:
+            w.u32(len(body))                # buffer capacity -- the ctor mallocs this
+            w.u64(fid)
+            w.u32(int(f.get("created", 0)) if f else 0)
+            w.u32(int(f.get("modified", 0)) if f else 0)
+            w.bool_(bool(f.get("private")) if f else False)
+            w.bool_(False)
+            w.u64(_storage_owner(f) if f else 0)
+            w.str_(f.get("name", "") if f else "", 127)
         w.blob(body)
     # A MISS MUST STILL BE ONE ROW. The op-5 arm (0x08c275bc) calls its
     # container with a hard-coded count of 1, so `0 results` leaves the
-    # deserializer reading a blob that is not there: the container returns
+    # deserializer reading a row that is not there: the container returns
     # false and the client drops the whole LSG connection ~330 ms later
-    # ("Connection Lost"). An empty blob is the quiet answer.
+    # ("Connection Lost"). An empty blob is the quiet answer -- and it stays
+    # safe with the capacity in front, because 0 skips the malloc and the
+    # `capacity < blobLen` guard is then `0 < 0`, which is false.
     return None, emit
 
 

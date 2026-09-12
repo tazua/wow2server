@@ -289,7 +289,8 @@ and the bytes beside them, and the owner of a row is written as a 16-hex-digit
 account id. If you hand-edit that file, use hex: the list and fetch paths match
 on the string, so a decimal id makes a file invisible to the screen meant to
 show it. The game uploads there by itself, from `Upload flag`, from a shared
-scheme, and from `Take snapshot` on a leaderboard.
+scheme, and from `Take snapshot` on a leaderboard, and reads them back from the
+matching screen under a user profile.
 
 One file is diagnostic rather than state:
 

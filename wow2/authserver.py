@@ -1659,21 +1659,42 @@ def write_push_body(w, type_id: int, msg_id: int, sender: int, sender_name: str,
     until a NUL (0x08c239a8..0x08c239e4); there is no length prefix, the buffer
     is 64 bytes and byte 0x3f is forced to NUL, so 63 characters is the limit.
 
-    STILL NOT PROVEN: what the middle pair at +0x70/+0x78 MEANS. It is a second
-    (account, name) pair in the same shape as base A's, so the target of the
-    invite is the obvious reading and is what is written here -- but no handler
-    has been found that reads it, and getting it wrong costs a wrong name on
-    screen, not a dropped connection. What IS proven is +0xb8: the clan message
-    dispatcher at 0x089be81c indexes a 23-entry table at 0x08d39cf0 by
-    `msg->[8] - 17` (`addiu $a1,$a1,-0x11`), and the three real handlers do:
+    THE FULL LAYOUT, all of it now proven (Phase 33c sentinels, then Phase 41
+    from the class ctor 0x08c237d0 and deserializer 0x08c23884):
 
-        0x089be89c  types 17, 18, 39   ->  findTeam(msg->[0xb8])
-        0x089be940  type  28           ->  findTeam(msg->[0xb8]) after a walk
-        0x089beac4  type  24           ->  findTeam(msg->[0x28])  (a base-A class)
-        0x089beb10  everything else    ->  findTeam(msg->[0x28])
+        +0x10 u64 msgId    +0x18 u64 dedup   +0x20 u32 ts   +0x24 bool read
+        +0x28 u64 SENDER   +0x30 char[64] sender name
+        +0x70 u64 teamId   +0x78 char[64] clan name
+        +0xb8 u64 SUBJECT GAMER   +0xc0 char[64] subject name   (0x100 class only)
 
-    i.e. the four ids the 0x100-byte class is registered for (17, 18, 28, 39)
-    are exactly the four table slots that read the clan class's own team id.
+    +0xc0 IS NEVER READ by anything, but it must still be on the wire or the
+    parse under-reads and the connection dies.
+
+    THERE ARE THREE DISPATCHERS, and the one that changes membership is not the
+    one you find first:
+
+        0x08990564  the UI switch (type-13). Builds inbox items. Sends NO RPC
+                    and never marks anything stale -- enumerated every jal.
+        0x089be770  net::tClan::onMessage (vtable +0x2c), switch(type-17).
+                    Picks the SUBJECT: types 17/18/28/39 use +0xb8, EVERY OTHER
+                    TYPE USES +0x28, the sender. Null lookup -> silent drop.
+        0x089b4b9c  net::tGamer::onMessage (type-13) -- the actual mutation:
+                    14 -> rank 2 + flag 0x800   15/16/18/26 -> remove
+                    17 -> rank 3   28 -> rank 4   39 -> rank 2
+
+    So a notification without its subject has nothing to act on. `findMember`
+    is 0x089ba930 (walks clan->0x24 comparing node->0x20, a GAMER id); finding a
+    CLAN by id is the different function 0x089c0030. An earlier version of this
+    comment called both of them findTeam, which is what made +0xb8 look like a
+    team id.
+
+    AND NOTHING HERE CAN FORCE A REFRESH. `0x089b9674` sets flag bit 0x4,
+    "needs a server refresh", and the idle delegates poll that bit into
+    `Teams op 20` (0x089c0238) / `op 21` (0x089bab38). None of its 28 callers is
+    in a message handler -- only creating a clan node (0x089bfe78) or adding a
+    member (0x089ba738) marks stale. That is the whole reason a push can refresh
+    a clan the console does NOT hold (the preamble creates it) and can only
+    mutate one it does.
     """
     w.u32(type_id)                    # read by 0x08c1cec0 -> factory -> msg[8]
 

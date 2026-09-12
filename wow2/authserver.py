@@ -2258,7 +2258,6 @@ NO_PROFILES = os.environ.get("WOW2_NO_PROFILES") == "1"
 def profile_db() -> dict:
     d = _jload(PROFILE_DB, {})
     d.setdefault("public", {})
-    d.setdefault("private", {})
     return d
 
 
@@ -2299,20 +2298,31 @@ PROFILE_EMPTY = [[bd.BD_SINT64, 0], [bd.BD_SINT64, 0], [bd.BD_SINT64, 0],
                  [bd.BD_SINT64, 0], [bd.BD_STR, ""], [bd.BD_SINT32, 0]]
 
 
-def profile_upload(dec: dict, who=None, peer_ip: str = "", section: str = "public"):
-    """Profile op 4 (public) and op 1: the console uploads its own profile.
+def profile_upload(dec: dict, who=None, peer_ip: str = "", create: bool = False):
+    """Profile op 4 (upload) and op 1 (create) -- both write the PUBLIC profile.
 
-    ONE record type, written to two places. Phase 42 measured both requests off
-    the wire and they are the same ten fields in the same order, down to the f64
-    longitude/latitude pair -- op 1 had simply never been read, because it was
-    answered by the fall-through bare reply and nothing looked at what it sent.
+    The two requests are the same nine fields because they serialise the same
+    OBJECT, not because one is a private copy of the other. Ops 1/4/5 share one
+    builder that writes `[u8 0]` and then calls a VIRTUAL serialiser on the
+    record delegate (vtable+0x14 -> ... -> the task's own vtable+0x3c), so the
+    body is whatever the concrete class emits:
 
-    The reply is unchanged either way: `bdProfile` ops 1/4/5 pass no result
-    container at all (`a2 = $zero` at 0x08986bec / 0x089889a0), so the bare
-    `err=0, 0 results` was always right and this only adds the store.
+        net::tPublicProfile::serialize   0x089894c8   the nine fields
+        net::tPrivateProfile::serialize  0x08985a60   one i32, hard-coded 99
 
-    `section` is "public" for op 4 and "private" for op 1. See ROADMAP A4 for
-    what is proved and what is inferred about that pairing."""
+    Which class is running is `this->0x20`, the private flag: the public ctor
+    (0x08989b0c) passes `$a3 = 0` and the private one (0x08985b18) passes 1.
+    The public path then chooses CREATE (op 1) or DOWNLOAD (op 2), and the
+    private path UPLOAD (op 5) or DOWNLOAD (op 3).
+
+    So op 1 is a CREATE, and it runs before the object is populated -- every
+    capture of it is all zeros while the op 4 a second later carries the real
+    longitude and latitude. Storing it unconditionally would blank a good
+    profile, so `create=True` only fills a record that does not exist yet.
+
+    The reply is unchanged either way: ops 1/4/5 collect results with a NULL
+    container (`move $a2, $zero` at 0x08986bec / 0x089889a0), so the bare
+    `err=0, 0 results` is correct and this adds only the store."""
     # account_for() FIRST: `who` is the identity the server ISSUES (1, 2, ...),
     # while every store on this rig is keyed by the CLIENT's 64-bit account id
     # (0x975367efa4bbebed and friends). Getting that precedence backwards files
@@ -2331,23 +2341,30 @@ def profile_upload(dec: dict, who=None, peer_ip: str = "", section: str = "publi
     d = profile_db()
     key = f"{entity:016x}"
     name = (who[0] if who else "") or friend_name(friends_db(), entity)
-    d[section][key] = {"name": name, "at": ts(),
-                       "fields": [_field_to_json(t, v) for t, v in fields]}
+    if create and key in d["public"]:
+        log(f"  profile op1 (create): {name or key} already has a profile -- "
+            f"keeping it (op 1 runs before the record is populated)")
+        return 0, None
+    d["public"][key] = {"name": name, "at": ts(),
+                        "fields": [_field_to_json(t, v) for t, v in fields]}
     _jsave(PROFILE_DB, d)
     shown = ", ".join(str(v) for _t, v in fields[:4])
-    log(f"  profile upload ({section}): {name or key} <- {len(fields)} fields "
-        f"({shown}...)")
+    log(f"  profile {'op1 (create)' if create else 'op4 (upload)'}: "
+        f"{name or key} <- {len(fields)} fields ({shown}...)")
     return 0, None
 
 
 def profile_op5(dec: dict, who=None, peer_ip: str = ""):
-    """Profile op 5 -- `[u8 0][i32 99]`, and 99 has been constant in every capture.
+    """Profile op 5 -- upload the PRIVATE profile, and there is nothing in it.
 
-    What it asks for is NOT established. It fires once per sign-in and takes the
-    bare `err=0, 0 results` this server has always given it (ops 1/4/5 pass no
-    result container at all, `a2 = $zero` at 0x08986bec / 0x089889a0), so this
-    handler changes nothing on the wire -- it exists so the value is recorded and
-    so a 99 that ever becomes something else is visible."""
+    `net::tPrivateProfile` is 0x28 bytes and carries no record fields at all;
+    its serialiser (0x08985a60) writes one `i32` whose value is the immediate
+    `ori $s1, $zero, 0x63` -- 99, hard-coded, read from no object field. So the
+    99 is not a count or a limit or a version, and there is nothing here to
+    store. The reply is the bare one ops 1/4/5 all take (null result container).
+
+    Kept as a handler purely so the value is recorded and a 99 that ever becomes
+    something else is visible rather than silently ignored."""
     try:
         r = lsg_request_params(dec)
         r.u8()                          # the [u8 0] lead-in, constant on every RPC
@@ -2356,13 +2373,58 @@ def profile_op5(dec: dict, who=None, peer_ip: str = ""):
         log(f"  (profile op5 decode failed: {e})")
         return 0, None
     shown = ", ".join(f"{bd.TYPE_NAMES.get(t, t)} {v!r}" for t, v in fields)
-    log(f"  profile op5: {shown or '(no arguments)'}"
-        + ("" if fields == [(bd.BD_SINT32, 99)] else "   <- NOT the usual i32 99"))
+    log(f"  profile op5 (private upload): {shown or '(empty)'}"
+        + ("" if fields == [(bd.BD_SINT32, 99)] else
+           "   <- NOT the hard-coded i32 99"))
     return 0, None
 
 
-def profile_read_public(dec: dict, who=None, peer_ip: str = "",
-                       section: str = "public"):
+def profile_read_private(dec: dict, who=None, peer_ip: str = ""):
+    """Profile op 3 -- download MY private profile. It takes NO parameters.
+
+    COLD: never fired once, on any console, in any capture. Served anyway
+    because its whole shape is known from the client's own code and costs
+    nothing, so if the gate below ever opens the answer is already there.
+
+    The request is the `[u8 0]` lead-in and nothing else (0x08c23f88 reads only
+    `$a0`). The reply deserialiser is `net::tPrivateProfile`'s, at vtable+0x44 =
+    0x08985ab0, and it reads `[u64][i32]` and **discards both** before returning
+    0 -- there is no private record to carry, the same way op 5 has nothing to
+    upload.
+
+    WHY IT HAS NEVER FIRED, which is a lead rather than a mystery. The profile
+    step machine picks download-vs-upload from `this->0x24`, and `0x24` is zero
+    from the base ctor (0x08985f04). The ONLY place it is ever set is the op-1
+    reply handler:
+
+        0x089870c8  xori $a0, $s3, 0x320     ; 0x320 = 800
+        0x089870cc  sltu $a0, $zero, $a0
+        0x089870d0  sb   $a0, 0x24($s0)      ; 0x24 = (X != 800)
+        0x089870d8  beqz $a0, 0x89870fc      ; == 800 -> DOWNLOAD, else UPLOAD
+
+    and the private step copies that flag off the public profile (0x0898d380).
+    So every console has taken the UPLOAD branch on both profiles, which is
+    exactly what the request census shows: ops 1, 4 and 5 fire at every sign-in
+    and ops 2 and 3 never do. What `X` is was NOT determined -- `$s3` is written
+    fifteen times in that handler -- but 800 is the same constant the handler
+    compares the bd task status against at 0x08986d5c, so "make the op-1 reply
+    look like status 800" is the experiment. See ROADMAP A4.
+    """
+    lsg_request_noargs(dec, "profile op3")
+    entity = account_for(peer_ip) or (who[1] if who else 0)
+    log(f"  profile op3 (read private) for 0x{entity:016x} -- FIRST EVER; the"
+        f" client discards both fields, so this is a formality")
+
+    def emit(w):
+        # NO count: the same single-result arm op 2 uses. Both fields are read
+        # and thrown away by 0x08985ab0, so the values cannot matter -- but 0 is
+        # this client's "no id yet" sentinel elsewhere, so do not send one.
+        w.u64(entity)
+        w.i32(99)
+    return None, emit
+
+
+def profile_read_public(dec: dict, who=None, peer_ip: str = ""):
     """Profile op 2: read one public profile. ONE row, and NO result count."""
     if NO_PROFILES:
         return 0, None
@@ -2374,7 +2436,7 @@ def profile_read_public(dec: dict, who=None, peer_ip: str = "",
         log(f"  (profile read decode failed: {e})")
         return 0, None
     d = profile_db()
-    rec = d[section].get(f"{target:016x}")
+    rec = d["public"].get(f"{target:016x}")
     fields = rec["fields"] if rec else [list(f) for f in PROFILE_EMPTY]
     name = (rec or {}).get("name") or friend_name(friends_db(), target)
     if not rec:
@@ -2394,7 +2456,7 @@ def profile_read_public(dec: dict, who=None, peer_ip: str = "",
             if not _write_field(w, int(t), v):
                 log(f"  (!! profile field type {t} has no writer -- skipped)")
 
-    log(f"  profile read ({section}): entity 0x{target:016x} "
+    log(f"  profile op2 (read public): entity 0x{target:016x} "
         f"({name or 'unknown'}) -- {'stored' if rec else 'EMPTY placeholder'}, "
         f"{len(fields)} fields")
     return None, emit
@@ -3984,7 +4046,9 @@ def lsg_result_block(svc: int, op: int, dec: dict,
     if svc == LSG_SERVICE_PROFILE and op == 4:
         return profile_upload(dec, who, ident_key)
     if svc == LSG_SERVICE_PROFILE and op == 1:
-        return profile_upload(dec, who, ident_key, section="private")
+        return profile_upload(dec, who, ident_key, create=True)
+    if svc == LSG_SERVICE_PROFILE and op == 3:
+        return profile_read_private(dec, who, ident_key)
     if svc == LSG_SERVICE_PROFILE and op == 5:
         return profile_op5(dec, who, ident_key)
     if svc == LSG_SERVICE_MESSAGING and op == 1:

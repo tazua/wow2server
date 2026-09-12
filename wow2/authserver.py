@@ -1041,18 +1041,76 @@ def stats_write_upload(dec: dict, who: tuple[str, int] | None = None,
     return 0, None
 
 
-def emit_rows(rows: list, total: int):
+def emit_rows(rows: list, total: int, board_id: int = 0):
     """Writer callback for a bdLeaderBoardResult: [u32 totalEntries] then the rows.
 
     0x08ce6080 returns the success flag of that FIRST read, so the u32 is
     mandatory even when no rows follow -- a reply without it fails the whole
     bdStats task, which is what ended the Phase 11 sign-in chain.
+
+    BOARD 1 CARRIES THREE MORE COLUMNS and this server dropped them for
+    twenty-seven phases -- see `_board1_tail`. WOW2_NO_STATS_ROW_TAIL=1 goes
+    back to the four-field row; WOW2_STATS_ROW_TAIL_A=<int> forces the first
+    i64 to a sentinel, which is how the round trip was proved.
     """
+    tail = board_id == 1 and os.environ.get("WOW2_NO_STATS_ROW_TAIL") != "1"
+    # A SENTINEL the console cannot have locally is the only way to tell
+    # "adopted" from "it already had that bit" -- the Phase 33d technique.
+    sentinel = os.environ.get("WOW2_STATS_ROW_TAIL_A")
+
     def emit(w):
         w.u32(total)
         for eid, score, rank, name in rows:
             write_leaderboard_row(w, eid, score, rank, name)
+            if tail:
+                a, b = _board1_tail(eid)
+                if sentinel:
+                    a = int(sentinel, 0)
+                log(f"  (board 1 tail for 0x{eid:016x}: A=0x{a:x} B=0x{b:x}"
+                    f"{' SENTINEL' if sentinel else ''}, "
+                    f"{bin(a).count('1') + bin(b).count('1')} game(s) unfinished)")
+                w.i32(0)
+                w.i64(a)
+                w.i64(b)
     return emit
+
+
+def _board1_tail(entity: int) -> tuple[int, int]:
+    """The two i64s this account last uploaded on board 1 (Phase 48).
+
+    BOARD 1 IS THE ONLY BOARD WHOSE ROW IS MORE THAN FOUR FIELDS. After the
+    ordinary `[u64 entity][i64 score][u64 rank][str name]` it carries
+    `[i32 0][i64 A][i64 B]`, and A|B is a **128-bit field, one bit per game,
+    indexed by the board-1 score**: the bit goes ON when a match starts and OFF
+    when it ends, so what stays set is the games this console STARTED AND DID
+    NOT FINISH. 2 x i64 is 128 slots for a window of 100, which is what
+    Team17's own forum describes -- the `100%` beside a name is the share of
+    the last 100 games started that the player finished.
+
+    Measured across every upload in `capture/stats-uploads.jsonl`: score 13
+    sets bit 13, score 20 sets bit 20, and a console that quit its 12th match
+    carried bit 12 forward through matches 13, 14 and 15.
+
+    **The client ADOPTS what we serve and ORs its new game in.** Proved with a
+    sentinel neither console could hold locally: served `A = 0x20` (game 5, a
+    game neither had ever played), started one match, and both uploaded
+    `{5, 21}` and `{5, 18}` respectively. So this is a real round trip and the
+    server was breaking it -- it has stored these columns since Phase 20 and
+    never served one back, which reset every console's completion history to
+    whatever survived locally, at every sign-in.
+
+    The store already keeps the tail as a fourth element of the row
+    (`statsdb.put(..., extra=)`), so this is a read, not a reconstruction.
+    """
+    row = stats_all().get(statsdb.key(1, entity))
+    if isinstance(row, list) and len(row) > 3 and isinstance(row[3], list):
+        vals = [v for _t, v in row[3]]
+        if len(vals) >= 3:
+            try:
+                return int(vals[1]), int(vals[2])
+            except (TypeError, ValueError):
+                pass
+    return 0, 0
 
 
 def stats_read_results(dec: dict, who: tuple[str, int] | None = None,
@@ -1087,7 +1145,7 @@ def stats_read_results(dec: dict, who: tuple[str, int] | None = None,
         + ",".join(f"0x{e:016x}" for e in entities)
         + " -> serving " + (", ".join(f"{r[2]}. {r[3]} {r[1]}" for r in rows) or "(nothing)")
         + f" of {len(board)}")
-    return len(rows), emit_rows(rows, len(board))
+    return len(rows), emit_rows(rows, len(board), board_id)
 
 
 def stats_pivot_results(dec: dict, who: tuple[str, int] | None = None,
@@ -1133,7 +1191,7 @@ def stats_pivot_results(dec: dict, who: tuple[str, int] | None = None,
         f"pivot=0x{pivot:016x} startRank={start_rank} count={count} -> serving "
         + (" | ".join(f"{r[2]}. {r[3]} {r[1]}" for r in rows) or "(nothing)")
         + f" of {len(board)}")
-    return len(rows), emit_rows(rows, len(board))
+    return len(rows), emit_rows(rows, len(board), board_id)
 
 
 # --------------------------------------------------------------- sessions (svc 5)

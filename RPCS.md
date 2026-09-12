@@ -53,22 +53,23 @@ lobby goes through `startTask`.
 
 | op | what it is | request | reply | fired by | state |
 |---:|---|---|---|---|---|
-| 1 | leaderboard WRITE | `[u8 0][u8 0][i32][u64 0][i64 0][i32 0][i32 0][i32 0]` | bare | match start (from a LOBBY only), one board per second | served |
+| 1 | leaderboard WRITE | `[u8 0][u8 0][i32][u64 0][i64][i32 0][i64][i64 0]` | bare | match start (from a LOBBY only), one board per second | served |
 | 4 | read board by entity | `[u8 0][i32][u32 1][u64]` | count+rows | sign-in, boards 1..5 | served |
-| 5 | read a board page | `[u8 0][i32 2][u64][u64 0][i64 10]` | count+rows | Leader boards -> View board; Daily awards sweeps boards 24..9 | served |
+| 5 | read a board page | `[u8 0][i32][u64][u64 0][i64]` | count+rows | Leader boards -> View board; Daily awards sweeps boards 24..9 | served |
 
-- **op 1** — The client does a read-modify-write: new = max(10, round(0.9 * served)). On a ranked board that is your rating minus a 10% stake, not a decay. Boards 6/7/8 are the three per-match counters, each written iff nonzero.
-- **op 5** — Daily awards is op 5 with pivot=0 startRank=1 count=1 on boards 9..24, and renders whoever is top of each.
+- **op 1** — The client does a read-modify-write: new = max(10, round(0.9 * served)). On a ranked board that is your rating minus a 10% stake, not a decay. Boards 6/7/8 are the three per-match counters, each written iff nonzero. BOARD 1 ALSO CARRIES A TYPED TAIL, [i32 0][i64 A][i64 B], and A|B is a 128-bit field with ONE BIT PER GAME indexed by the board-1 score: set when a match starts, cleared when it ends, so what stays set is the games started and not finished -- the `100%` a leaderboard prints beside a name. Serve it back on the row or the console loses its history at every sign-in (Phase 48).
+- **op 4** — A row is [u64 entity][i64 score][u64 rank][str name] -- EXCEPT on board 1, which takes three more columns ([i32 0][i64 A][i64 B], the completion history) and hands them straight back to the next upload. Proved with a sentinel: serve bit 5 to a console that has never played a 5th game and its next upload carries bits {5, N}.
+- **op 5** — Daily awards is op 5 with pivot=0 startRank=1 count=1 on boards 9..24, and renders whoever is top of each. Board 1 rows carry the same three extra columns op 4's do.
 
 ## Service 5 — Sessions
 
 | op | what it is | request | reply | fired by | state |
 |---:|---|---|---|---|---|
-| 1 | create session | `?` | count+rows | Host Game -> Start lobby | served |
-| 2 | update session | `?` | bare | each JOIN (a roster update) | served |
+| 1 | create session | `[u8 0][blob][blob][blob][i32 3][i32 1][i32 0][i32 0][i32 3][i32 0][i32 0][i32 0][i32 0][str player1][i32 0][i32 4][i32 3][i32 30][i32 60][i64 0][i64 0][i64 1][i64][str player1][i32 99]` | count+rows | Host Game -> Start lobby | served |
+| 2 | update session | `[u8 0][blob][blob][blob][i32][i32][i32 0][i32 0][i32][i32 0][i32 0][i32 0][i32 0][str player1][i32 0][i32 4][i32 3][i32 30][i32 60][i64 0][i64 0][i64 1][i64][str player1][i32 99]` | bare | each JOIN (a roster update) | served |
 | 3 | delete session | `?` | bare | leaving or quitting a hosted match | served |
 | 4 | get session by id | `[u8 0][blob 8B session id]` | 1 row, no count -- one bdMatchMakingInfo | opening a match invite in View messages | served |
-| 5 | search sessions | `?` | count+rows | Find Game | served |
+| 5 | search sessions | `[u8 0][i32 1][i32 25][i32 0][i32][i32 0][i32][i32][i32][i32][i32][i32][i64 0][i64 2][i64]` | count+rows | Find Game | served |
 | – | (ops 1/2/5 share one builder) | `?` | - | - | cold (never fired) |
 
 - **op 1** — Three fields are uninitialised STACK GARBAGE only the server can fill: [3] the 8-byte session id, [4] the 16-byte bdSecurityKey, and a bdCommonAddr. Replaying them verbatim into a search reply is what made joins die on 'This session is no longer available.' (Phases 14-17). Field [11] is the play mode, 1 = for points.

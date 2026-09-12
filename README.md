@@ -292,6 +292,16 @@ show it. The game uploads there by itself, from `Upload flag`, from a shared
 scheme, and from `Take snapshot` on a leaderboard, and reads them back from the
 matching screen under a user profile.
 
+Leaderboards have one shape worth knowing if you edit them by hand. Every board
+stores `[score, rank, name]`, but **board 1 stores a fourth element**: three
+extra typed columns the game sends with each upload, which are a 128-bit field
+with one bit per game — set when a match starts and cleared when it ends, so
+what stays set is the games that player started and never finished. That is the
+percentage the game shows beside a name. The server hands it straight back on
+the next read, and the console ORs its new game into whatever it receives, so
+deleting that element quietly rewrites a player's history. `WOW2_NO_STATS_ROW_TAIL=1`
+goes back to serving the plain four-field row.
+
 One file is diagnostic rather than state:
 
 | file | what |

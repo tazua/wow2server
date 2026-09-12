@@ -27,11 +27,11 @@ lobby goes through `startTask`.
 | 1 | create clan | `?` | 1 row, no count -- one typed u64 team id | Clans -> Create new clan | served |
 | 3 | promote to administrator | `?` | bare | View clan -> a member row -> gamer menu | served |
 | 4 | remove from clan | `[u8 0][u64][u64]` | bare | View clan -> a member row -> gamer menu | served |
-| 5 | leave clan / disband clan | `?` | bare | Clans -> Leave clan | served |
+| 5 | leave clan / disband clan | `[u8 0][u64][u64 0]` | bare | Clans -> Leave clan | served |
 | 6 | send clan invite | `[u8 0][u64][u64]` | bare | View clan -> a member row -> gamer menu | served |
 | 7 | decline clan invite | `[u8 0][u64][u64]` | bare | View messages -> the invite -> DOWN -> Decline clan invite | served |
-| 8 | accept clan invite | `?` | bare | View messages -> Accept clan invite | served |
-| 10 | (not a clan verb) | `[u8 0][u64 gamer]` | bare | the block-a-gamer chain | served |
+| 8 | accept clan invite | `[u8 0][u64][u64]` | bare | View messages -> Accept clan invite | served |
+| 10 | a net::tCrony action, verb unknown | `[u8 0][u64 gamer]` | bare | NEVER FIRED | served |
 | 20 | my clan memberships | `[u8 0]` | count+rows [u64 teamID][str name][u8] | every sign-in | served |
 | 21 | members of a clan | `[u8 0][u64]` | count+rows [u64 gamer][str name][u8 role] | after op 20 | served |
 | 24 | clan invitations to me | `[u8 0]` | count+rows [u64][u64][str][str] | sign-in (if already in a clan), or on a clan push | served |
@@ -43,7 +43,7 @@ lobby goes through `startTask`.
 - **op 5** — ONE op for both verbs, gamer = 0 in each; the server tells them apart by whether the caller owns the clan. There is no disband row anywhere in the game -- for an owner, Leave clan offers Transfer ownership and CIRCLE there is the step forward to Disband (Phase 40).
 - **op 6** — Files a mailbox row AND pushes type 13 if the target is online. The inbox is read once at sign-in and View messages does not re-fetch it, so without the push an invite to an online console is invisible until next time.
 - **op 7** — Driven for the first time in Phase 44 and the Phase 38 derivation held: same [u8 0][u64 teamId][u64 inviter] as the accept. The server pushes type 15 Creject, which renders in the inviter's inbox as '<name> declined your clan invite'. The decline row is one DOWN from Accept on an opened invite -- there is no separate screen.
-- **op 10** — No team id at all, and all ten %CLAN% verbs are placed elsewhere. Its only trigger is inside the block-a-gamer chain (0x08a0f948), one state after that chain fires Friends op 7 on the same gamer. Logged, not acted on.
+- **op 10** — Phase 45 placed it in the class, not the trigger. The builder at 0x08c293e0 has exactly one caller and that caller is SLOT 8 of the net::tCrony vtable at 0x08d39460 -- the class that owns promote (2/12), demote (3), accept (4), decline (5), remove (6), cancel (7) and invite (10/11/21). So it is a per-gamer clan action; it is only the one whose request carries no team id, the u64 coming from this+0x20. Phase 45 also REFUTED the block-a-gamer guess twice: blocking a gamer with an outstanding clan invite fired Friends op6 then op4, and blocking a fellow clan member fired op6 alone. Neither sent op 10. What is unknown is which UI action dispatches slot 8; a virtual call is type-erased at the call site, so scanning for it does not work. Logged, not acted on.
 - **op 20** — Answering this with nothing is why a created clan did not survive a sign-in.
 - **op 21** — The trailing u8 is the ROLE, remapped at 0x089bf7cc: 0 = member, 1 = ADMINISTRATOR, 2 = owner. Serving 0 for the owner hid every administrator verb for six phases.
 - **op 26** — Gated on the target being an ADMINISTRATOR, so promote and demote had to be built together or neither could be tested.
@@ -53,9 +53,9 @@ lobby goes through `startTask`.
 
 | op | what it is | request | reply | fired by | state |
 |---:|---|---|---|---|---|
-| 1 | leaderboard WRITE | `?` | bare | match start (from a LOBBY only), one board per second | served |
+| 1 | leaderboard WRITE | `[u8 0][u8 0][i32][u64 0][i64 0][i32 0][i32 0][i32 0]` | bare | match start (from a LOBBY only), one board per second | served |
 | 4 | read board by entity | `[u8 0][i32][u32 1][u64]` | count+rows | sign-in, boards 1..5 | served |
-| 5 | read a board page | `?` | count+rows | Leader boards -> View board; Daily awards sweeps boards 24..9 | served |
+| 5 | read a board page | `[u8 0][i32 2][u64][u64 0][i64 10]` | count+rows | Leader boards -> View board; Daily awards sweeps boards 24..9 | served |
 
 - **op 1** — The client does a read-modify-write: new = max(10, round(0.9 * served)). On a ranked board that is your rating minus a 10% stake, not a decay. Boards 6/7/8 are the three per-match counters, each written iff nonzero.
 - **op 5** — Daily awards is op 5 with pivot=0 startRank=1 count=1 on boards 9..24, and renders whoever is top of each.
@@ -81,7 +81,7 @@ lobby goes through `startTask`.
 | op | what it is | request | reply | fired by | state |
 |---:|---|---|---|---|---|
 | 1 | download the inbox | `[u8 0][u32 0][u32 25][bool False][bool False]` | count+rows (one write_push_body each) | every sign-in -- and ONLY at sign-in | served |
-| 4 | delete a message | `[u8 0][u64 44]` | bare | accepting or declining anything, and every notification | served |
+| 4 | delete a message | `[u8 0][u64]` | bare | accepting or declining anything, and every notification | served |
 
 - **op 1** — View messages does NOT re-fetch, so a message filed while a console is online is invisible until next sign-in unless it is also pushed. The two trailing bools are hard-coded false at the single call site (0x0898d7dc / 0x0898d7e4); what they select is unknown.
 - **op 4** — A message that deletes itself is a NOTIFICATION; one that survives being read is a mailbox item. That difference is the whole distinction in the clan message family.
@@ -106,12 +106,12 @@ lobby goes through `startTask`.
 
 | op | what it is | request | reply | fired by | state |
 |---:|---|---|---|---|---|
-| 1 | send buddy invite | `?` | bare | Buddy list -> Add buddy | served |
-| 2 | accept buddy invite | `?` | bare | View messages -> Accept buddy invite | served |
+| 1 | send buddy invite | `[u8 0][u64]` | bare | Buddy list -> Add buddy | served |
+| 2 | accept buddy invite | `[u8 0][u64]` | bare | View messages -> Accept buddy invite | served |
 | 3 | (unknown) | `?` | ? | NEVER FIRED | served |
-| 4 | revoke / remove a buddy | `[u8 0][u64 other]` | bare | Remove buddy, Decline buddy invite, and the second half of blocking a BUDDY | served |
+| 4 | revoke / remove a buddy | `[u8 0][u64]` | bare | Remove buddy, Decline buddy invite, and the second half of blocking a BUDDY | served |
 | 5 | buddy list | `[u8 0]` | count+rows | every sign-in | served |
-| 6 | block / unblock a gamer | `[u8 0][u64 gamer][u8 flag]  (1 = block, 0 = unblock)` | bare | gamer menu -> Block gamer / Unblock player | served |
+| 6 | block / unblock a gamer | `[u8 0][u64][u8]` | bare | gamer menu -> Block gamer / Unblock player | served |
 | 7 | block list | `[u8 0]` | count+rows | every sign-in | served |
 | 8 | send match invite | `[u8 0][u64 target][blob 8B session id]` | bare | gamer menu -- ONLY while you are HOSTING | served |
 | 9 | accept match invite | `?` | bare | View messages -> Accept match invite | bare reply is correct |
@@ -129,17 +129,17 @@ lobby goes through `startTask`.
 
 | op | what it is | request | reply | fired by | state |
 |---:|---|---|---|---|---|
-| 1 | upload a file | `[u8 0][bool published][str name <=128][bool private][blob]` | 1 row, no count -- one typed u64 file id | Upload flag, and View shared schemes -> Upload | served |
+| 1 | upload a file | `[u8 0][bool False][str][bool False][blob]` | 1 row, no count -- one typed u64 file id | Upload flag; View shared schemes -> Upload; Take snapshot | served |
 | 2 | overwrite a file by id | `[u8 0][u64 fileId][blob]` | bare | the SAME button as op 1 | served |
 | 4 | delete a file by id | `[u8 0][u64 fileId]` | bare | NEVER FIRED | served |
-| 5 | fetch a file's bytes | `?` | 1 row, no count | opening anything in a storage list | served |
+| 5 | fetch a file's bytes | `[u8 0][u64 20482]` | 1 row, no count | opening anything in a storage list | served |
 | 7 | list one user's files | `[u8 0][u64][u32 0][u16 128]` | count+rows | sign-in, and View shared landscapes / View shared schemes | served |
 | 8 | list the global files | `[u8 0][u32 0][u16 256]` | count+rows | sign-in -- Downloads draws what this returned | served |
 
-- **op 1** — The id must be NON-ZERO: 0 is the client's 'no id yet' sentinel, the same trap as the session id and security key.
+- **op 1** — The id must be NON-ZERO: 0 is the client's 'no id yet' sentinel, the same trap as the session id and security key. A THIRD caller was found in Phase 45: SQUARE on a rendered leaderboard is 'Take snapshot', which picks one of four slots and uploads scoreboard<0-3>.dat -- four names hard-coded in three ELF tables. The file is 'GAME', the board title, then [u64 rank][name NUL][u64 score] per row.
 - **op 2** — The choice is a cached file id at this->0x1c which op 1's own reply fills in, so the first upload of a name is op 1 and every one after it is op 2.
 - **op 4** — A net::tFile virtual, and no storage screen offers it. The only screen naming Net.Req.Delete is UserProfileDeleteScreen.cpp, so provoking it probably means deleting a user profile.
-- **op 5** — A MISS must still return one EMPTY blob: the hard-coded count turns '0 results' into a dropped LSG connection.
+- **op 5** — A MISS must still return one EMPTY blob: the hard-coded count turns '0 results' into a dropped LSG connection. 'Download scoreboard snapshots?' fires this once per slot the op 7 list holds -- Phase 29 recorded that modal as making no request at all, which was true only because there was nothing to fetch (Phase 45).
 
 ## What a storage list will actually display
 

@@ -284,6 +284,13 @@ on the server survives — except longitude and latitude, and six bits of two
 other fields, which the console always supplies itself. Set
 `WOW2_NO_PROFILE_EXISTS=1` to go back to upload-only.
 
+Uploaded files are the other one worth a note. Rows live in `storage-db.json`
+and the bytes beside them, and the owner of a row is written as a 16-hex-digit
+account id. If you hand-edit that file, use hex: the list and fetch paths match
+on the string, so a decimal id makes a file invisible to the screen meant to
+show it. The game uploads there by itself, from `Upload flag`, from a shared
+scheme, and from `Take snapshot` on a leaderboard.
+
 One file is diagnostic rather than state:
 
 | file | what |

@@ -2713,7 +2713,7 @@ def friends_match_decline(dec: dict, who=None, peer_ip: str = ""):
     log(f"  friends op10 (MATCH DECLINE): {name} 0x{me:016x} declined the match "
         f"invite from 0x{inviter:016x} "
         f"({d['names'].get(theirs) or 'unknown account'})")
-    push_to_account(inviter, PUSH_MATCH_REJECTED, me, name)
+    push_to_account(inviter, PUSH_MATCH_REJECTED, me, name, notify_id())
     return 0, None
 
 
@@ -2789,10 +2789,10 @@ def friends_respond_legacy(dec: dict, me: int, name: str, target: int, flag: int
             d["friends"].append([mine, theirs])
         log(f"  friends op6: {name} ACCEPTED 0x{target:016x} -- now buddies "
             f"({len(d['friends'])} pair(s))")
-        push_to_account(target, PUSH_BUDDY_ACCEPTED, me, name)
+        push_to_account(target, PUSH_BUDDY_ACCEPTED, me, name, notify_id())
     else:
         log(f"  friends op6: {name} REJECTED 0x{target:016x}")
-        push_to_account(target, PUSH_BUDDY_REJECTED, me, name)
+        push_to_account(target, PUSH_BUDDY_REJECTED, me, name, notify_id())
     _jsave(FRIENDS_DB, d)
     return 0, None
 
@@ -2852,7 +2852,7 @@ def friends_revoke(dec: dict, who=None, peer_ip: str = ""):
         mid = message_add(target, PUSH_BUDDY_REJECTED, me, name)
         push_to_account(target, PUSH_BUDDY_REJECTED, me, name, mid)
     elif was_buddy:
-        push_to_account(target, PUSH_BUDDY_REVOKED, me, name)
+        push_to_account(target, PUSH_BUDDY_REVOKED, me, name, notify_id())
     return 0, None
 
 
@@ -2904,7 +2904,7 @@ def friends_remove(dec: dict, who=None, peer_ip: str = ""):
         f"friends {before[0]}->{len(d['friends'])}, "
         f"proposals {before[1]}->{len(d['invites'])})")
     if outgoing and os.environ.get("WOW2_NO_FRIENDS_FIX") != "1":
-        push_to_account(target, PUSH_PROPOSAL_CANCELLED, me, name)
+        push_to_account(target, PUSH_PROPOSAL_CANCELLED, me, name, notify_id())
     return 0, None
 
 
@@ -2931,6 +2931,32 @@ def message_add(to_entity: int, type_id: int, sender: int, sender_name: str,
                           "from": f"{sender:016x}", "from_name": sender_name,
                           "session": bytes(session_id).hex(),
                           "clan": clan_name, "at": ts()})
+    _jsave(FRIENDS_DB, d)
+    return mid
+
+
+def notify_id() -> int:
+    """An id for a push that is NOT filed. Unique, non-zero, nothing stored.
+
+    PHASE 45 -- `write_push_body` puts this value in BOTH `+0x10` (the id
+    `Messaging op 4` deletes by) and `+0x18`, which the super-base calls the
+    DEDUP key, and five Friends pushes were passing 0 for both. Two of them in
+    one session are therefore the same message as far as the client's identity
+    fields are concerned.
+
+    `clan_notify` had already solved this for its six notifications: take the
+    mailbox counter, store nothing. A `Messaging op 4` for such an id finds
+    nothing and says so, which is the correct outcome and not a leak -- the
+    client deletes what it has consumed either way, and the six clan types have
+    been measured working like that since Phase 40.
+
+    The alternative -- a separate counter -- would let a notification id collide
+    with a REAL mailbox id, and then one `Messaging op 4` would delete somebody's
+    stored invite. That is the whole reason this shares `next_msg`.
+    """
+    d = messages_db()
+    mid = int(d["next_msg"])
+    d["next_msg"] = mid + 1
     _jsave(FRIENDS_DB, d)
     return mid
 
@@ -3785,12 +3811,12 @@ def storage_list_result(op: int, dec: dict, who=None, peer_ip: str = ""):
         for i, f in enumerate(files, start=1):
             body = storage_bytes(f)
             w.u32(len(body))                                  # size
-            w.u64(int(f.get("id", i)))                        # file id
+            w.u64(_storage_id(f, i))                          # file id
             w.u32(int(f.get("created", 0)))
             w.u32(int(f.get("modified", 0)))
             w.bool_(bool(f.get("private")))
             w.bool_(False)
-            w.u64(int(f.get("owner", "0"), 16) if f.get("owner") else 0)
+            w.u64(_storage_owner(f))
             w.str_(f.get("name", ""), 127)
     return len(files), emit
 
@@ -3847,6 +3873,46 @@ def storage_get_result(dec: dict, who=None, peer_ip: str = ""):
 # `.flg`, shared landscapes `<7 chars>.sl<0-7>`, shared schemes
 # `<6 chars>.ss<0-7>`), and `private` must be false because the client prefixes
 # `public:\` and indexes the type letter at the fixed offset name+8.
+def _storage_owner(rec: dict) -> int:
+    """The account that owns one storage row, however the row spells it.
+
+    PHASE 45 -- this file kept TWO conventions for the same field and they met
+    here. `storage_list_result` filters with `f.get("owner") == f"{owner:016x}"`
+    and `storage_get_result` reads it with `int(..., 16)`, i.e. the 16-hex-digit
+    string every other store in this server uses for an account; but
+    `storage_upload_result` wrote a raw int and read it back with a DECIMAL
+    `int()`. Both bugs were invisible until something uploaded:
+
+      * a decimal parse of a hand-seeded row raises ValueError, the B6 dispatch
+        backstop drops the message, and the console sits on "Uploading
+        scoreboard snapshots..." forever with nothing in the log but the
+        exception -- which is how `Take snapshot` was found to be broken;
+      * and a row this function DID write was invisible to the very list meant
+        to show it, because an int never equals a hex string.
+
+    Hex is the convention. This accepts an int, a decimal string or a hex
+    string so old stores keep working.
+    """
+    v = rec.get("owner")
+    if v in (None, ""):
+        return 0
+    if isinstance(v, int):
+        return v
+    s = str(v).strip()
+    try:
+        return int(s, 16) if len(s) == 16 else int(s)
+    except ValueError:
+        return 0
+
+
+def _storage_id(rec: dict, default: int = 0) -> int:
+    """One storage row's file id, int or string."""
+    try:
+        return int(rec.get("id", default) or default)
+    except (TypeError, ValueError):
+        return default
+
+
 def storage_upload_result(dec: dict, who=None, peer_ip: str = ""):
     """Storage op 1 -- store a file and hand back its id."""
     me = account_for(peer_ip)
@@ -3864,11 +3930,11 @@ def storage_upload_result(dec: dict, who=None, peer_ip: str = ""):
     files = d.setdefault("files", [])
     fid = 0
     for f in files:
-        if f.get("name") == name and int(f.get("owner", 0) or 0) == me:
-            fid = int(f.get("id", 0) or 0)
+        if f.get("name") == name and _storage_owner(f) == me:
+            fid = _storage_id(f)
             break
     if not fid:
-        used = {int(f.get("id", 0) or 0) for f in files}
+        used = {_storage_id(f) for f in files}
         fid = next(i for i in range(0x5001, 0x5001 + 4096) if i not in used)
     blob_name = f"{fid:x}-{name}"
     try:
@@ -3880,9 +3946,11 @@ def storage_upload_result(dec: dict, who=None, peer_ip: str = ""):
         os.replace(blob_tmp, STORAGE_DIR / blob_name)
     except OSError as e:
         log(f"  (storage op1 could not write {blob_name}: {e})")
-    rec = {"id": fid, "name": name, "owner": me, "file": blob_name,
+    # The owner goes in as the 16-hex-digit string every other store uses --
+    # see _storage_owner(). An int here is invisible to storage_list_result.
+    rec = {"id": fid, "name": name, "owner": f"{me:016x}", "file": blob_name,
            "private": bool(private), "size": len(data)}
-    files[:] = [f for f in files if int(f.get("id", 0) or 0) != fid] + [rec]
+    files[:] = [f for f in files if _storage_id(f) != fid] + [rec]
     _jsave(STORAGE_DB, d)
     log(f"  storage op1 (UPLOAD): {name!r} {len(data)} bytes from "
         f"0x{me:016x} -> file id 0x{fid:x} "
@@ -3916,11 +3984,11 @@ def storage_overwrite_result(dec: dict, who=None, peer_ip: str = ""):
         return 0, None
     d = _jload(STORAGE_DB, {})
     files = d.setdefault("files", [])
-    rec = next((f for f in files if int(f.get("id", 0) or 0) == fid), None)
+    rec = next((f for f in files if _storage_id(f) == fid), None)
     if rec is None:
         log(f"  storage op2 (OVERWRITE): no file 0x{fid:x} -- ignored")
         return 0, None
-    owner = int(rec.get("owner", 0) or 0)
+    owner = _storage_owner(rec)
     if owner and owner != me:
         log(f"  storage op2 (OVERWRITE): file 0x{fid:x} {rec.get('name')!r} "
             f"belongs to 0x{owner:016x}, not 0x{me:016x} -- REFUSED")
@@ -3956,16 +4024,16 @@ def storage_delete_result(dec: dict, who=None, peer_ip: str = ""):
         return 0, None
     d = _jload(STORAGE_DB, {})
     files = d.setdefault("files", [])
-    rec = next((f for f in files if int(f.get("id", 0) or 0) == fid), None)
+    rec = next((f for f in files if _storage_id(f) == fid), None)
     if rec is None:
         log(f"  storage op4 (DELETE): no file 0x{fid:x} -- ignored")
         return 0, None
-    owner = int(rec.get("owner", 0) or 0)
+    owner = _storage_owner(rec)
     if owner and owner != me:
         log(f"  storage op4 (DELETE): file 0x{fid:x} {rec.get('name')!r} "
             f"belongs to 0x{owner:016x}, not 0x{me:016x} -- REFUSED")
         return 0, None
-    files[:] = [f for f in files if int(f.get("id", 0) or 0) != fid]
+    files[:] = [f for f in files if _storage_id(f) != fid]
     _jsave(STORAGE_DB, d)
     # The blob is kept. A delete here removes the file from every listing, which
     # is what the client asked for; leaving the bytes on disk costs nothing and

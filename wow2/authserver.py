@@ -2643,6 +2643,56 @@ def message_add(to_entity: int, type_id: int, sender: int, sender_name: str,
     return mid
 
 
+# The six clan NOTIFICATIONS, from the client's own message dispatcher
+# (0x08990564, `type - 13`). These are not mailbox items and must never be
+# filed: a notification DELETES ITSELF when it is handled (the console resolves
+# the clan, re-reads the roster, then fires `Messaging op 4`), which is exactly
+# the difference between the two kinds -- "a message that survives being read is
+# a mailbox item; one that deletes itself is a notification". Filing one would
+# re-deliver it at every sign-in forever, and a message the client cannot make
+# sense of is how an account gets bricked.
+CLAN_MSG_CLEFT = 16            # "%GAMER% has left the clan"
+CLAN_MSG_CADMIN = 17           # "You are now a clan %CLAN% administrator"
+CLAN_MSG_CKICKED = 18          # "You have been kicked from the clan %CLAN%"
+CLAN_MSG_CDISBAND = 26         # "The clan %CLAN% has been disbanded"
+CLAN_MSG_COWNER = 28           # "You are now the clan %CLAN% owner"
+CLAN_MSG_CORDINARY = 39        # "You are no longer a clan %CLAN% administrator"
+
+
+def clan_notify(to_entity: int, type_id: int, tid: int, clan_name: str,
+                actor: int, actor_name: str) -> None:
+    """Tell one account that something happened to its clan. Push only.
+
+    This is the half of every clan verb that the REQUEST does not do. Without
+    it a promoted member keeps a stale roster and its own gamer menu goes on
+    offering the verbs an ordinary member should not have, until it signs in
+    again -- the client has no polling anywhere in the clan surface.
+
+    The id is taken from the mailbox counter but nothing is stored, so a
+    `Messaging op 4` for it finds nothing and says so. That is the correct
+    outcome, not a leak: the client deletes what it has consumed either way.
+
+    `WOW2_NO_CLAN_NOTIFY=1` turns all of these off. Worth having because the
+    tail layout is only proven for the 0x100-byte class (types 17/18/28/39,
+    Phase 32); 16 and 26 fall to the plain eight-field base B on the strength of
+    the registry's malloc sizes alone, and a wrong shape drops the receiver's
+    LSG connection. Nothing is persisted, so a re-login is the whole recovery.
+    """
+    if os.environ.get("WOW2_NO_CLAN_NOTIFY") == "1":
+        log(f"  (clan notify type {type_id} suppressed by WOW2_NO_CLAN_NOTIFY)")
+        return
+    d = messages_db()
+    mid = int(d["next_msg"])
+    d["next_msg"] = mid + 1
+    _jsave(FRIENDS_DB, d)
+    ok = push_to_account(to_entity, type_id, actor, actor_name, msg_id=mid,
+                         session_id=tid.to_bytes(8, "little"),
+                         clan_name=clan_name)
+    log(f"  clan notify type {type_id} -> 0x{to_entity:016x} "
+        f"({clan_name!r} 0x{tid:016x}, msg {mid}): "
+        + ("pushed" if ok else "not online, and a notification is never filed"))
+
+
 def messages_for(entity: int) -> list:
     return [m for m in messages_db()["messages"] if m.get("to") == f"{entity:016x}"]
 
@@ -3005,6 +3055,260 @@ def teams_answer_invite(accept: bool, dec: dict, who=None, peer_ip: str = ""):
         + ("" if had else ", but no proposal was on file")
         + f") -- {len(rec['members'])} member(s), "
         f"{len(rec['proposals'])} proposal(s) left")
+    return 0, None
+
+
+def _teams_req_pair(dec: dict, op: int):
+    """The shape every clan-administration request shares: `[u8 0][u64][u64]`.
+
+    Decoded from the request builders in Phase 40 -- ops 3, 4, 5, 26 and 27 all
+    call the same three-field builder, and the two u64s are always (teamId,
+    gamerId) IN THAT ORDER. `op 25` is the exception in the family and reads the
+    pair the OTHER way round; it has no handler, which is why nothing noticed.
+    """
+    r = lsg_request_params(dec)
+    r.u8()
+    return r.u64(), r.u64()
+
+
+def _teams_actor(peer_ip: str, who):
+    return account_for(peer_ip), (who or (rigconfig.USERNAME, 0))[0]
+
+
+def teams_set_rank(promote: bool, dec: dict, who=None, peer_ip: str = ""):
+    """Teams op 3 (promote to administrator) / op 26 (demote to member).
+
+    `[u8 0][u64 teamId][u64 gamerId]`. Both are OWNER-only in the client: the
+    rows are conditional adds, so an ordinary member is not shown a greyed
+    button, the verb simply is not on the menu (`0x08a06444` promote,
+    `0x08a06e4c` demote).
+
+    The rank is written into the team record's `ranks` map, which is exactly
+    what `team_rank()` already reads -- so the whole of promote/demote is one
+    number in the store, and the client picks it up at its next `Teams op 21`.
+
+    **Demote cannot be reached until promote works**, and that is not a UI
+    quirk: the demote row is gated on the target's rank being ADMINISTRATOR,
+    and until Phase 40 this server only ever served 0 or 2. So the two verbs had
+    to be built together or neither could be tested.
+    """
+    op = 3 if promote else 26
+    verb = "PROMOTE" if promote else "DEMOTE"
+    me, name = _teams_actor(peer_ip, who)
+    try:
+        tid, target = _teams_req_pair(dec, op)
+    except Exception as e:
+        log(f"  (teams op{op} decode failed: {e})")
+        return 0, None
+    d = teams_db()
+    key, mine, them = f"{tid:016x}", f"{me:016x}", f"{target:016x}"
+    rec = d["teams"].get(key)
+    if rec is None:
+        log(f"  teams op{op} ({verb}): no such clan 0x{key} -- ignored")
+        return 0, None
+    if rec.get("owner") != mine:
+        log(f"  teams op{op} ({verb}): {name} 0x{mine} does not own "
+            f"{rec.get('name')!r} -- REFUSED")
+        return 0, None
+    if them not in rec.get("members", []):
+        log(f"  teams op{op} ({verb}): 0x{them} is not in {rec.get('name')!r} "
+            f"-- ignored")
+        return 0, None
+    ranks = rec.setdefault("ranks", {})
+    ranks[them] = TEAM_RANK_ADMIN if promote else TEAM_RANK_MEMBER
+    _jsave(TEAMS_DB, d)
+    log(f"  teams op{op} ({verb} CLAN MEMBER): {name} 0x{mine} sets 0x{them} "
+        f"to {'administrator' if promote else 'member'} (rank "
+        f"{ranks[them]}) in {rec.get('name')!r} 0x{key}")
+    clan_notify(target, CLAN_MSG_CADMIN if promote else CLAN_MSG_CORDINARY,
+                tid, rec.get("name") or "", me, name)
+    return 0, None
+
+
+def teams_remove_member(dec: dict, who=None, peer_ip: str = ""):
+    """Teams op 4 -- remove a member from the clan ("Remove from clan").
+
+    `[u8 0][u64 teamId][u64 gamerId]`, ADMIN or OWNER. Its launcher
+    (`0x089ae364`) is shared with cancel-invite and branches on a per-gamer
+    relationship flag (0x800): a real member gets op 4, a pending invitee gets
+    op 25 from the same button.
+    """
+    me, name = _teams_actor(peer_ip, who)
+    try:
+        tid, target = _teams_req_pair(dec, 4)
+    except Exception as e:
+        log(f"  (teams op4 decode failed: {e})")
+        return 0, None
+    d = teams_db()
+    key, mine, them = f"{tid:016x}", f"{me:016x}", f"{target:016x}"
+    rec = d["teams"].get(key)
+    if rec is None:
+        log(f"  teams op4 (REMOVE): no such clan 0x{key} -- ignored")
+        return 0, None
+    if team_rank(rec, mine) < TEAM_RANK_ADMIN:
+        log(f"  teams op4 (REMOVE): {name} 0x{mine} is an ordinary member of "
+            f"{rec.get('name')!r} -- REFUSED")
+        return 0, None
+    if not _team_drop(rec, them):
+        log(f"  teams op4 (REMOVE): 0x{them} is not in {rec.get('name')!r} "
+            f"-- ignored")
+        return 0, None
+    _jsave(TEAMS_DB, d)
+    log(f"  teams op4 (REMOVE FROM CLAN): {name} 0x{mine} removes 0x{them} "
+        f"from {rec.get('name')!r} 0x{key} -- {len(rec['members'])} member(s) left")
+    clan_notify(target, CLAN_MSG_CKICKED, tid, rec.get("name") or "", me, name)
+    return 0, None
+
+
+def _team_drop(rec: dict, member: str) -> bool:
+    """Take a member off a clan, rank override and all. True if they were on it."""
+    if member not in rec.get("members", []):
+        return False
+    rec["members"] = [m for m in rec["members"] if m != member]
+    (rec.get("ranks") or {}).pop(member, None)
+    return True
+
+
+def teams_leave(dec: dict, who=None, peer_ip: str = ""):
+    """Teams op 5 -- leave the clan, DISBAND it, or remove a member. All three.
+
+    `[u8 0][u64 teamId][u64 gamerId]`, and the three meanings are told apart by
+    the caller's role and by whether the gamer id is zero:
+
+        target == 0, caller is not the owner   -> the caller leaves
+        target == 0, caller IS the owner       -> DISBAND the whole clan
+        target != 0                            -> remove that member
+
+    **There is no separate disband opcode, and there is no disband menu row.**
+    Ten `%CLAN%` verbs map to nine wire verbs. For the owner, `Leave clan`
+    becomes the disband chain: it asks "Transfer ownership of clan X?" first,
+    and pressing CIRCLE there -- declining the transfer -- is the step FORWARD
+    to "Disband clan X?". The two launchers (`0x089ba4c4` no-gamer and
+    `0x089ba65c` selected-gamer) put identical bytes on the wire for leave and
+    disband, both with target 0, so the server cannot tell them apart from the
+    request and must decide from the caller's role. That is not a guess: the
+    no-gamer launcher loads its target from a static pair at `0x08d39b98`, which
+    is zero.
+    """
+    me, name = _teams_actor(peer_ip, who)
+    try:
+        tid, target = _teams_req_pair(dec, 5)
+    except Exception as e:
+        log(f"  (teams op5 decode failed: {e})")
+        return 0, None
+    d = teams_db()
+    key, mine, them = f"{tid:016x}", f"{me:016x}", f"{target:016x}"
+    rec = d["teams"].get(key)
+    if rec is None:
+        log(f"  teams op5 (LEAVE/DISBAND): no such clan 0x{key} -- ignored")
+        return 0, None
+    cname = rec.get("name")
+    if target and them != mine:
+        if team_rank(rec, mine) < TEAM_RANK_ADMIN:
+            log(f"  teams op5 (REMOVE): {name} 0x{mine} is an ordinary member "
+                f"of {cname!r} -- REFUSED")
+            return 0, None
+        if not _team_drop(rec, them):
+            log(f"  teams op5 (REMOVE): 0x{them} is not in {cname!r} -- ignored")
+            return 0, None
+        _jsave(TEAMS_DB, d)
+        log(f"  teams op5 (REMOVE FROM CLAN): {name} 0x{mine} removes 0x{them} "
+            f"from {cname!r} 0x{key} -- {len(rec['members'])} member(s) left")
+        clan_notify(target, CLAN_MSG_CKICKED, tid, cname or "", me, name)
+        return 0, None
+    if rec.get("owner") == mine:
+        members = [m for m in rec.get("members", []) if m != mine]
+        del d["teams"][key]
+        _jsave(TEAMS_DB, d)
+        log(f"  teams op5 (DISBAND CLAN): {name} 0x{mine} disbands {cname!r} "
+            f"0x{key} -- {len(members)} other member(s) lose it")
+        for m in members:
+            clan_notify(int(m, 16), CLAN_MSG_CDISBAND, tid, cname or "", me, name)
+        return 0, None
+    _team_drop(rec, mine)
+    _jsave(TEAMS_DB, d)
+    log(f"  teams op5 (LEAVE CLAN): {name} 0x{mine} leaves {cname!r} 0x{key} "
+        f"-- {len(rec['members'])} member(s) left")
+    for m in rec.get("members", []):
+        clan_notify(int(m, 16), CLAN_MSG_CLEFT, tid, cname or "", me, name)
+    return 0, None
+
+
+def teams_transfer_owner(dec: dict, who=None, peer_ip: str = ""):
+    """Teams op 27 -- hand the clan to another member ("Transfer ownership").
+
+    `[u8 0][u64 teamId][u64 gamerId]`, OWNER only -- the row is not added at all
+    otherwise (`0x089cda18` skips the whole add), so there is nothing greyed to
+    see. Picking the new owner is a second screen, `UserProfileClanOwnerSelect`,
+    whose list is `[empty]` in a one-member clan.
+
+    The OLD OWNER BECOMES AN ORDINARY MEMBER here. Nothing in the client says
+    what should happen to them -- `Net.Ack.SetOwner` only names the new owner --
+    so this is the server's choice, and it is the conservative one: no lingering
+    administrator rights that nobody granted.
+    """
+    me, name = _teams_actor(peer_ip, who)
+    try:
+        tid, target = _teams_req_pair(dec, 27)
+    except Exception as e:
+        log(f"  (teams op27 decode failed: {e})")
+        return 0, None
+    d = teams_db()
+    key, mine, them = f"{tid:016x}", f"{me:016x}", f"{target:016x}"
+    rec = d["teams"].get(key)
+    if rec is None:
+        log(f"  teams op27 (TRANSFER): no such clan 0x{key} -- ignored")
+        return 0, None
+    if rec.get("owner") != mine:
+        log(f"  teams op27 (TRANSFER): {name} 0x{mine} does not own "
+            f"{rec.get('name')!r} -- REFUSED")
+        return 0, None
+    if them not in rec.get("members", []):
+        log(f"  teams op27 (TRANSFER): 0x{them} is not in {rec.get('name')!r} "
+            f"-- ignored")
+        return 0, None
+    rec["owner"] = them
+    ranks = rec.setdefault("ranks", {})
+    ranks.pop(them, None)                      # the owner's rank is implied
+    ranks[mine] = TEAM_RANK_MEMBER
+    _jsave(TEAMS_DB, d)
+    log(f"  teams op27 (TRANSFER OWNERSHIP): {name} 0x{mine} hands "
+        f"{rec.get('name')!r} 0x{key} to 0x{them}; the old owner is now an "
+        f"ordinary member")
+    clan_notify(target, CLAN_MSG_COWNER, tid, rec.get("name") or "", me, name)
+    return 0, None
+
+
+def teams_op10(dec: dict, who=None, peer_ip: str = ""):
+    """Teams op 10 -- `[u8 0][u64 gamerId]`, and NOT one of the ten clan verbs.
+
+    All ten are placed elsewhere, and this one carries no team id at all. Its
+    single trigger in the whole image is inside the BLOCK-A-GAMER chain
+    (`0x08a0f948`), one state after the same chain fires op 7 (decline clan
+    invite) on the same gamer -- so it is the second half of a clan cleanup
+    performed when you block someone. Two readings fit and the client cannot
+    separate them: withdraw my outstanding proposal to this gamer (the Teams
+    analogue of `Friends op 13`), or remove them from my clan without naming it.
+
+    Logged rather than acted on. A bare reply is right either way -- op 10 is on
+    the dispatcher's "reads nothing" arm -- and guessing wrong here would delete
+    a membership nobody asked to lose. To settle it: block a gamer you have
+    invited to your clan, and see which id arrives.
+    """
+    me, name = _teams_actor(peer_ip, who)
+    try:
+        r = lsg_request_params(dec)
+        r.u8()
+        target = r.u64()
+    except Exception as e:
+        log(f"  (teams op10 decode failed: {e})")
+        return 0, None
+    tid, rec = team_of(me)
+    log(f"  teams op10 (UNIDENTIFIED, from the block-gamer chain): {name} "
+        f"0x{me:016x} -> gamer 0x{target:016x}"
+        + (f"; caller is in {rec.get('name')!r} 0x{tid:016x}" if rec else
+           "; caller is in no clan")
+        + " -- recorded, not acted on")
     return 0, None
 
 
@@ -3422,6 +3726,16 @@ def lsg_result_block(svc: int, op: int, dec: dict,
         return teams_answer_invite(op == 8, dec, who, ident_key)
     if svc == LSG_SERVICE_TEAMS and op == 24:
         return teams_proposals_result(dec, who, ident_key)
+    if svc == LSG_SERVICE_TEAMS and op in (3, 26):
+        return teams_set_rank(op == 3, dec, who, ident_key)
+    if svc == LSG_SERVICE_TEAMS and op == 4:
+        return teams_remove_member(dec, who, ident_key)
+    if svc == LSG_SERVICE_TEAMS and op == 5:
+        return teams_leave(dec, who, ident_key)
+    if svc == LSG_SERVICE_TEAMS and op == 27:
+        return teams_transfer_owner(dec, who, ident_key)
+    if svc == LSG_SERVICE_TEAMS and op == 10:
+        return teams_op10(dec, who, ident_key)
     if svc == LSG_SERVICE_STORAGE and op in (7, 8):
         return storage_list_result(op, dec, who, ident_key)
     if svc == LSG_SERVICE_STORAGE and op == 5:

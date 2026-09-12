@@ -567,6 +567,27 @@ def lsg_request_params(dec: dict):
     return r
 
 
+def lsg_request_noargs(dec: dict, what: str) -> None:
+    """Consume the request of an RPC that takes NO parameters.
+
+    Several sign-in reads (`Friends` 5/7/19, `Teams` 20, `Teams` 24) are nothing
+    but the `[u8 0]` lead-in. Reading it costs nothing and buys two things: the
+    request census stops listing them as ignored, so that list can be driven to
+    empty and any entry in it becomes a genuine surprise; and if one of them ever
+    turns out to carry an argument after all, this says so instead of dropping it
+    in silence -- which is the whole failure mode blindspots.py exists for."""
+    try:
+        r = lsg_request_params(dec)
+        lead = r.u8()
+        extra = bd.read_fields(r)
+    except Exception as e:
+        log(f"  ({what}: request decode failed: {e})")
+        return
+    if lead or extra:
+        shown = ", ".join(f"{bd.TYPE_NAMES.get(t, t)} {v!r}" for t, v in extra)
+        log(f"  *** {what} TOOK ARGUMENTS (lead={lead}): {shown}")
+
+
 # ---------------------------------------------------------- the request census
 # What the client SENDS, against what a handler READS.
 #
@@ -636,8 +657,13 @@ def census_note(svc: int, op: int, dec: dict) -> None:
     rec = REQ_CENSUS.setdefault(key, {"count": 0, "read": 0, "unread": 0,
                                       "fields": []})
     rec["count"] += 1
-    rec["read"] = max(rec["read"], len(fields) - len(tail))
-    rec["unread"] = max(rec["unread"], len(tail))
+    # LATEST, not max. The question this answers is "does the handler ignore
+    # fields NOW", so a max() would leave a blind spot flagged forever after it
+    # was fixed -- which is exactly what it did the first time one was closed.
+    nread, nun = len(fields) - len(tail), len(tail)
+    if (rec["read"], rec["unread"]) != (nread, nun):
+        fresh = True                    # a handler changed: worth writing out
+    rec["read"], rec["unread"] = nread, nun
     for i, (t, v) in enumerate(fields):
         while len(rec["fields"]) <= i:
             rec["fields"].append({"type": "", "values": [], "more": False})
@@ -2232,6 +2258,7 @@ NO_PROFILES = os.environ.get("WOW2_NO_PROFILES") == "1"
 def profile_db() -> dict:
     d = _jload(PROFILE_DB, {})
     d.setdefault("public", {})
+    d.setdefault("private", {})
     return d
 
 
@@ -2272,8 +2299,20 @@ PROFILE_EMPTY = [[bd.BD_SINT64, 0], [bd.BD_SINT64, 0], [bd.BD_SINT64, 0],
                  [bd.BD_SINT64, 0], [bd.BD_STR, ""], [bd.BD_SINT32, 0]]
 
 
-def profile_upload(dec: dict, who=None, peer_ip: str = ""):
-    """Profile op 4: the console uploads its own public profile. No results."""
+def profile_upload(dec: dict, who=None, peer_ip: str = "", section: str = "public"):
+    """Profile op 4 (public) and op 1: the console uploads its own profile.
+
+    ONE record type, written to two places. Phase 42 measured both requests off
+    the wire and they are the same ten fields in the same order, down to the f64
+    longitude/latitude pair -- op 1 had simply never been read, because it was
+    answered by the fall-through bare reply and nothing looked at what it sent.
+
+    The reply is unchanged either way: `bdProfile` ops 1/4/5 pass no result
+    container at all (`a2 = $zero` at 0x08986bec / 0x089889a0), so the bare
+    `err=0, 0 results` was always right and this only adds the store.
+
+    `section` is "public" for op 4 and "private" for op 1. See ROADMAP A4 for
+    what is proved and what is inferred about that pairing."""
     # account_for() FIRST: `who` is the identity the server ISSUES (1, 2, ...),
     # while every store on this rig is keyed by the CLIENT's 64-bit account id
     # (0x975367efa4bbebed and friends). Getting that precedence backwards files
@@ -2292,15 +2331,38 @@ def profile_upload(dec: dict, who=None, peer_ip: str = ""):
     d = profile_db()
     key = f"{entity:016x}"
     name = (who[0] if who else "") or friend_name(friends_db(), entity)
-    d["public"][key] = {"name": name, "at": ts(),
-                        "fields": [_field_to_json(t, v) for t, v in fields]}
+    d[section][key] = {"name": name, "at": ts(),
+                       "fields": [_field_to_json(t, v) for t, v in fields]}
     _jsave(PROFILE_DB, d)
     shown = ", ".join(str(v) for _t, v in fields[:4])
-    log(f"  profile upload: {name or key} <- {len(fields)} fields ({shown}...)")
+    log(f"  profile upload ({section}): {name or key} <- {len(fields)} fields "
+        f"({shown}...)")
     return 0, None
 
 
-def profile_read_public(dec: dict, who=None, peer_ip: str = ""):
+def profile_op5(dec: dict, who=None, peer_ip: str = ""):
+    """Profile op 5 -- `[u8 0][i32 99]`, and 99 has been constant in every capture.
+
+    What it asks for is NOT established. It fires once per sign-in and takes the
+    bare `err=0, 0 results` this server has always given it (ops 1/4/5 pass no
+    result container at all, `a2 = $zero` at 0x08986bec / 0x089889a0), so this
+    handler changes nothing on the wire -- it exists so the value is recorded and
+    so a 99 that ever becomes something else is visible."""
+    try:
+        r = lsg_request_params(dec)
+        r.u8()                          # the [u8 0] lead-in, constant on every RPC
+        fields = bd.read_fields(r)
+    except Exception as e:
+        log(f"  (profile op5 decode failed: {e})")
+        return 0, None
+    shown = ", ".join(f"{bd.TYPE_NAMES.get(t, t)} {v!r}" for t, v in fields)
+    log(f"  profile op5: {shown or '(no arguments)'}"
+        + ("" if fields == [(bd.BD_SINT32, 99)] else "   <- NOT the usual i32 99"))
+    return 0, None
+
+
+def profile_read_public(dec: dict, who=None, peer_ip: str = "",
+                       section: str = "public"):
     """Profile op 2: read one public profile. ONE row, and NO result count."""
     if NO_PROFILES:
         return 0, None
@@ -2312,7 +2374,7 @@ def profile_read_public(dec: dict, who=None, peer_ip: str = ""):
         log(f"  (profile read decode failed: {e})")
         return 0, None
     d = profile_db()
-    rec = d["public"].get(f"{target:016x}")
+    rec = d[section].get(f"{target:016x}")
     fields = rec["fields"] if rec else [list(f) for f in PROFILE_EMPTY]
     name = (rec or {}).get("name") or friend_name(friends_db(), target)
     if not rec:
@@ -2332,8 +2394,9 @@ def profile_read_public(dec: dict, who=None, peer_ip: str = ""):
             if not _write_field(w, int(t), v):
                 log(f"  (!! profile field type {t} has no writer -- skipped)")
 
-    log(f"  profile read: entity 0x{target:016x} ({name or 'unknown'}) -- "
-        f"{'stored' if rec else 'EMPTY placeholder'}, {len(fields)} fields")
+    log(f"  profile read ({section}): entity 0x{target:016x} "
+        f"({name or 'unknown'}) -- {'stored' if rec else 'EMPTY placeholder'}, "
+        f"{len(fields)} fields")
     return None, emit
 
 
@@ -2396,6 +2459,7 @@ def friends_write_row(w, entity: int, name: str, kind: str) -> None:
 
 def friends_list_result(op: int, dec: dict, who=None, peer_ip: str = ""):
     """Friends ops 5 / 7 / 19 -- the three lists the client downloads at sign-in."""
+    lsg_request_noargs(dec, f"friends op{op}")
     me = account_for(peer_ip)
     name = (who or (rigconfig.USERNAME, 0))[0]
     friends_note_name(me, name)
@@ -2872,6 +2936,13 @@ def messages_result(dec: dict, who=None, peer_ip: str = ""):
         r.u8()                              # the [u8 0] lead-in, constant on every RPC
         start = r.u32()
         count = r.u32()
+        # Two trailing bools, both hard-coded FALSE at this RPC's single call
+        # site (`move $t0, $zero` / `move $t1, $zero` at 0x0898d7dc / 0x0898d7e4),
+        # so they cannot vary and what they select is unknown. Tripwire, not a
+        # feature: if either is ever true, that is new information.
+        flags = [v for t, v in bd.read_fields(r) if t == bd.BD_BOOL]
+        if any(flags):
+            log(f"  *** messaging op1 flags are not both false: {flags}")
     except Exception as e:
         log(f"  (messaging op1 decode failed: {e})")
     rows = messages_for(me)[start:start + max(1, count)]
@@ -3021,6 +3092,7 @@ def teams_memberships_result(dec: dict, who=None, peer_ip: str = ""):
 
     Reply: [u32 numResults] then rows [u64 teamID][str name][u8] (0x08c279a4).
     """
+    lsg_request_noargs(dec, "teams op20")
     me = account_for(peer_ip)
     name = (who or (rigconfig.USERNAME, 0))[0]
     d = teams_db()
@@ -3499,6 +3571,7 @@ def teams_proposals_result(dec: dict, who=None, peer_ip: str = ""):
     clan message type ids are somewhere in the 8 / 11..33 block that
     `net::tBuddy` stubs out, and no table for them has been found yet.
     """
+    lsg_request_noargs(dec, "teams op24")
     me = account_for(peer_ip)
     mine = f"{me:016x}"
     fd = friends_db()
@@ -3572,22 +3645,49 @@ def storage_list_result(op: int, dec: dict, who=None, peer_ip: str = ""):
     """
     me = account_for(peer_ip)
     owner = me
-    if op == 7 and os.environ.get("WOW2_NO_STORAGE_OWNER") != "1":
-        try:
-            r = lsg_request_params(dec)
-            r.u8()                          # leading flags byte
-            owner = r.u64() or me
-        except Exception as e:
-            log(f"  (storage op7 owner decode failed: {e}; falling back to caller)")
+    # Phase 42: BOTH ops end with a window and an optional name filter, and the
+    # server used to answer with everything it held regardless.
+    #
+    #   op 7  [u8 0][u64 owner][u32 start][u16 count][str filter?]
+    #   op 8  [u8 0]           [u32 start][u16 count][str filter?]
+    #
+    # `start` and `count` are hard-coded immediates at each op's single call
+    # site -- `ori $a3, $zero, 0x100` (256) at 0x089969f4 for op 8 and
+    # `ori $t1, $zero, 0x80` (128) at 0x08996b64 for op 7 -- so the client will
+    # never ask for more, and a reply carrying more hands rows to a list it did
+    # not size for. Harmless while no store holds ten files; not a thing to
+    # leave in for a real deployment.
+    start, count, filt = 0, 0, ""
+    try:
+        r = lsg_request_params(dec)
+        r.u8()                          # the [u8 0] lead-in, constant on every RPC
+        if op == 7:
+            asked = r.u64()
+            if os.environ.get("WOW2_NO_STORAGE_OWNER") != "1":
+                owner = asked or me
+        start = r.u32()
+        count = r.u16()
+        # The filter is NULL at both call sites ($t0 / $t2 = zero) and has never
+        # arrived non-empty. Log it rather than drop it, so the first one that
+        # ever does is visible instead of silently ignored.
+        filt = next((v for t, v in bd.read_fields(r) if t == bd.BD_STR and v), "")
+    except Exception as e:
+        log(f"  (storage op{op} request decode failed: {e}; serving unwindowed)")
     files = storage_files()
     if op == 7:
         files = [f for f in files if f.get("owner") in (None, f"{owner:016x}")]
     else:
         files = [f for f in files if not f.get("owner")]
+    total = len(files)
+    if count > 0:
+        files = files[start:start + count]
     log(f"  storage op{op} ({'by owner' if op == 7 else 'global'}) for "
         f"0x{owner:016x}"
         + (f" (asked by 0x{me:016x})" if owner != me else "")
         + f": {len(files)} file(s)"
+        + (f" of {total} (window {start}..{start + count})"
+           if len(files) != total else "")
+        + (f" [filter {filt!r} IGNORED]" if filt else "")
         + (" -> " + ", ".join(f.get("name", "?") for f in files) if files else ""))
 
     def emit(w):
@@ -3883,6 +3983,10 @@ def lsg_result_block(svc: int, op: int, dec: dict,
         return profile_read_public(dec, who, ident_key)
     if svc == LSG_SERVICE_PROFILE and op == 4:
         return profile_upload(dec, who, ident_key)
+    if svc == LSG_SERVICE_PROFILE and op == 1:
+        return profile_upload(dec, who, ident_key, section="private")
+    if svc == LSG_SERVICE_PROFILE and op == 5:
+        return profile_op5(dec, who, ident_key)
     if svc == LSG_SERVICE_MESSAGING and op == 1:
         return messages_result(dec, who, ident_key)
     if svc == LSG_SERVICE_MESSAGING and op == 4:

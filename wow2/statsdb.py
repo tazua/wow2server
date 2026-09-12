@@ -17,10 +17,25 @@ from __future__ import annotations
 
 import json
 import os
+import sys
 from pathlib import Path
 
-ROOT = Path(__file__).resolve().parent.parent
-CAP = ROOT / "capture"
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+
+import serverconfig
+
+# THE CONFIGURED DATA DIRECTORY, not one derived from where this file happens to
+# live. It used to be `Path(__file__).parent.parent / "capture"`, which is the
+# right answer in the source tree and silently wrong once installed: it resolves
+# to `site-packages/capture`, which does not exist and is not writable, so every
+# leaderboard write, every rating and the whole ranked pot failed with one line
+# of log each and nothing persisted. Found on a live deployment after a real
+# match between two real NATs uploaded ten boards and kept none of them.
+#
+# `authserver.py` had this right (`CAP = serverconfig.DATA_DIR`); the store
+# modules did not, and potbank derives its own path from this one, so the same
+# bug reached the pot ledger.
+CAP = serverconfig.DATA_DIR
 STATS_DB = CAP / "stats-db.json"
 STATS_UPLOADS = CAP / "stats-uploads.jsonl"     # append-only forensic trail
 
@@ -63,8 +78,24 @@ def load() -> dict:
 
 
 def save(db: dict) -> bool:
+    """Write the leaderboards, atomically, creating the data directory if needed.
+
+    Two things this used to get wrong, both found on a live deployment:
+
+    * **It assumed the directory existed.** The server creates it at startup, so
+      the server was fine; the CLIs (`wow2 rating`, `wow2 award`) were not, and a
+      fresh install had nothing to say about why the write failed.
+    * **It was not atomic.** `write_text` truncates first, so a kill at the wrong
+      moment left a half-written leaderboard -- which `load()` then reads as `{}`
+      and the next write makes permanent. `authserver._jsave` has been atomic for
+      exactly this reason; this one was missed because the rig never gets killed
+      mid-match.
+    """
     try:
-        STATS_DB.write_text(json.dumps(db, indent=1, sort_keys=True))
+        CAP.mkdir(parents=True, exist_ok=True)
+        tmp = STATS_DB.with_suffix(".json.tmp")
+        tmp.write_text(json.dumps(db, indent=1, sort_keys=True))
+        os.replace(tmp, STATS_DB)          # atomic within one filesystem
         return True
     except OSError:
         return False

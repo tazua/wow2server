@@ -24,6 +24,7 @@ import argparse, pathlib, re, sys
 
 sys.path.insert(0, str(pathlib.Path(__file__).resolve().parent))
 import bdproto as bd
+import serverconfig
 
 ROOT = pathlib.Path(__file__).resolve().parent.parent
 
@@ -189,7 +190,8 @@ def main():
     if args.log is None:
         ap.error("give --hex or --log")
     path = (pathlib.Path(args.log) if args.log else
-            max((ROOT / "capture").glob("session-*.log"), key=lambda p: p.stat().st_mtime))
+            max(serverconfig.DATA_DIR.glob("session-*.log"),
+                key=lambda p: p.stat().st_mtime))
     msgs = messages_from_log(path)
     if args.svc is not None:
         msgs = [m for m in msgs if m[0] == args.svc]

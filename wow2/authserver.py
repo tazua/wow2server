@@ -12,6 +12,7 @@ this is the iteration surface. Run:  ../.venv/bin/python tools/authserver.py
 from __future__ import annotations
 
 import asyncio
+import atexit
 import datetime
 import json
 import secrets
@@ -546,8 +547,7 @@ def write_leaderboard_row(w, entity_id: int, score: int, rank: int, name: str):
     w.str_(name, LEADERBOARD_NAME_MAX)
 
 
-def lsg_request_params(dec: dict):
-    """A BdReader on a decoded client RPC, positioned just past the typed op id."""
+def _request_reader(dec: dict):
     body = dec["plain"][4:] if dec["enc"] == 1 else dec["plain"]
     r = bd.BdReader(body[1:])          # skip the service-id byte
     r.bitmode = True
@@ -555,6 +555,125 @@ def lsg_request_params(dec: dict):
     r.type_checked = True
     r.u8()                             # op id
     return r
+
+
+def lsg_request_params(dec: dict):
+    """A BdReader on a decoded client RPC, positioned just past the typed op id.
+
+    It parks the reader for `census_note()`, which is how the server can tell
+    what a handler did NOT read. See tools/blindspots.py."""
+    r = _request_reader(dec)
+    _LAST_READER.append(r)
+    return r
+
+
+# ---------------------------------------------------------- the request census
+# What the client SENDS, against what a handler READS.
+#
+# The whole class of bug this exists for is silent by construction: a field of
+# the right type in the right position carrying a value nobody derived. A wrong
+# field COUNT drops the LSG connection ~330 ms later and is loud; a wrong field
+# VALUE produces nothing at all -- no error, no log line, and a console that
+# looks like it simply ignored us. `+0xb8` cost two phases that way.
+#
+# So decode every request TWICE: once generically (bdproto walks any bd message
+# without knowing the RPC, because every field carries its own 5-bit tag), and
+# once as the handler actually read it. The difference is the blind spot. It
+# also records the DISTINCT VALUES of each field, which is what turns "that
+# leading u8 is probably always 0" from an assumption into a measurement.
+#
+# WOW2_NO_CENSUS=1 turns it off.
+REQ_CENSUS_PATH = CAP / "request-census.json"
+REQ_CENSUS: dict[str, dict] = {}
+_LAST_READER: list = []
+_CENSUS_LOGGED: set[str] = set()
+_CENSUS_WRITES = 0
+_CENSUS_LOADED = False
+_CENSUS_SAVED_AT = 0.0
+CENSUS_MAX_VALUES = 12                 # distinct values kept per field
+CENSUS_SAVE_S = 30.0                   # debounce; the store is small
+
+
+def _census_val(v) -> str:
+    if isinstance(v, bytes):
+        return v[:24].hex() + ("..." if len(v) > 24 else "")
+    if isinstance(v, int) and not isinstance(v, bool) and abs(v) > 0xFFFF:
+        return f"0x{v:x}"
+    s = str(v)
+    return s[:48] + ("..." if len(s) > 48 else "")
+
+
+def census_load() -> None:
+    """Carry the census across restarts. It accumulates what the client has EVER
+    sent, so starting empty and saving would quietly erase every RPC that did not
+    happen to fire again this run."""
+    global _CENSUS_LOADED
+    _CENSUS_LOADED = True
+    try:
+        prev = json.loads(REQ_CENSUS_PATH.read_text())
+    except (OSError, ValueError):
+        return
+    if isinstance(prev, dict):
+        REQ_CENSUS.update(prev)
+
+
+def census_note(svc: int, op: int, dec: dict) -> None:
+    """Record one request's typed fields, and shout once if we ignored any."""
+    global _CENSUS_WRITES
+    reader = _LAST_READER[-1] if _LAST_READER else None
+    del _LAST_READER[:]
+    if os.environ.get("WOW2_NO_CENSUS") == "1":
+        return
+    if not _CENSUS_LOADED:
+        census_load()
+    try:
+        fields = bd.read_fields(_request_reader(dec))
+        tail = bd.read_fields(reader) if reader is not None else list(fields)
+    except Exception:
+        return                          # a message we cannot walk is not a finding
+    key = f"{svc}:{op}"
+    fresh = key not in REQ_CENSUS
+    rec = REQ_CENSUS.setdefault(key, {"count": 0, "read": 0, "unread": 0,
+                                      "fields": []})
+    rec["count"] += 1
+    rec["read"] = max(rec["read"], len(fields) - len(tail))
+    rec["unread"] = max(rec["unread"], len(tail))
+    for i, (t, v) in enumerate(fields):
+        while len(rec["fields"]) <= i:
+            rec["fields"].append({"type": "", "values": [], "more": False})
+        f = rec["fields"][i]
+        f["type"] = bd.TYPE_NAMES.get(t, f"type{t}")
+        s = _census_val(v)
+        if s not in f["values"]:
+            fresh = True
+            if len(f["values"]) < CENSUS_MAX_VALUES:
+                f["values"].append(s)
+            else:
+                f["more"] = True
+    if tail and key not in _CENSUS_LOGGED:
+        _CENSUS_LOGGED.add(key)
+        shown = ", ".join(f"{bd.TYPE_NAMES.get(t, f'type{t}')} {_census_val(v)}"
+                          for t, v in tail[:6])
+        log(f"  *** UNREAD REQUEST FIELD service={svc} op={op}: handler read "
+            f"{len(fields) - len(tail)} of {len(fields)} fields, ignored "
+            f"{len(tail)}: {shown}")
+    # Write whenever the census LEARNS something (a new RPC, a value never seen
+    # before), and otherwise at most every CENSUS_SAVE_S. A plain every-Nth-call
+    # save would leave the file empty exactly when it is most interesting: a
+    # whole sign-in is thirteen RPCs.
+    global _CENSUS_SAVED_AT
+    _CENSUS_WRITES += 1
+    if fresh or time.time() - _CENSUS_SAVED_AT > CENSUS_SAVE_S:
+        _CENSUS_SAVED_AT = time.time()
+        _jsave(REQ_CENSUS_PATH, REQ_CENSUS)
+
+
+def census_flush() -> None:
+    if REQ_CENSUS and os.environ.get("WOW2_NO_CENSUS") != "1":
+        _jsave(REQ_CENSUS_PATH, REQ_CENSUS)
+
+
+atexit.register(census_flush)
 
 
 # --------------------------------------------------------------- identities
@@ -1336,7 +1455,7 @@ def sessions_get_result(dec: dict, peer_ip: str = ""):
     """
     try:
         r = lsg_request_params(dec)
-        r.u8()
+        r.u8()                              # the [u8 0] lead-in, constant on every RPC
         blob = r.blob()
     except Exception as e:
         log(f"  (session get decode failed: {e})")
@@ -2431,7 +2550,7 @@ def friends_match_decline(dec: dict, who=None, peer_ip: str = ""):
     name = (who or (rigconfig.USERNAME, 0))[0]
     try:
         r = lsg_request_params(dec)
-        r.u8()
+        r.u8()                              # the [u8 0] lead-in, constant on every RPC
         inviter = r.u64()
     except Exception as e:
         log(f"  (friends op10 decode failed: {e})")
@@ -2478,7 +2597,7 @@ def friends_block(dec: dict, who=None, peer_ip: str = ""):
     name = (who or (rigconfig.USERNAME, 0))[0]
     try:
         r = lsg_request_params(dec)
-        r.u8()
+        r.u8()                              # the [u8 0] lead-in, constant on every RPC
         target = r.u64()
         flag = r.u8()
     except Exception as e:
@@ -2550,7 +2669,7 @@ def friends_revoke(dec: dict, who=None, peer_ip: str = ""):
     name = (who or (rigconfig.USERNAME, 0))[0]
     try:
         r = lsg_request_params(dec)
-        r.u8()
+        r.u8()                              # the [u8 0] lead-in, constant on every RPC
         target = r.u64()
     except Exception as e:
         log(f"  (friends op4 decode failed: {e})")
@@ -2601,7 +2720,7 @@ def friends_remove(dec: dict, who=None, peer_ip: str = ""):
     name = (who or (rigconfig.USERNAME, 0))[0]
     try:
         r = lsg_request_params(dec)
-        r.u8()
+        r.u8()                              # the [u8 0] lead-in, constant on every RPC
         target = r.u64()
     except Exception as e:
         log(f"  (friends op13 decode failed: {e})")
@@ -2750,7 +2869,7 @@ def messages_result(dec: dict, who=None, peer_ip: str = ""):
     start, count = 0, 25
     try:
         r = lsg_request_params(dec)
-        r.u8()
+        r.u8()                              # the [u8 0] lead-in, constant on every RPC
         start = r.u32()
         count = r.u32()
     except Exception as e:
@@ -2781,7 +2900,7 @@ def messages_delete(dec: dict, who=None, peer_ip: str = ""):
     me = account_for(peer_ip)
     try:
         r = lsg_request_params(dec)
-        r.u8()
+        r.u8()                              # the [u8 0] lead-in, constant on every RPC
         mid = r.u64()
     except Exception as e:
         log(f"  (messaging op4 decode failed: {e})")
@@ -2809,7 +2928,7 @@ def friends_answer(dec: dict, accept: bool, who=None, peer_ip: str = ""):
     name = (who or (rigconfig.USERNAME, 0))[0]
     try:
         r = lsg_request_params(dec)
-        r.u8()
+        r.u8()                              # the [u8 0] lead-in, constant on every RPC
         sender = r.u64()
     except Exception as e:
         log(f"  (friends op{2 if accept else 3} decode failed: {e})")
@@ -2960,7 +3079,7 @@ def teams_members_result(dec: dict, who=None, peer_ip: str = ""):
     """Teams op 21 -- the members of one team. Row [u64][str][bool][u8] (0x08c2804c)."""
     try:
         r = lsg_request_params(dec)
-        r.u8()
+        r.u8()                              # the [u8 0] lead-in, constant on every RPC
         tid = r.u64()
     except Exception as e:
         log(f"  (teams op21 decode failed: {e})")
@@ -3005,7 +3124,7 @@ def teams_invite(dec: dict, who=None, peer_ip: str = ""):
     name = (who or (rigconfig.USERNAME, 0))[0]
     try:
         r = lsg_request_params(dec)
-        r.u8()
+        r.u8()                              # the [u8 0] lead-in, constant on every RPC
         tid = r.u64()
         target = r.u64()
     except Exception as e:
@@ -3070,7 +3189,7 @@ def teams_answer_invite(accept: bool, dec: dict, who=None, peer_ip: str = ""):
     verb = "ACCEPT" if accept else "DECLINE"
     try:
         r = lsg_request_params(dec)
-        r.u8()
+        r.u8()                              # the [u8 0] lead-in, constant on every RPC
         tid = r.u64()
         inviter = r.u64()
     except Exception as e:
@@ -3117,7 +3236,7 @@ def _teams_req_pair(dec: dict, op: int):
     pair the OTHER way round; it has no handler, which is why nothing noticed.
     """
     r = lsg_request_params(dec)
-    r.u8()
+    r.u8()                              # the [u8 0] lead-in, constant on every RPC
     return r.u64(), r.u64()
 
 
@@ -3354,7 +3473,7 @@ def teams_op10(dec: dict, who=None, peer_ip: str = ""):
     me, name = _teams_actor(peer_ip, who)
     try:
         r = lsg_request_params(dec)
-        r.u8()
+        r.u8()                              # the [u8 0] lead-in, constant on every RPC
         target = r.u64()
     except Exception as e:
         log(f"  (teams op10 decode failed: {e})")
@@ -3503,7 +3622,7 @@ def storage_get_result(dec: dict, who=None, peer_ip: str = ""):
     must NOT carry a numResults field (same trap as Teams op 1)."""
     try:
         r = lsg_request_params(dec)
-        r.u8()
+        r.u8()                              # the [u8 0] lead-in, constant on every RPC
         fid = r.u64()
     except Exception as e:
         log(f"  (storage op5 decode failed: {e})")
@@ -3545,7 +3664,7 @@ def storage_upload_result(dec: dict, who=None, peer_ip: str = ""):
     me = account_for(peer_ip)
     try:
         r = lsg_request_params(dec)
-        r.u8()
+        r.u8()                              # the [u8 0] lead-in, constant on every RPC
         published = r.bool_()
         name = r.str_(128)
         private = r.bool_()
@@ -3601,7 +3720,7 @@ def storage_overwrite_result(dec: dict, who=None, peer_ip: str = ""):
     me = account_for(peer_ip)
     try:
         r = lsg_request_params(dec)
-        r.u8()
+        r.u8()                              # the [u8 0] lead-in, constant on every RPC
         fid = r.u64()
         data = r.blob()
     except Exception as e:
@@ -3642,7 +3761,7 @@ def storage_delete_result(dec: dict, who=None, peer_ip: str = ""):
     me = account_for(peer_ip)
     try:
         r = lsg_request_params(dec)
-        r.u8()
+        r.u8()                              # the [u8 0] lead-in, constant on every RPC
         fid = r.u64()
     except Exception as e:
         log(f"  (storage op4 decode failed: {e})")
@@ -4275,6 +4394,7 @@ class AuthConnection(asyncio.Protocol):
             self.next_txn += 1
             nres, results = lsg_result_block(svc, op, dec, self.ident, self.peer_ip,
                                              self.ident_key)
+            census_note(svc, op, dec)       # what did that handler NOT read?
             reply = build_lsg_taskreply_encrypted(session_key, transaction_id=txn,
                                                   error_code=err, operation_id=op or 0,
                                                   num_results=nres, results=results)

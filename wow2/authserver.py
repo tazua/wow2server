@@ -2651,6 +2651,8 @@ def message_add(to_entity: int, type_id: int, sender: int, sender_name: str,
 # a mailbox item; one that deletes itself is a notification". Filing one would
 # re-deliver it at every sign-in forever, and a message the client cannot make
 # sense of is how an account gets bricked.
+CLAN_MSG_CACCEPT = 14          # the INVITER's copy: the invite was accepted
+CLAN_MSG_CREJECT = 15          # the INVITER's copy: the invite was declined
 CLAN_MSG_CLEFT = 16            # "%GAMER% has left the clan"
 CLAN_MSG_CADMIN = 17           # "You are now a clan %CLAN% administrator"
 CLAN_MSG_CKICKED = 18          # "You have been kicked from the clan %CLAN%"
@@ -2659,14 +2661,31 @@ CLAN_MSG_COWNER = 28           # "You are now the clan %CLAN% owner"
 CLAN_MSG_CORDINARY = 39        # "You are no longer a clan %CLAN% administrator"
 
 
+def account_name(entity: int) -> str:
+    """The display name we have on file for an account, or "" if none."""
+    try:
+        return (friends_db().get("names") or {}).get(f"{entity:016x}", "") or ""
+    except Exception:
+        return ""
+
+
 def clan_notify(to_entity: int, type_id: int, tid: int, clan_name: str,
-                actor: int, actor_name: str) -> None:
+                actor: int, actor_name: str,
+                target: int = 0, target_name: str = "") -> None:
     """Tell one account that something happened to its clan. Push only.
 
     This is the half of every clan verb that the REQUEST does not do. Without
     it a promoted member keeps a stale roster and its own gamer menu goes on
     offering the verbs an ordinary member should not have, until it signs in
     again -- the client has no polling anywhere in the clan surface.
+
+    **Name the gamer the notification is ABOUT in `target`.** Type 14 proved the
+    mechanism: a clan push is not only a prompt to re-read, the client can apply
+    it to its cached member list directly -- pushing 14 to the inviter made the
+    new member appear in `View clan` with no `Teams op 21` and no re-sign-in.
+    The corollary is that a notification whose subject is missing has nothing to
+    apply, which is the most likely reason `Ckicked` did nothing: the tail was
+    left empty, so it said "remove account 0".
 
     The id is taken from the mailbox counter but nothing is stored, so a
     `Messaging op 4` for it finds nothing and says so. That is the correct
@@ -2687,7 +2706,8 @@ def clan_notify(to_entity: int, type_id: int, tid: int, clan_name: str,
     _jsave(FRIENDS_DB, d)
     ok = push_to_account(to_entity, type_id, actor, actor_name, msg_id=mid,
                          session_id=tid.to_bytes(8, "little"),
-                         clan_name=clan_name)
+                         clan_name=clan_name,
+                         target=target, target_name=target_name)
     log(f"  clan notify type {type_id} -> 0x{to_entity:016x} "
         f"({clan_name!r} 0x{tid:016x}, msg {mid}): "
         + ("pushed" if ok else "not online, and a notification is never filed"))
@@ -3055,6 +3075,15 @@ def teams_answer_invite(accept: bool, dec: dict, who=None, peer_ip: str = ""):
         + ("" if had else ", but no proposal was on file")
         + f") -- {len(rec['members'])} member(s), "
         f"{len(rec['proposals'])} proposal(s) left")
+    # TELL THE INVITER. Without this their roster is stale until they sign in
+    # again: `Teams op 21` fires at sign-in and nothing else re-reads it, so the
+    # console that sent the invite goes on showing a clan of one. Types 14 and
+    # 15 sit unused right beside the 13 this server already pushes, and 14
+    # `Caccept` / 15 `Creject` is what they are for.
+    if inviter and inviter != me:
+        clan_notify(inviter, CLAN_MSG_CACCEPT if accept else CLAN_MSG_CREJECT,
+                    tid, rec.get("name") or "", me, name,
+                    target=me, target_name=name)
     return 0, None
 
 
@@ -3121,7 +3150,8 @@ def teams_set_rank(promote: bool, dec: dict, who=None, peer_ip: str = ""):
         f"to {'administrator' if promote else 'member'} (rank "
         f"{ranks[them]}) in {rec.get('name')!r} 0x{key}")
     clan_notify(target, CLAN_MSG_CADMIN if promote else CLAN_MSG_CORDINARY,
-                tid, rec.get("name") or "", me, name)
+                tid, rec.get("name") or "", me, name,
+                target=target, target_name=account_name(target))
     return 0, None
 
 
@@ -3156,7 +3186,8 @@ def teams_remove_member(dec: dict, who=None, peer_ip: str = ""):
     _jsave(TEAMS_DB, d)
     log(f"  teams op4 (REMOVE FROM CLAN): {name} 0x{mine} removes 0x{them} "
         f"from {rec.get('name')!r} 0x{key} -- {len(rec['members'])} member(s) left")
-    clan_notify(target, CLAN_MSG_CKICKED, tid, rec.get("name") or "", me, name)
+    clan_notify(target, CLAN_MSG_CKICKED, tid, rec.get("name") or "", me, name,
+                target=target, target_name=account_name(target))
     return 0, None
 
 
@@ -3214,7 +3245,8 @@ def teams_leave(dec: dict, who=None, peer_ip: str = ""):
         _jsave(TEAMS_DB, d)
         log(f"  teams op5 (REMOVE FROM CLAN): {name} 0x{mine} removes 0x{them} "
             f"from {cname!r} 0x{key} -- {len(rec['members'])} member(s) left")
-        clan_notify(target, CLAN_MSG_CKICKED, tid, cname or "", me, name)
+        clan_notify(target, CLAN_MSG_CKICKED, tid, cname or "", me, name,
+                    target=target, target_name=account_name(target))
         return 0, None
     if rec.get("owner") == mine:
         members = [m for m in rec.get("members", []) if m != mine]
@@ -3223,14 +3255,16 @@ def teams_leave(dec: dict, who=None, peer_ip: str = ""):
         log(f"  teams op5 (DISBAND CLAN): {name} 0x{mine} disbands {cname!r} "
             f"0x{key} -- {len(members)} other member(s) lose it")
         for m in members:
-            clan_notify(int(m, 16), CLAN_MSG_CDISBAND, tid, cname or "", me, name)
+            clan_notify(int(m, 16), CLAN_MSG_CDISBAND, tid, cname or "", me, name,
+                        target=me, target_name=name)
         return 0, None
     _team_drop(rec, mine)
     _jsave(TEAMS_DB, d)
     log(f"  teams op5 (LEAVE CLAN): {name} 0x{mine} leaves {cname!r} 0x{key} "
         f"-- {len(rec['members'])} member(s) left")
     for m in rec.get("members", []):
-        clan_notify(int(m, 16), CLAN_MSG_CLEFT, tid, cname or "", me, name)
+        clan_notify(int(m, 16), CLAN_MSG_CLEFT, tid, cname or "", me, name,
+                    target=me, target_name=name)
     return 0, None
 
 
@@ -3275,7 +3309,8 @@ def teams_transfer_owner(dec: dict, who=None, peer_ip: str = ""):
     log(f"  teams op27 (TRANSFER OWNERSHIP): {name} 0x{mine} hands "
         f"{rec.get('name')!r} 0x{key} to 0x{them}; the old owner is now an "
         f"ordinary member")
-    clan_notify(target, CLAN_MSG_COWNER, tid, rec.get("name") or "", me, name)
+    clan_notify(target, CLAN_MSG_COWNER, tid, rec.get("name") or "", me, name,
+                target=target, target_name=account_name(target))
     return 0, None
 
 

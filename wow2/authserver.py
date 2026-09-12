@@ -3856,13 +3856,20 @@ def storage_get_result(dec: dict, who=None, peer_ip: str = ""):
                                  yes -> "Reading BLOB failed. Buffer too small"
                                         (0x08d6af10), skip the read, return false
 
-    With no leading u32 the container's very first read fails, so it never even
-    constructs an element and the count stays 0. **That failure is SILENT**: it
-    is the game's own `bdStorage` poll (0x089949c4) that calls the reply handler,
-    not the LSG reply reader, so a bad body here neither drops the connection nor
-    logs anything -- the download simply returns false and the node keeps its
-    `[empty]` bit. The rig's usual oracle (does the console stay connected?)
-    cannot see this class of bug at all; cf. `tools/blindspots.py`.
+    though that guard is not the one that fired here. With no leading u32 the
+    container's very FIRST read fails on the TYPE, so it never even constructs
+    an element and the count stays 0 -- and the client says exactly that:
+
+        err [bdCore/bitBuffer] Expected: UInt32 , read: Blob  bdBitBuffer.cpp:526
+
+    twice, once per fetch, measured both ways with `tools/bdwarn.py`.
+
+    **The failure is SILENT on this side**: it is the game's own `bdStorage`
+    poll (0x089949c4) that calls the reply handler, not the LSG reply reader, so
+    a bad body here neither drops the connection nor logs anything -- the
+    download simply returns false and the node keeps its `[empty]` bit. The
+    rig's usual oracle (does the console stay connected?) cannot see this class
+    of bug at all; cf. `tools/blindspots.py` and `tools/bdwarn.py`.
 
     The eight fields are exactly `storage_list_result`'s row, in the same order,
     which is the independent check: that row has worked since Phase 27.

@@ -156,9 +156,12 @@ nat_type_alt_port = 3078
 # starting_rating = 400
 
 [storage]
-# Where the JSON stores (stats, profiles, friends, teams, accounts) and uploaded
-# blobs live. The server re-reads the JSON stores per request on purpose: you can
-# edit a leaderboard with the server running and see it on the next screen.
+# Where the store (wow2.sqlite3: accounts, leaderboards, pots, clans, friends,
+# profiles, storage rows), the uploaded blobs and the logs live. The server reads
+# the store per request on purpose: you can edit a leaderboard with the server
+# running (`sqlite3 wow2.sqlite3`, `wow2 rating`) and see it on the next screen.
+# A directory that still holds the pre-0.3 JSON files is imported at the first
+# start, each file renamed <name>.imported-<date> once it is in.
 #
 # Left commented out because the default already does the right thing in both
 # places: <repo>/capture when run from a source checkout, ./wow2-data when

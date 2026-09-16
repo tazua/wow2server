@@ -1,6 +1,8 @@
 # wow2-server
 
-A server for the online mode of Worms Open Warfare 2 on PSP (`ULES00819`).
+A server for the online mode of Worms Open Warfare 2 on PSP — the PAL disc
+(`ULES00819`) and the US disc (`ULUS10260`), which are the same client on the
+wire.
 The official Demonware servers were shut down years ago; this reimplements
 the auth and lobby services the game talks to, so consoles can sign in, find
 each other and play. Sign-in, the game browser, hosting, joining, full
@@ -80,7 +82,8 @@ the default. The one worth knowing about: players behind mobile or
 carrier-grade NAT cannot reach each other directly, and `[nat] relay = true`
 makes the server carry the match instead. Accounts are created by the game
 itself the first time a player signs in; `wow2-account` is the operator's
-tool for the credential store.
+tool for the credential store, and `wow2-db` (`check`, `backup`, `export`)
+for the SQLite file that holds every store.
 
 ## Documentation
 

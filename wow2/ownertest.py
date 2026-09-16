@@ -41,10 +41,22 @@ code, and what each section proves:
              only mailbox owners; a 29-byte datagram from anywhere naming a
              mailbox port in addrA re-pointed that console's return path.
 
+AND THE CLAN LIFECYCLE (§66 step 5): create, memberships, roster and ranks,
+promote, demote, transfer, remove, leave, disband -- the verbs the retail
+C-cases drive, run here as carol and dave so the store behind them is proved
+without a console. AND THE STORAGE / PROFILE ROUND TRIP (§66 step 6): op 7
+lists an upload, op 2 replaces its bytes and op 5 fetches them, op 2 / op 4
+from another account are refused (D9), op 4 removes it; Profile op 1 answers
+0 then 800 (P1) and op 2 hands the nine fields back verbatim (P3). `--revert`
+fails the nine §65 checks and one consequence of the learned identity
+(45/57: the two D9 checks join them, because bob IS alice).
+
 Standing up a whole server per run is the cheap part (~1 s) and it buys a
 data dir nobody else is writing, which is the only way a check can assert on
-`teams-db.json` and mean it. The udp/relay checks that need the tables
-themselves run in-process against the modules.
+the store and mean it: the read-backs go through `store.export_*()`, which
+returns the JSON files' shapes from the scratch server's own `wow2.sqlite3`.
+The udp/relay checks that need the tables themselves run in-process against
+the modules.
 """
 from __future__ import annotations
 
@@ -71,7 +83,7 @@ from blocktest import (Console as _Console, _rpc, encrypt_rpc,      # noqa: E402
                        req_buddy_invite, req_clan_invite, PASSWORD)
 
 PORT = 3876
-ACCOUNTS = ["alice1", "bob222", "carol3"]
+ACCOUNTS = ["alice1", "bob222", "carol3", "dave4"]
 CLAN_ID = 0xC1A0C1A0C1A0C1A1
 CLAN_NAME = "ownerclan"
 ADDR25 = bytes.fromhex("0a000001030c") + b"\x00" * 12 + bytes.fromhex("c0a80101030c") + b"\x01"
@@ -169,6 +181,57 @@ def req_clan_accept(team_id: int, inviter: int) -> bytes:
     return w.getvalue()
 
 
+def req_clan_create(name: str) -> bytes:
+    """Teams op 1 -- [u8 0][str name]. The reply is ONE u64, the id, no count."""
+    w = _rpc(3, 1)
+    w.str_(name, 64)
+    return w.getvalue()
+
+
+def req_clan_pair(op: int, team_id: int, gamer: int) -> bytes:
+    """Ops 3 / 26 (promote / demote), 4 (remove), 5 (leave / disband / remove),
+    27 (transfer): [u8 0][u64 teamId][u64 gamerId]."""
+    w = _rpc(3, op)
+    w.u64(team_id)
+    w.u64(gamer)
+    return w.getvalue()
+
+
+def req_clan_noargs(op: int) -> bytes:
+    """Ops 20 (my memberships) and 24 (proposals to me): the lead-in only."""
+    return _rpc(3, op).getvalue()
+
+
+def req_clan_members(team_id: int) -> bytes:
+    """Teams op 21 -- [u8 0][u64 teamId]."""
+    w = _rpc(3, 21)
+    w.u64(team_id)
+    return w.getvalue()
+
+
+def memberships(r) -> list[tuple[int, str, int]]:
+    """The op 20 rows: [u32 n] then [u64 id][str name][u8 owner]."""
+    out = []
+    try:
+        for _ in range(r.u32() if r is not None else 0):
+            out.append((r.u64(), r.str_(64), r.u8()))
+    except EOFError:
+        pass                      # a reply cut short reads as fewer rows, not a crash
+    return out
+
+
+def roster(r) -> dict[int, tuple[bool, int]]:
+    """The op 21 rows: [u32 n] then [u64 id][str name][bool owner][u8 rank]."""
+    out = {}
+    try:
+        for _ in range(r.u32() if r is not None else 0):
+            eid, _name, owner, rank = r.u64(), r.str_(64), r.bool_(), r.u8()
+            out[eid] = (owner, rank)
+    except EOFError:
+        pass
+    return out
+
+
 def req_storage_upload(name: str, data: bytes) -> bytes:
     """Storage op 1 -- [u8 0][bool published][str name][bool private][blob]."""
     w = _rpc(10, 1)
@@ -177,6 +240,91 @@ def req_storage_upload(name: str, data: bytes) -> bytes:
     w.bool_(False)
     w.blob(data)
     return w.getvalue()
+
+
+def req_storage_by_id(op: int, fid: int, data: bytes | None = None) -> bytes:
+    """Storage op 2 (overwrite: [u8 0][u64 id][blob]), op 4 (delete) and
+    op 5 (fetch): [u8 0][u64 id]."""
+    w = _rpc(10, op)
+    w.u64(fid)
+    if data is not None:
+        w.blob(data)
+    return w.getvalue()
+
+
+def req_storage_list(op: int, owner: int = 0, start: int = 0, count: int = 128) -> bytes:
+    """Storage op 7 ([u8 0][u64 owner][u32 start][u16 count]) / op 8 (no owner)."""
+    w = _rpc(10, op)
+    if op == 7:
+        w.u64(owner)
+    w.u32(start)
+    w.u16(count)
+    return w.getvalue()
+
+
+def storage_rows_of(r) -> dict[int, dict]:
+    """The op 7/8 rows by id: [u32 n] then [u32 size][u64 id][u32 created]
+    [u32 modified][bool private][bool][u64 owner][str name]."""
+    out = {}
+    try:
+        for _ in range(r.u32() if r is not None else 0):
+            size, fid, created, modified = r.u32(), r.u64(), r.u32(), r.u32()
+            private, _b, owner, name = r.bool_(), r.bool_(), r.u64(), r.str_(127)
+            out[fid] = {"size": size, "created": created, "modified": modified,
+                        "private": private, "owner": owner, "name": name}
+    except EOFError:
+        pass
+    return out
+
+
+def storage_fetch(r) -> tuple[dict, bytes] | None:
+    """The op 5 row: [u32 cap][u64 id][u32][u32][bool][bool][u64 owner][str][blob]."""
+    if r is None:
+        return None
+    try:
+        cap, fid, created, modified = r.u32(), r.u64(), r.u32(), r.u32()
+        private, _b, owner, name = r.bool_(), r.bool_(), r.u64(), r.str_(127)
+        return ({"cap": cap, "id": fid, "created": created, "modified": modified,
+                 "owner": owner, "name": name}, r.blob())
+    except EOFError:
+        return None
+
+
+PROFILE_FIELDS = [(bd.BD_SINT64, 11), (bd.BD_SINT64, 22), (bd.BD_SINT64, 33),
+                  (bd.BD_SINT64, 44), (bd.BD_F64, -15.5), (bd.BD_F64, 62.25),
+                  (bd.BD_SINT64, 66), (bd.BD_STR, "hello"), (bd.BD_SINT32, 8)]
+
+
+def req_profile_write(op: int, fields=PROFILE_FIELDS) -> bytes:
+    """Profile op 1 (create) / op 4 (upload): [u8 0] then the nine typed fields."""
+    w = _rpc(8, op)
+    for t, v in fields:
+        if t == bd.BD_SINT64:
+            w.i64(v)
+        elif t == bd.BD_F64:
+            w.f64(v)
+        elif t == bd.BD_STR:
+            w.str_(v, 64)
+        else:
+            w.i32(v)
+    return w.getvalue()
+
+
+def req_profile_read(entity: int) -> bytes:
+    """Profile op 2 -- [u8 0][u64 entity]. ONE row, no count."""
+    w = _rpc(8, 2)
+    w.u64(entity)
+    return w.getvalue()
+
+
+def profile_row(r) -> tuple[int, list] | None:
+    if r is None:
+        return None
+    try:
+        ent = r.u64()
+        return ent, [(t, v) for t, v in bd.read_fields(r)]
+    except EOFError:
+        return None
 
 
 # ------------------------------------------------------------------- the peers
@@ -363,12 +511,61 @@ def jload(tmp: Path, name: str) -> dict:
     return json.loads(p.read_text()) if p.exists() else {}
 
 
+def store_row(tmp: Path, sql: str, args=()):
+    """One row out of the scratch server's own SQLite store (§66). A second
+    connection to the file the server has open is what WAL is for."""
+    import store
+    conn = store.connect(tmp / store.DB_NAME)
+    try:
+        return conn.execute(sql, args).fetchone()
+    finally:
+        conn.close()
+
+
+def teams_json(tmp: Path) -> dict:
+    """The clan store in the JSON file's shape, exported from the scratch
+    server's own SQLite store (§66 step 5)."""
+    import store
+    conn = store.connect(tmp / store.DB_NAME)
+    try:
+        return store.export_teams(conn)
+    finally:
+        conn.close()
+
+
+def storage_json(tmp: Path) -> dict:
+    import store
+    conn = store.connect(tmp / store.DB_NAME)
+    try:
+        return store.export_storage(conn)
+    finally:
+        conn.close()
+
+
 def proposals(tmp: Path) -> list:
-    return jload(tmp, "teams-db.json")["teams"][f"{CLAN_ID:016x}"].get("proposals", [])
+    return teams_json(tmp)["teams"][f"{CLAN_ID:016x}"].get("proposals", [])
+
+
+def friends_json(tmp: Path) -> dict:
+    """The social store in the JSON file's shape, exported from the scratch
+    server's own SQLite store (§66 step 4)."""
+    import store
+    conn = store.connect(tmp / store.DB_NAME)
+    try:
+        return store.export_friends(conn)
+    finally:
+        conn.close()
+
+
+def clan_mail(tmp: Path, entity: int, team_id: int) -> list[int]:
+    """The ids of the mailbox rows that carry THIS clan's invite for `entity`."""
+    blob = team_id.to_bytes(8, "little").hex()
+    return [m.get("id") for m in friends_json(tmp).get("messages", [])
+            if m.get("to") == f"{entity:016x}" and m.get("session") == blob]
 
 
 def mail_types(tmp: Path, entity: int) -> list[int]:
-    return sorted(m.get("type") for m in jload(tmp, "friends-db.json").get("messages", [])
+    return sorted(m.get("type") for m in friends_json(tmp).get("messages", [])
                   if m.get("to") == f"{entity:016x}")
 
 
@@ -396,15 +593,17 @@ def run_server_checks(tmp: Path, srv: Server, check: Checks) -> None:
     err, r = bob.call(req_stats_read(1, [alice.entity]))
     check(err == 0, "the read itself is served (setup)", f"err={err}")
     bob.call(req_buddy_invite(carol.entity))
-    inv = [i for i in jload(tmp, "friends-db.json").get("invites", [])
+    inv = [i for i in friends_json(tmp).get("invites", [])
            if i.get("to") == f"{carol.entity:016x}"]
     check(bool(inv) and inv[0].get("from") == f"{bob.entity:016x}",
           "bob's buddy invite is filed FROM bob, not from the account he read first",
           f"invites: {json.dumps(inv)}")
-    row = jload(tmp, "accounts.json").get(ACCOUNTS[1], {})
-    check(row.get("account_id") in (None, bob.entity),
-          "...and accounts.json did not record alice's id against bob",
-          f"row: {json.dumps(row)}")
+    row = store_row(tmp, "SELECT name, handle, user_id FROM accounts WHERE name = ?",
+                    (ACCOUNTS[1],))
+    check(row is not None and row["handle"] == tiger192(ACCOUNTS[1].encode())[:8].hex(),
+          "...and the account store still keys bob by his own handle (the schema "
+          "has no learned id to record alice's under)",
+          f"row: {dict(row) if row else None}")
     check(bool(srv.grep(r"!!!! bob222 asked about account")),
           "...and the server said so (the !!!! line)")
     carol.drain()
@@ -504,7 +703,7 @@ def run_server_checks(tmp: Path, srv: Server, check: Checks) -> None:
 
     bob.drain()
     carol.call(req_clan_accept(CLAN_ID, bob.entity))       # no proposal on file
-    members = jload(tmp, "teams-db.json")["teams"][f"{CLAN_ID:016x}"]["members"]
+    members = teams_json(tmp)["teams"][f"{CLAN_ID:016x}"]["members"]
     check(f"{carol.entity:016x}" not in members and 14 not in bob.drain(),
           "an accept with no proposal admits nobody and notifies nobody",
           f"members={members}")
@@ -513,29 +712,153 @@ def run_server_checks(tmp: Path, srv: Server, check: Checks) -> None:
     alice.drain(); bob.drain(); carol.drain()
     carol.call(req_clan_accept(CLAN_ID, bob.entity))       # names bob as the inviter
     to_alice, to_bob = alice.drain(), bob.drain()
-    members = jload(tmp, "teams-db.json")["teams"][f"{CLAN_ID:016x}"]["members"]
+    members = teams_json(tmp)["teams"][f"{CLAN_ID:016x}"]["members"]
     check(f"{carol.entity:016x}" in members, "CONTROL: an accept with a proposal admits",
           f"members={members}")
     check(14 in to_alice and 14 not in to_bob,
           "...and the Caccept goes to the account that INVITED, not the one the request names",
           f"pushes: alice={to_alice} bob={to_bob}")
 
+    # ------------------------------------------------- the clan lifecycle
+    print("\n-- clans: create, roster and ranks, promote, demote, transfer, remove, "
+          "leave, disband (the verbs the retail C-cases drive)")
+    # dave, a fourth account that has read nobody: under `--revert` bob IS
+    # alice for the life of the process (the learned identity is per name),
+    # and these checks are about the verbs, not about §65.
+    dave = Console("127.0.0.1", PORT, ACCOUNTS[3])
+    alice.drain()
+    carol.call(req_clan_pair(5, CLAN_ID, 0))                 # carol leaves alice's clan
+    members = teams_json(tmp)["teams"][f"{CLAN_ID:016x}"]["members"]
+    check(f"{carol.entity:016x}" not in members and 16 in alice.drain(),
+          "op 5 with gamer 0 from a member is LEAVE; the owner gets a Cleft",
+          f"members={members}")
+    dave.drain()
+    err, r = carol.call(req_clan_create("newclan"))
+    new_id = r.u64() if r is not None and err == 0 else 0
+    rec = teams_json(tmp)["teams"].get(f"{new_id:016x}")
+    check(err == 0 and new_id and rec and rec["owner"] == f"{carol.entity:016x}"
+          and rec["members"] == [f"{carol.entity:016x}"],
+          "op 1 creates a clan owned by the caller and returns its id",
+          f"err={err} id={new_id:#x} rec={rec}")
+    err, r = carol.call(req_clan_noargs(20))
+    mine = memberships(r)
+    check(any(t == new_id and n == "newclan" and o == 1 for t, n, o in mine),
+          "op 20 lists it for the owner with the owner flag", f"rows={mine}")
+    carol.call(req_clan_invite(new_id, dave.entity))
+    dave.drain()
+    dave.call(req_clan_accept(new_id, carol.entity))
+    carol.drain()
+    err, r = dave.call(req_clan_noargs(20))
+    check(sorted(t for t, _n, _o in memberships(r)) == sorted([new_id]),
+          "op 20 lists it for the member too", f"rows={memberships(r)}")
+    err, r = carol.call(req_clan_members(new_id))
+    ros = roster(r)
+    check(ros.get(carol.entity) == (True, 2) and ros.get(dave.entity) == (False, 0),
+          "op 21: the owner is flagged with rank 2, a member rank 0", f"roster={ros}")
+    dave.call(req_clan_pair(3, new_id, carol.entity))         # a member promoting the owner
+    carol.call(req_clan_pair(3, new_id, dave.entity))
+    ros = roster(carol.call(req_clan_members(new_id))[1])
+    check(ros.get(dave.entity) == (False, 1) and 17 in dave.drain(),
+          "op 3 by the owner promotes to rank 1 and the member gets a Cadmin; "
+          "op 3 by a member is refused", f"roster={ros}")
+    carol.call(req_clan_pair(26, new_id, dave.entity))
+    ros = roster(carol.call(req_clan_members(new_id))[1])
+    check(ros.get(dave.entity) == (False, 0) and 39 in dave.drain(),
+          "op 26 demotes back to rank 0 with a Cordinary", f"roster={ros}")
+    dave.call(req_clan_pair(27, new_id, dave.entity))          # a member cannot take the clan
+    carol.call(req_clan_pair(27, new_id, dave.entity))
+    rec = teams_json(tmp)["teams"][f"{new_id:016x}"]
+    ros = roster(carol.call(req_clan_members(new_id))[1])
+    check(rec["owner"] == f"{dave.entity:016x}" and ros.get(dave.entity) == (True, 2)
+          and ros.get(carol.entity) == (False, 0) and 28 in dave.drain(),
+          "op 27 by the owner hands the clan over: the new owner is rank 2, the old "
+          "one an ordinary member, and a Cowner goes to the new owner", f"rec={rec}")
+    carol.call(req_clan_pair(4, new_id, dave.entity))         # an ordinary member removing
+    rec = teams_json(tmp)["teams"][f"{new_id:016x}"]
+    check(len(rec["members"]) == 2, "op 4 by an ordinary member is refused",
+          f"members={rec['members']}")
+    dave.call(req_clan_pair(4, new_id, carol.entity))
+    rec = teams_json(tmp)["teams"][f"{new_id:016x}"]
+    check(rec["members"] == [f"{dave.entity:016x}"] and 18 in carol.drain(),
+          "op 4 by the owner removes the member, who gets a Ckicked",
+          f"members={rec['members']}")
+    dave.call(req_clan_invite(new_id, carol.entity))          # an outstanding invite...
+    carol.drain()
+    dave.call(req_clan_pair(5, new_id, 0))                    # ...then the owner leaves = disband
+    # (carol's mailbox still holds the type 13 for alice's clan, which she
+    # ACCEPTED: the client deletes that row itself with Messaging op 4, and a
+    # synthetic peer does not -- so the check is for THIS clan's row.)
+    check(f"{new_id:016x}" not in teams_json(tmp)["teams"]
+          and not clan_mail(tmp, carol.entity, new_id),
+          "op 5 with gamer 0 from the OWNER disbands the clan and withdraws its "
+          "outstanding invite from the invitee's mailbox",
+          f"teams={list(teams_json(tmp)['teams'])} carol's rows for the clan="
+          f"{clan_mail(tmp, carol.entity, new_id)}")
+    dave.drain(); carol.drain(); alice.drain()
+
     # ------------------------------------------------------------ storage
     print("\n-- storage: the blob directory cannot be made")
     (tmp / "storage").write_bytes(b"not a directory")
     err, r = alice.call(req_storage_upload("xyzzy.ufd", b"F" * 64))
-    rows = jload(tmp, "storage-db.json").get("files", [])
+    rows = storage_json(tmp).get("files", [])
     check(err not in (0, None), "an upload whose blob cannot be written is answered with an error",
           f"err={err}")
     check(not rows, "...and no row is filed for it", f"rows={rows}")
     (tmp / "storage").unlink()
     err, r = alice.call(req_storage_upload("xyzzy.ufd", b"F" * 64))
     fid = r.u64() if r is not None and err == 0 else 0
-    rows = jload(tmp, "storage-db.json").get("files", [])
+    rows = storage_json(tmp).get("files", [])
     blob = tmp / "storage" / f"{fid:x}-xyzzy.ufd"
     check(err == 0 and fid and len(rows) == 1 and blob.exists(),
           "CONTROL: with the directory writable the upload is filed and its id returned",
           f"err={err} fid={fid:#x} rows={len(rows)} blob={blob.exists()}")
+
+    # ------------------------------------------- storage and profiles round trip
+    print("\n-- storage and profiles: the rows and bytes round-trip through the store "
+          "(the retail D- and P-cases' server half)")
+    listed = storage_rows_of(alice.call(req_storage_list(7, alice.entity))[1])
+    row = listed.get(fid)
+    check(row is not None and row["size"] == 64 and row["owner"] == alice.entity
+          and row["name"] == "xyzzy.ufd" and row["created"] > 1_700_000_000,
+          "op 7 lists the upload with its size, owner and a real created time",
+          f"row={row}")
+    err, r = alice.call(req_storage_by_id(2, fid, b"G" * 96))
+    got = storage_fetch(alice.call(req_storage_by_id(5, fid))[1])
+    check(err == 0 and got is not None and got[1] == b"G" * 96 and got[0]["cap"] == 96
+          and got[0]["id"] == fid and got[0]["modified"] >= got[0]["created"],
+          "op 2 replaces the bytes in place; op 5 fetches the row with the new bytes "
+          "and the capacity in front", f"err={err} got={got and got[0]}")
+    err_b, _ = bob.call(req_storage_by_id(2, fid, b"H" * 8))
+    got = storage_fetch(alice.call(req_storage_by_id(5, fid))[1])
+    check(got is not None and got[1] == b"G" * 96,
+          "op 2 from another account is refused and the bytes stand (D9)",
+          f"bytes={got and got[1][:4]}")
+    bob.call(req_storage_by_id(4, fid))
+    check(fid in storage_rows_of(alice.call(req_storage_list(7, alice.entity))[1]),
+          "op 4 from another account removes nothing (D9)")
+    alice.call(req_storage_by_id(4, fid))
+    listed = storage_rows_of(alice.call(req_storage_list(7, alice.entity))[1])
+    got = storage_fetch(alice.call(req_storage_by_id(5, fid))[1])
+    check(fid not in listed and got is not None and got[1] == b"" and got[0]["id"] == fid,
+          "op 4 by the owner removes the row; a later op 5 for the id is still ONE row, "
+          "with an empty blob", f"listed={list(listed)} got={got and got[0]}")
+
+    err, r = carol.call(req_profile_write(1))
+    check(err == 0, "a first Profile op 1 (create) is answered 0", f"err={err}")
+    carol.call(req_profile_write(4))
+    err, r = carol.call(req_profile_write(1))
+    check(err == 800, "...and the second answers 800 BD_PROFILE_ALREADY_EXISTS, so the "
+                      "console downloads instead of uploading (P1)", f"err={err}")
+    got = profile_row(alice.call(req_profile_read(carol.entity))[1])
+    check(got is not None and got[0] == carol.entity
+          and got[1] == [(t, v) for t, v in PROFILE_FIELDS],
+          "op 2 hands back the nine typed fields verbatim (P3's server half)",
+          f"got={got}")
+    got = profile_row(alice.call(req_profile_read(dave.entity))[1])
+    check(got is not None and got[0] == dave.entity and len(got[1]) == 9
+          and got[1][7] == (bd.BD_STR, "dave4"),
+          "op 2 for an account with no profile is the empty placeholder with the "
+          "name in its one string field", f"got={got}")
 
     # ------------------------------------------------------------ udp
     print("\n-- udp: a flood of datagrams that are not bdNAT, then of forged keepalives")

@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "wow2-server"
-version = "0.2.1"
+version = "0.3.0"
 description = "Reimplementation of the Demonware auth/lobby servers for Worms Open Warfare 2 (PSP)"
 readme = "README.md"
 requires-python = ">=3.11"          # tomllib
@@ -37,6 +37,9 @@ wow2-nsdns = "wow2.nsdns:main"
 # name ONCE, in the create message, and identifies itself by a one-way hash
 # ever after -- so a server that missed that message can never learn the name.
 wow2-account = "wow2.accountcli:main"
+# The SQLite store's door (§66): integrity check, JSON import/export, a
+# consistent backup while the server runs, and the import/export round trip.
+wow2-db = "wow2.dbcli:main"
 
 # The modules live in tools/ and import each other flatly (each one puts its own
 # directory on sys.path first), so they install as a package directory without

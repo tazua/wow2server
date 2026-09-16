@@ -163,7 +163,7 @@ profile name or password is incorrect" and the log says `login handle <hex>
 is not an account we know` or `has no stored credential`. This is also what
 a reinstall looks like: a console that made its account against the old
 data directory is refused by the new one until the operator restores
-`accounts.json` or re-creates the account. Only the operator can fix it:
+the `accounts` table or re-creates the account. Only the operator can fix it:
 
 ```bash
 wow2-account list              # every account, and whether it has a credential
@@ -177,36 +177,53 @@ every account without a credential may sign in on one shared password
 (`WOW2_PASSWORD`, default `123456`, which is in this repository). With it on,
 anyone who knows a name is in. Leave it off.
 
-Back up `accounts.json` before deleting anything. It is the only copy of
-every credential.
+Back up the database (`wow2-db backup PATH`, safe while the server runs)
+before deleting anything. It is the only copy of every credential.
 
 ## What the server stores
 
-Everything is in the data directory, as JSON re-read per request, so a file
-can be edited while the server runs and the change shows on the next screen.
+Everything is in the data directory. The seven stores are one SQLite file,
+`wow2.sqlite3`, read per request, so a row can be changed while the server
+runs (`sqlite3 wow2.sqlite3`, or `wow2-account`) and the change shows on the
+next screen. A data directory from a version before 0.3 holds them as JSON
+files; the server imports those the first time it starts, one line in the log
+per file, and renames each to `<name>.imported-<date>`.
 
-| file | holds |
+| what | where |
 |---|---|
-| `accounts.json` | name, credential digest, handle, user id |
-| `stats-db.json`, `stats-uploads.jsonl` | leaderboards as `board:entity` rows of `[score, rank, name]`, and every upload as received |
-| `pot.json` | ranked wagers: open pots, stakes, payouts |
-| `teams-db.json` | clans, members, ranks, outstanding invites |
-| `friends-db.json` | buddies, invites, blocks, the mailbox, and every name seen |
-| `profile-db.json` | player profiles, keyed by account id |
-| `storage-db.json`, `storage/` | uploaded files (flags, shared schemes and landscapes, leaderboard snapshots) and their bytes |
-| `request-census.json` | diagnostic: every typed field the client has sent, per RPC, and whether a handler read it |
-| `session-*.log` | one log per server run |
+| accounts: name, credential digest, handle, user id | `accounts` |
+| leaderboards: one row per (board, entity) with the score and name; the rank is derived on read | `stats` |
+| ranked wagers: open pots, stakes, payouts | `pots` |
+| clans, members, ranks, outstanding invites | `teams`, `team_members`, `team_proposals` |
+| buddies, invites, blocks, the mailbox, and every name seen | `friends`, `friend_invites`, `blocks`, `messages`, `names` |
+| player profiles, keyed by account id | `profiles` |
+| uploaded files (flags, shared schemes and landscapes, leaderboard snapshots) | `storage`, with the bytes in `storage/` |
+| every leaderboard upload as received | `stats-uploads.jsonl` |
+| diagnostic: every typed field the client has sent, per RPC, and whether a handler read it | `request-census.json` |
+| one log per server run | `session-*.log` |
+
+```bash
+wow2-db check                 # integrity, row counts, which stores were imported when
+wow2-db backup PATH           # a consistent copy, safe while the server runs
+wow2-db export DIR            # the stores as JSON files, for an editor or a diff
+wow2-db import DIR            # JSON files -> a fresh database
+```
+
+On a system install run these as the service user (`sudo -u wow2 ...`), or
+as root: a root-run command gives the database files back to the service
+user, so it cannot lock the server out of its own store.
 
 Three things about the stores that are not obvious:
 
-- Rank is computed on read from the score order; the rank written in a row
-  is for readability and ignored. Board 5 is the ranked rating, boards 2 and
-  3 weekly and monthly, board 1 games started, 9 to 24 the daily awards.
-  Board 1 rows carry a fourth element the client round-trips (its
-  completion history); deleting it rewrites a player's percentage.
-- A storage row's owner is a 16-hex-digit account id. If you edit the file,
-  keep it hex; a decimal id makes the file invisible to the screen meant to
-  show it. Two rows must never share an id.
+- Rank is computed on read from the score order and never stored. Board 5
+  is the ranked rating, boards 2 and 3 weekly and monthly, board 1 games
+  started, 9 to 24 the daily awards. Board 1 rows carry a `tail` the client
+  round-trips (its completion history); clearing it rewrites a player's
+  percentage.
+- A storage row's owner is a 16-hex-digit account id, or NULL for a global
+  file. If you insert rows by hand keep it hex; a decimal id makes the file
+  invisible to the screen meant to show it. Two rows cannot share an id: the
+  primary key refuses the second.
 - A console asks to *create* its profile at every sign-in. The server
   answers "already exists" once it holds one, which makes the console
   download the server's copy instead of uploading over it, so a profile
@@ -246,16 +263,19 @@ at the main port; the alternate port is only an address to answer from.
 
 ## Checks
 
-Three suites ship with the server. Each starts its own server on a spare
+Four suites ship with the server. Three start their own server on a spare
 port with a scratch data directory, so they can run on an installed copy
-without touching its data, and each has a `--revert` that runs against the
-older behaviour and must fail.
+without touching its data, and each of those has a `--revert` that runs
+against the older behaviour and must fail; the fourth exercises the store
+module on a scratch directory.
 
 ```bash
 .venv/bin/python -m wow2.lsgauth      # the credential path, 22 checks
 .venv/bin/python -m wow2.blocktest    # a block stops all three invites, 7 checks
-.venv/bin/python -m wow2.ownertest    # identity, ownership, UDP and relay bounds, 37 checks
+.venv/bin/python -m wow2.ownertest    # identity, ownership, clans, storage, profiles, UDP and relay bounds, 57 checks
+.venv/bin/python -m wow2.storetest    # the SQLite store: the import keeps everything, the rules hold, 29 checks
 .venv/bin/python -m wow2.loadtest --consoles 32 --lifetime 200   # capacity, see below
+.venv/bin/python -m wow2.dbcli roundtrip DIR   # a directory of JSON stores in and out, field by field
 ```
 
 ## Limits and what has been tested
@@ -269,7 +289,11 @@ end. A five-console lobby was measured refusing its fifth joiner (the host
 does that, over the peer channel). The development rig was eight PPSSPP
 instances; retail hardware is one PSP on 6.61 ARK-4 for one evening,
 which signed in, browsed, hosted and created ranked lobbies against a server
-on a VPS.
+on a VPS. The US disc (`ULUS10260`, 1.02) was compared against the PAL one
+(`ULES00819`, 1.01) it was all derived from: the Demonware SDK, the network
+layer and every data table are identical modulo relocation, the eleven code
+changes are in the front end, and a US console has hosted for and joined a
+PAL console on the emulator rig. Nothing is configured per region.
 
 Every one of the client's 45 lobby RPCs is answered, and the reply layouts
 were bisected on the wire against the real client. The parsers have taken
@@ -286,17 +310,16 @@ reader finds one or two more of the same kind, none reachable from a retail
 console.
 
 Scale was measured with synthetic consoles (`python -m wow2.loadtest`), on a
-workstation; a small VPS is slower by its CPU. Players online at once is not
-the limit: 128 consoles signing in at the same instant all finish within
-3.4 s and the process sustains about 850 RPCs a second, against a sign-in of
-some 20 RPCs, a match start of 5 and a signed-in console that is otherwise
-nearly silent. The limit is the number of accounts the server has ever seen,
-because every store is a JSON file re-read per request: at 200 lifetime
-accounts a sign-in under load is a quarter of a second, at 2,000 it is two
-seconds, at 10,000 sign-ins time out. Watch `wow2-account list | wc -l`; a
-deployment approaching a thousand accounts wants the parsed-store cache
-described in the tool's own notes. One asyncio process, JSON on disk: that
-is what keeps the stores editable while the server runs.
+workstation; a small VPS is slower by its CPU. With 200 accounts on file, 32
+consoles signing in at the same instant all finish within 0.2 s and the
+process sustains about 2,800 RPCs a second, against a sign-in of some 20
+RPCs, a match start of 5 and a signed-in console that is otherwise nearly
+silent; with 10,000 accounts on file, 32 finish in 0.5 s and 128 in 2.0 s,
+none timing out. (Before the SQLite store the stores were JSON files re-read
+per request, and 10,000 lifetime accounts made every sign-in time out; that
+is why the store exists.) What remains per request is proportional to the
+size of one leaderboard, in milliseconds. One asyncio process, one file on
+disk: that is what keeps the stores editable while the server runs.
 
 This repository holds the server alone. The rig that produced it, which
 drives the emulator over its debugger protocol and reads the game's screen,

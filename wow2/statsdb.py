@@ -1,17 +1,19 @@
 """The leaderboard store, shared by the server and the CLI.
 
-`capture/stats-db.json` is a flat dict keyed `"board:entityid"`:
+Rows live in the `stats` table of `wow2.sqlite3` (tools/store.py, §66), one
+per (board, entity): the score, the display name, and on board 1 the
+completion-history tail the upload carried. **Rank is derived on read** --
+`1 + COUNT(*) WHERE board = ? AND score > ?`, ties sharing a rank -- and is
+never stored; nothing the client sends ever carries a rank.
 
-    {"5:975367efa4bbebed": [4444, 1, "player1"]}      # score, rank, name[, blob]
-
-The middle number is written back only so the file reads well -- **rank is
-derived on read**, as the row's position with the board ordered by score, best
-first, ties sharing a rank. Nothing the client sends ever carries a rank.
-
-The file is re-read PER CALL, on purpose: rows can be edited (or awarded a pot)
-with the server running, no restart and no re-login. That is also why this lives
-in its own module -- `tools/potbank.py` and `tools/wow2` bank a pot straight into
-the same file while `authserver.py` is serving out of it.
+Every read goes to the database, so rows can be edited (or awarded a pot)
+with the server running, no restart and no re-login: `tools/potbank.py` and
+`tools/wow2 rating` write the same table while `authserver.py` serves out of
+it, and `sqlite3 capture/wow2.sqlite3` is the editor. Before §66 this was
+`capture/stats-db.json`, re-parsed per call, which is what put the capacity
+ceiling at the lifetime population (loadtest.py: 0.24 s sign-ins at 200
+accounts, timeouts at 10,000); a build that finds that file imports it once
+at startup and renames it aside.
 """
 from __future__ import annotations
 
@@ -23,6 +25,7 @@ from pathlib import Path
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 
 import serverconfig
+import store
 
 # THE CONFIGURED DATA DIRECTORY, not one derived from where this file happens to
 # live. It used to be `Path(__file__).parent.parent / "capture"`, which is the
@@ -31,12 +34,7 @@ import serverconfig
 # leaderboard write, every rating and the whole ranked pot failed with one line
 # of log each and nothing persisted. Found on a live deployment after a real
 # match between two real NATs uploaded ten boards and kept none of them.
-#
-# `authserver.py` had this right (`CAP = serverconfig.DATA_DIR`); the store
-# modules did not, and potbank derives its own path from this one, so the same
-# bug reached the pot ledger.
 CAP = serverconfig.DATA_DIR
-STATS_DB = CAP / "stats-db.json"
 STATS_UPLOADS = CAP / "stats-uploads.jsonl"     # append-only forensic trail
 
 # The board map, as far as it is known (netrecon Phase 21/22):
@@ -104,64 +102,42 @@ def disabled() -> bool:
 
 
 def key(board_id: int, entity_id: int) -> str:
+    """The `board:entity` spelling the JSON store used; still the log's spelling."""
     return f"{board_id}:{entity_id:016x}"
 
 
-def load() -> dict:
+def _e(entity_id: int) -> str:
+    return f"{int(entity_id):016x}"
+
+
+def count(board_id: int) -> int:
+    """How many rows the board has -- the `totalEntries` a leaderboard reply carries."""
     if disabled():
-        return {}
-    try:
-        return json.loads(STATS_DB.read_text())
-    except (OSError, ValueError):
-        return {}
+        return 0
+    return int(store.db().execute("SELECT COUNT(*) FROM stats WHERE board = ?",
+                                  (board_id,)).fetchone()[0])
 
 
-def save(db: dict) -> bool:
-    """Write the leaderboards, atomically, creating the data directory if needed.
-
-    Two things this used to get wrong, both found on a live deployment:
-
-    * **It assumed the directory existed.** The server creates it at startup, so
-      the server was fine; the CLIs (`wow2 rating`, `wow2 award`) were not, and a
-      fresh install had nothing to say about why the write failed.
-    * **It was not atomic.** `write_text` truncates first, so a kill at the wrong
-      moment left a half-written leaderboard -- which `load()` then reads as `{}`
-      and the next write makes permanent. `authserver._jsave` has been atomic for
-      exactly this reason; this one was missed because the rig never gets killed
-      mid-match.
-    """
-    try:
-        CAP.mkdir(parents=True, exist_ok=True)
-        tmp = STATS_DB.with_suffix(".json.tmp")
-        tmp.write_text(json.dumps(db, indent=1, sort_keys=True))
-        os.replace(tmp, STATS_DB)          # atomic within one filesystem
-        return True
-    except OSError:
-        return False
+def raw(board_id: int, entity_id: int) -> tuple[int, str, list | None] | None:
+    """The stored (score, name, tail) for one board/entity, or None if no row."""
+    if disabled():
+        return None
+    r = store.db().execute("SELECT score, name, tail FROM stats WHERE board = ? "
+                           "AND entity = ?", (board_id, _e(entity_id))).fetchone()
+    if r is None:
+        return None
+    return int(r["score"]), r["name"] or "", (json.loads(r["tail"]) if r["tail"] else None)
 
 
-def board(board_id: int, default_name: str = "") -> list:
-    """Every stored row of one board as (entityID, score, rank, name), best first."""
-    rows = []
-    prefix = f"{board_id}:"
-    for k, row in load().items():
-        if not k.startswith(prefix) or not isinstance(row, list) or not row:
-            continue
-        try:
-            entity_id = int(k[len(prefix):], 16)
-        except ValueError:
-            continue
-        name = row[2] if len(row) > 2 and isinstance(row[2], str) else default_name
-        rows.append((entity_id, int(row[0]), name))
-    rows.sort(key=lambda r: -r[1])
-    out = []
-    for i, (entity_id, score, name) in enumerate(rows):
-        rank = i + 1
-        if i and score == rows[i - 1][1]:
-            out.append((entity_id, score, out[-1][2], name))     # tie -> same rank
-        else:
-            out.append((entity_id, score, rank, name))
-    return out
+def tail(board_id: int, entity_id: int) -> list | None:
+    """Board 1's `[i32][i64 A][i64 B]` as the upload's typed list, or None."""
+    row = raw(board_id, entity_id)
+    return row[2] if row else None
+
+
+def _rank(conn, board_id: int, score: int) -> int:
+    return 1 + int(conn.execute("SELECT COUNT(*) FROM stats WHERE board = ? AND score > ?",
+                                (board_id, score)).fetchone()[0])
 
 
 def get(board_id: int, entity_id: int, default_name: str = "") -> tuple[int, int, str]:
@@ -182,41 +158,85 @@ def get(board_id: int, entity_id: int, default_name: str = "") -> tuple[int, int
     the board. That asymmetry is the whole point: this is what you are worth
     before your first ranked match, not a row.
     """
-    for eid, score, rank, name in board(board_id, default_name):
-        if eid == entity_id:
-            return score, rank, name
+    row = raw(board_id, entity_id)
+    if row is not None:
+        score, name, _tail = row
+        return score, _rank(store.db(), board_id, score), name or default_name
     if board_id == RATING_BOARD:
         return STARTING_RATING, 0, default_name
     return 0, 0, default_name
 
 
-def _reranked(db: dict, board_id: int) -> dict:
-    ranked = {}
-    tmp = sorted(((k, v) for k, v in db.items() if k.startswith(f"{board_id}:")),
-                 key=lambda kv: -int(kv[1][0]))
-    for i, (k, v) in enumerate(tmp):
-        ranked[k] = i + 1
-        if i and int(v[0]) == int(tmp[i - 1][1][0]):
-            ranked[k] = ranked[tmp[i - 1][0]]
-    return ranked
+_PAGE_SQL = ("SELECT entity, score, name, RANK() OVER (ORDER BY score DESC) AS rank "
+             "FROM stats WHERE board = ? ORDER BY score DESC, entity")
+
+
+def _rows(cur, default_name: str) -> list[tuple[int, int, int, str]]:
+    return [(int(r["entity"], 16), int(r["score"]), int(r["rank"]), r["name"] or default_name)
+            for r in cur]
+
+
+def board(board_id: int, default_name: str = "") -> list:
+    """Every stored row of one board as (entityID, score, rank, name), best first.
+
+    The whole board: `top()`, `page_by_rank()` and `page_around()` are what the
+    handlers use, because the client never asks for more than 50 rows."""
+    if disabled():
+        return []
+    return _rows(store.db().execute(_PAGE_SQL, (board_id,)), default_name)
+
+
+def top(board_id: int, want: int, default_name: str = "") -> list:
+    """The first `want` rows of a board, best first."""
+    if disabled():
+        return []
+    return _rows(store.db().execute(_PAGE_SQL + " LIMIT ?", (board_id, want)), default_name)
+
+
+def page_by_rank(board_id: int, start_rank: int, want: int, default_name: str = "") -> list:
+    """`want` rows from the first row whose rank is >= start_rank -- the
+    leaderboard's "start at rank N" view. Ties share a rank (RANK(), not
+    ROW_NUMBER()), exactly as the JSON board() computed it."""
+    if disabled():
+        return []
+    sql = f"SELECT * FROM ({_PAGE_SQL}) WHERE rank >= ? ORDER BY score DESC, entity LIMIT ?"
+    return _rows(store.db().execute(sql, (board_id, start_rank, want)), default_name)
+
+
+def page_around(board_id: int, pivot: int, want: int, default_name: str = "") -> list:
+    """`want` rows with `pivot` as near the middle as the board's ends allow --
+    the "Own rank" view. A pivot with no row centres on the top of the board."""
+    if disabled():
+        return []
+    conn = store.db()
+    n = count(board_id)
+    row = raw(board_id, pivot)
+    at = 0
+    if row is not None:
+        # The pivot's POSITION (not rank): rows ordered before it.
+        at = int(conn.execute(
+            "SELECT COUNT(*) FROM stats WHERE board = ? AND (score > ? OR "
+            "(score = ? AND entity < ?))",
+            (board_id, row[0], row[0], _e(pivot))).fetchone()[0])
+    lo = max(0, min(at - want // 2, max(0, n - want)))
+    return _rows(conn.execute(_PAGE_SQL + " LIMIT ? OFFSET ?", (board_id, want, lo)),
+                 default_name)
 
 
 def put(board_id: int, entity_id: int, score: int, name: str = "",
         extra: list | None = None) -> tuple[bool, int]:
-    """Record one score. Returns (written, rank). Rank is only cosmetic in the file."""
+    """Record one score. Returns (written, rank)."""
     if disabled():
         return False, 0
-    db = load()
-    k = key(board_id, entity_id)
-    row = [int(score), 0, name]
-    if extra:
-        row.append(extra)
-    db[k] = row
-    ranked = _reranked(db, board_id)
-    for kk, r in ranked.items():
-        if len(db[kk]) > 1:
-            db[kk][1] = r
-    return save(db), ranked.get(k, 0)
+    conn = store.db()
+    with store.tx(conn):
+        conn.execute(
+            "INSERT INTO stats (board, entity, score, name, tail) VALUES (?, ?, ?, ?, ?) "
+            "ON CONFLICT (board, entity) DO UPDATE SET score = excluded.score, "
+            "name = excluded.name, tail = excluded.tail",
+            (board_id, _e(entity_id), int(score), name or "",
+             json.dumps(extra) if extra else None))
+        return True, _rank(conn, board_id, int(score))
 
 
 def find_entity(who: str) -> list:
@@ -231,13 +251,12 @@ def find_entity(who: str) -> list:
         ident = int(text, 16) if len(text.strip("0x")) >= 8 else 0
     except ValueError:
         ident = 0
-    seen = {}
-    for k, row in load().items():
-        try:
-            eid = int(k.split(":", 1)[1], 16)
-        except (IndexError, ValueError):
-            continue
-        name = row[2] if isinstance(row, list) and len(row) > 2 else ""
-        if eid == ident or (name and name.lower() == text.lower()):
-            seen[eid] = name or seen.get(eid, "")
+    if disabled():
+        return []
+    seen: dict[int, str] = {}
+    for r in store.db().execute(
+            "SELECT DISTINCT entity, name FROM stats WHERE entity = ? OR lower(name) = ?",
+            (_e(ident), text.lower())):
+        eid = int(r["entity"], 16)
+        seen[eid] = r["name"] or seen.get(eid, "")
     return sorted(seen.items())

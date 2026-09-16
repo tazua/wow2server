@@ -27,6 +27,7 @@ import bdproto as bd
 import bddump
 import statsdb
 import potbank
+import store
 
 import natrelay
 import serverconfig
@@ -870,14 +871,11 @@ def identity_for(ip: str) -> tuple[str, int]:
 # therefore keeps a SCORE per (board, entity) and the rank we serve is the row's
 # position with the board ordered by score, best first.
 #
-# The file is re-read PER REQUEST (like nat-broker.mode) so rows can be edited
-# with the server running -- no restart, no re-login:
-#
-#   {"2:975367efa4bbebed": [4242, 7, "player1"]}   # board:entity -> score, rank, name
-#
-# The middle number is written back for readability and IGNORED on read. A row
-# may carry a 4th element, the decoded RankData blob of the last upload.
-STATS_DB = CAP / "stats-db.json"
+# The rows live in the `stats` table of the SQLite store (tools/store.py,
+# §66; `capture/stats-db.json` before that, imported once at startup) and
+# every read goes to the database, so a row can be edited with the server
+# running -- no restart, no re-login. The rank is derived per read and never
+# stored; board 1's row keeps the decoded RankData tail of the last upload.
 STATS_UPLOADS = CAP / "stats-uploads.jsonl"     # append-only forensic trail
 NO_STATS_STORE = os.environ.get("WOW2_NO_STATS_STORE") == "1"
 LEADERBOARD_CAPACITY = 50      # bdLeaderBoardResultTemplate<50> (0x08ce6080); the
@@ -987,19 +985,6 @@ def stats_key(board_id: int, entity_id: int) -> str:
     return statsdb.key(board_id, entity_id)
 
 
-def stats_all() -> dict:
-    return statsdb.load()
-
-
-def stats_board(board_id: int, default_name: str = "") -> list:
-    """Every stored row of one board as (entityID, score, rank, name), best first.
-
-    The rank is COMPUTED (statsdb.board) -- the row's position by score,
-    descending, ties sharing a rank. Nothing the client sends carries a rank.
-    """
-    return statsdb.board(board_id, default_name)
-
-
 def stats_get(board_id: int, entity_id: int, default_name: str = "") -> tuple[int, int, str]:
     """(score, rank, name) for one board/entity. Unknown -> an unranked zero row."""
     return statsdb.get(board_id, entity_id, default_name)
@@ -1012,13 +997,16 @@ def stats_put(board_id: int, entity_id: int, score: int,
     if NO_STATS_STORE:
         log("  (stats store disabled by WOW2_NO_STATS_STORE)")
         return
-    before = stats_all().get(statsdb.key(board_id, entity_id))
-    ok, rank = statsdb.put(board_id, entity_id, score, name, extra)
+    before = statsdb.raw(board_id, entity_id)
+    try:
+        ok, rank = statsdb.put(board_id, entity_id, score, name, extra)
+    except store.sqlite3.Error as e:
+        log(f"  (!! could not write the stats table: {e})")
+        return
     if not ok:
-        log(f"  (!! could not write {statsdb.STATS_DB})")
         return
     log(f"  stats STORED {statsdb.key(board_id, entity_id)} = score {score} "
-        f"(rank {rank or '?'}, was {before})")
+        f"(rank {rank or '?'}, was {before[0] if before else None})")
 
 
 def read_typed_tail(r) -> list:
@@ -1103,11 +1091,9 @@ def stats_write_upload(dec: dict, who: tuple[str, int] | None = None,
         if sid:
             before, _rank, _n = stats_get(board_id, entity, name)
             if score > before and not os.environ.get("WOW2_NO_CLIENT_PAYOUT"):
-                log("  POT: " + potbank.note_payout(sid, entity, name, before,
-                                                    score, ts()))
+                log("  POT: " + potbank.note_payout(sid, entity, name, before, score))
             else:
-                stake, pot = potbank.note_stake(sid, entity, name, before, score,
-                                                ts())
+                stake, pot = potbank.note_stake(sid, entity, name, before, score)
                 log(f"  POT: {name} staked {stake} ({before} -> {score}); "
                     f"session 0x{sid:x} pot is now {pot}")
     stats_put(board_id, entity, score, name, extra)
@@ -1172,12 +1158,12 @@ def _board1_tail(entity: int) -> tuple[int, int]:
     never served one back, which reset every console's completion history to
     whatever survived locally, at every sign-in.
 
-    The store already keeps the tail as a fourth element of the row
-    (`statsdb.put(..., extra=)`), so this is a read, not a reconstruction.
+    The store already keeps the tail beside the row (`statsdb.put(...,
+    extra=)`), so this is a read, not a reconstruction.
     """
-    row = stats_all().get(statsdb.key(1, entity))
-    if isinstance(row, list) and len(row) > 3 and isinstance(row[3], list):
-        vals = [v for _t, v in row[3]]
+    tail = statsdb.tail(1, entity)
+    if isinstance(tail, list):
+        vals = [v for _t, v in tail]
         if len(vals) >= 3:
             try:
                 return int(vals[1]), int(vals[2])
@@ -1208,7 +1194,7 @@ def stats_read_results(dec: dict, who: tuple[str, int] | None = None,
     if entities:
         account_seen(peer_ip, entities[0], default)
     entities = entities[:LEADERBOARD_CAPACITY]
-    board = stats_board(board_id, default)
+    total = statsdb.count(board_id)
     rows = []
     for eid in entities:
         score, rank, name = stats_get(board_id, eid, default)
@@ -1217,8 +1203,8 @@ def stats_read_results(dec: dict, who: tuple[str, int] | None = None,
     log(f"  stats op4 (read-by-entity): boardID={board_id} entities="
         + ",".join(f"0x{e:016x}" for e in entities)
         + " -> serving " + (", ".join(f"{r[2]}. {r[3]} {r[1]}" for r in rows) or "(nothing)")
-        + f" of {len(board)}")
-    return len(rows), emit_rows(rows, len(board), board_id)
+        + f" of {total}")
+    return len(rows), emit_rows(rows, total, board_id)
 
 
 def stats_pivot_results(dec: dict, who: tuple[str, int] | None = None,
@@ -1246,16 +1232,14 @@ def stats_pivot_results(dec: dict, who: tuple[str, int] | None = None,
         log(f"  (stats op5 decode failed: {e})")
 
     default = (who or (rigconfig.USERNAME, 0))[0]
-    board = stats_board(board_id, default)
+    total = statsdb.count(board_id)
     want = max(1, min(int(count), LEADERBOARD_CAPACITY))
     if start_rank:                          # "start at rank N"
-        rows = [r for r in board if r[2] >= start_rank][:want]
+        rows = statsdb.page_by_rank(board_id, start_rank, want, default)
     elif pivot:                             # centre the page on that player
-        at = next((i for i, r in enumerate(board) if r[0] == pivot), 0)
-        lo = max(0, min(at - want // 2, max(0, len(board) - want)))
-        rows = board[lo:lo + want]
+        rows = statsdb.page_around(board_id, pivot, want, default)
     else:
-        rows = board[:want]
+        rows = statsdb.top(board_id, want, default)
     if not rows and pivot:                  # nothing stored: still answer with a row
         score, rank, name = stats_get(board_id, pivot, default)
         rows = [(pivot, score, rank, name)]
@@ -1263,8 +1247,8 @@ def stats_pivot_results(dec: dict, who: tuple[str, int] | None = None,
     log(f"  stats op5 (read-by-pivot): boardID={board_id} "
         f"pivot=0x{pivot:016x} startRank={start_rank} count={count} -> serving "
         + (" | ".join(f"{r[2]}. {r[3]} {r[1]}" for r in rows) or "(nothing)")
-        + f" of {len(board)}")
-    return len(rows), emit_rows(rows, len(board), board_id)
+        + f" of {total}")
+    return len(rows), emit_rows(rows, total, board_id)
 
 
 # --------------------------------------------------------------- sessions (svc 5)
@@ -1356,7 +1340,7 @@ def sessions_create_result(dec: dict, peer_ip: str = "", host_key: str = ""):
         SESSIONS.pop(old_sid, None)
         log(f"  session create: {rec['host']!r} already hosted 0x{old_sid:x} "
             f"{old_rec.get('name')!r} -- replaced")
-        settled = potbank.settle_unresolved(old_sid, ts())
+        settled = potbank.settle_unresolved(old_sid)
         if settled:
             log(f"  POT: {settled}")
     sid = _next_session_id[0]
@@ -1384,7 +1368,7 @@ def sessions_create_result(dec: dict, peer_ip: str = "", host_key: str = ""):
         f"mode={'POINTS' if rec.get('points') else 'fun'} "
         f"info={len(rec['info'])} fields ({len(SESSIONS)} live)")
     if rec.get("points"):
-        potbank.open_pot(sid, rec["name"], ts())
+        potbank.open_pot(sid, rec["name"])
         log(f"  POT opened for ranked session 0x{sid:x} -- each console will pay "
             f"10% of board {statsdb.RATING_BOARD} when the match starts")
     return 1, emit
@@ -1726,7 +1710,7 @@ def sessions_host_gone(host_key: str) -> None:
         log(f"  session EXPIRED: id=0x{sid:x} {rec.get('name')!r} -- its host's LSG "
             f"connection went away without a Sessions op 3 "
             f"({len(SESSIONS)} live)")
-        settled = potbank.settle_unresolved(sid, ts())
+        settled = potbank.settle_unresolved(sid)
         if settled:
             log(f"  POT: {settled}")
 
@@ -1861,7 +1845,7 @@ def sessions_delete(dec: dict, host_key: str = ""):
     log(f"  session delete: id=0x{sid:x} "
         + (f"({gone['name']!r} removed, {len(SESSIONS)} live)" if gone
            else "-- not one of ours; the client had no session id"))
-    settled = potbank.settle_unresolved(sid, ts())
+    settled = potbank.settle_unresolved(sid)
     if settled:
         log(f"  POT: {settled}")
     return 0, None
@@ -2000,10 +1984,10 @@ CLAN_BLOB_TYPES = (13, 22, 23)
 # which is consistent with all three dropping the LSG connection ~450 ms after
 # the inbox reply.
 #
-# 0 = DO NOT PUSH. Override per deployment with `"invite_push_type"` in
-# capture/teams-db.json. If a console cannot sign in after a change here, clear
-# `messages` in capture/friends-db.json -- the message is re-sent from the
-# mailbox at EVERY sign-in, so a bad one bricks that account until it is deleted.
+# 0 = DO NOT PUSH. Override per deployment with `meta.invite_push_type` in the
+# store. If a console cannot sign in after a change here, clear that account's
+# rows in the `messages` table -- the message is re-sent from the mailbox at
+# EVERY sign-in, so a bad one bricks that account until it is deleted.
 CLAN_INVITE_PUSH_DEFAULT = PUSH_CLAN_INVITE
 PUSH_MATCH_ACCEPTED = 6
 PUSH_MATCH_REJECTED = 7
@@ -2334,8 +2318,6 @@ def evict_other_lsg(account: str, keep) -> int:
 # every one of them carrying `entityID = 0`, because the client had no team to
 # name. Hand back an id and those uploads carry it.
 TEAM_ID_BASE = 0x00C1A0_0000_0000        # "clan" ids, obviously ours in a capture
-TEAMS_DB = CAP / "teams-db.json"
-FRIENDS_DB = CAP / "friends-db.json"
 FRIEND_NAME_MAX = 64
 # Row shape per list op, overridable while bisecting:
 #   WOW2_FRIEND_ROWS="5=u8,7=none,19=none"
@@ -2462,27 +2444,24 @@ def _jsave(path: Path, data: dict) -> None:
 # them. It stores what the console uploaded and hands the same typed fields back,
 # which is the one answer guaranteed to be the shape the client expects.
 # --------------------------------------------------------- account credentials
-# What the create-account request told us, per account name. This is NOT yet the
-# credential store the server AUTHENTICATES against (that is ROADMAP B2, and it
-# has to come with account-keyed identity in B1 -- writing one without the other
-# would just be a second source of truth). It is written now because the data is
-# free the moment the request is decoded, and because having real captures of
-# what accounts exist is what makes B1/B2 a mechanical change rather than a
-# design exercise.
+# The `accounts` table of the SQLite store (tools/store.py; `capture/
+# accounts.json` before §66 step 3, imported once at the first start). One
+# row per name: the credential digest, the login handle, the small user id,
+# and when and from where the account was last seen.
 #
 # The stored value is Tiger192(password), which is exactly `account_key()` -- the
-# key the login proof is built with. So this file never holds a password, and a
+# key the login proof is built with. So this store never holds a password, and a
 # server built on it never learns one.
-ACCOUNTS_DB = CAP / "accounts.json"
 
 
 def stored_credential(username: str) -> bytes | None:
     """The digest we hold for `username`, or None. An account EXISTS iff this is
-    not None -- a row with only an `account_id` is something an older server's
+    not None -- a row with no pwhash is something an older server's
     `account_seen()` noticed in passing (it stopped writing them in §65), not
     something anybody created."""
-    row = _jload(ACCOUNTS_DB, {}).get(username)
-    if isinstance(row, dict) and row.get("pwhash"):
+    row = store.db().execute("SELECT pwhash FROM accounts WHERE name = ?",
+                             (username,)).fetchone()
+    if row and row["pwhash"]:
         try:
             return bytes.fromhex(row["pwhash"])
         except ValueError:
@@ -2507,26 +2486,34 @@ def note_account(username: str, password_hash: bytes, peer_ip: str) -> None:
     """
     if os.environ.get("WOW2_NO_ACCOUNT_STORE") == "1":
         return
-    db = _jload(ACCOUNTS_DB, {})
-    row = db.get(username) or {}
-    now = datetime.datetime.now().isoformat(timespec="seconds")
-    old = row.get("pwhash")
-    row.update({"pwhash": password_hash.hex(), "last_ip": peer_ip, "last_seen": now,
-                "handle": account_handle(username).hex()})
-    row.setdefault("first_seen", now)
-    if not row.get("user_id"):
-        row["user_id"] = allocate_user_id(db, username)
-    if old and old != row["pwhash"]:
-        # Only reachable under create_mode = "success". It is not a note, it is
-        # the takeover happening: whoever sent this request now owns the account.
-        log(f"    (!!!! account {username!r}: password digest REPLACED by a "
-            f"create-account from {peer_ip} -- the previous owner can no longer "
-            f"sign in. Only create_mode = 'success' allows this.)")
-    db[username] = row
-    _jsave(ACCOUNTS_DB, db)
+    with store.tx() as conn:
+        old = conn.execute("SELECT pwhash FROM accounts WHERE name = ?",
+                           (username,)).fetchone()
+        old = old["pwhash"] if old else None
+        if old and old != password_hash.hex():
+            # Only reachable under create_mode = "success". It is not a note, it is
+            # the takeover happening: whoever sent this request now owns the account.
+            log(f"    (!!!! account {username!r}: password digest REPLACED by a "
+                f"create-account from {peer_ip} -- the previous owner can no longer "
+                f"sign in. Only create_mode = 'success' allows this.)")
+        _write_credential(conn, username, password_hash, peer_ip)
 
 
-def allocate_user_id(db: dict, username: str) -> int:
+def _write_credential(conn, username: str, password_hash: bytes, peer_ip: str) -> None:
+    """Upsert one account's credential row; the caller holds the transaction."""
+    now = store.now_iso()
+    conn.execute(
+        "INSERT INTO accounts (name, pwhash, handle, user_id, first_seen, last_seen, last_ip) "
+        "VALUES (?, ?, ?, ?, ?, ?, ?) "
+        "ON CONFLICT (name) DO UPDATE SET pwhash = excluded.pwhash, "
+        "handle = excluded.handle, last_seen = excluded.last_seen, "
+        "last_ip = COALESCE(excluded.last_ip, accounts.last_ip), "
+        "user_id = COALESCE(accounts.user_id, excluded.user_id)",
+        (username, password_hash.hex(), account_handle(username).hex(),
+         allocate_user_id(conn, username), now, now, peer_ip or None))
+
+
+def allocate_user_id(conn, username: str) -> int:
     """A stable small id per account. The rig's own consoles keep the ids
     IDENTITIES gives them (1..8) so nothing about the eight-console rig changes;
     anyone else is numbered from 100 up, which cannot collide.
@@ -2535,12 +2522,17 @@ def allocate_user_id(db: dict, username: str) -> int:
     `wow2-account set` used to leave `user_id` at 0 for a name outside
     IDENTITIES, and a 0 is filled in at login from the SOURCE ADDRESS -- so two
     players behind one router, both migrated by hand, shared a user_id and were
-    one player to the matchmaker (Phase 64).
+    one player to the matchmaker (Phase 64). An account that already has an id
+    keeps it (the upsert's COALESCE); this only supplies one for a row without.
     """
+    have = conn.execute("SELECT user_id FROM accounts WHERE name = ?", (username,)).fetchone()
+    if have and have["user_id"]:
+        return int(have["user_id"])
     cfg = next((uid for _ip, (n, uid) in IDENTITIES.items() if n == username), 0)
-    return cfg or max(
-        [100] + [r.get("user_id", 0) for r in db.values()
-                 if isinstance(r, dict) and r.get("user_id", 0) >= 100]) + 1
+    if cfg:
+        return cfg
+    top = conn.execute("SELECT MAX(user_id) FROM accounts WHERE user_id >= 100").fetchone()[0]
+    return max(100, int(top or 0)) + 1
 
 
 def set_account_password(username: str, password_hash: bytes, peer_ip: str = "") -> None:
@@ -2550,18 +2542,8 @@ def set_account_password(username: str, password_hash: bytes, peer_ip: str = "")
     which is exactly the key `build_login_reply` needs. So this store holds
     digests and the operator learns nothing from reading it.
     """
-    db = _jload(ACCOUNTS_DB, {})
-    row = db.get(username) or {}
-    now = datetime.datetime.now().isoformat(timespec="seconds")
-    row.update({"pwhash": password_hash.hex(), "last_seen": now,
-                "handle": account_handle(username).hex()})
-    row.setdefault("first_seen", now)
-    if peer_ip:
-        row["last_ip"] = peer_ip
-    if not row.get("user_id"):
-        row["user_id"] = allocate_user_id(db, username)
-    db[username] = row
-    _jsave(ACCOUNTS_DB, db)
+    with store.tx() as conn:
+        _write_credential(conn, username, password_hash, peer_ip)
 
 
 def account_handle(username: str) -> bytes:
@@ -2569,34 +2551,40 @@ def account_handle(username: str) -> bytes:
     return tiger192(username.encode())[:8]
 
 
-def handle_index() -> dict[bytes, dict]:
-    """Tiger192(name)[:8] -> {name, user_id, pwhash} for every account we can name.
-
-    Two sources, and the first one matters more than it looks: the rig's
-    configured IDENTITIES give us the NAMES, and a name is all you need to
-    compute its handle. So console 1..8 are resolvable by account from the very
-    first login with no store at all -- the store only has to carry accounts we
-    learned from a create-account request, plus their passwords.
-    """
-    idx: dict[bytes, dict] = {}
-    for _ip, (name, uid) in IDENTITIES.items():
-        idx[account_handle(name)] = {"name": name, "user_id": uid,
-                                     "pwhash": None, "src": "config"}
-    for name, row in _jload(ACCOUNTS_DB, {}).items():
-        if not isinstance(row, dict):
-            continue
-        h = account_handle(name)
-        prev = idx.get(h, {})
-        idx[h] = {"name": name,
-                  "user_id": row.get("user_id") or prev.get("user_id") or 0,
-                  "pwhash": (bytes.fromhex(row["pwhash"]) if row.get("pwhash")
-                             else prev.get("pwhash")),
-                  "src": "store" if not prev else "config+store"}
-    return idx
+# The rig's configured IDENTITIES give us NAMES, and a name is all you need to
+# compute its handle -- so console 1..8 are resolvable by account from the very
+# first login with no store at all. Eight hashes, once, at import.
+_CONFIG_HANDLES: dict[bytes, dict] = {
+    account_handle(name): {"name": name, "user_id": uid, "pwhash": None, "src": "config"}
+    for _ip, (name, uid) in IDENTITIES.items()}
 
 
 def account_by_handle(handle: bytes) -> dict | None:
-    return handle_index().get(handle)
+    """{name, user_id, pwhash, src} for a login handle, or None.
+
+    The store first, through the unique index on `accounts.handle` -- one
+    lookup, however many accounts there are. This used to be `handle_index()`,
+    which parsed the whole JSON store and computed Tiger192 for every name in
+    it on EVERY login: 10,000 accounts cost five seconds per sign-in
+    (netrecon §66b), which is what put the login at the top of the capacity
+    measurements once the leaderboards had moved.
+    """
+    row = store.db().execute(
+        "SELECT name, user_id, pwhash FROM accounts WHERE handle = ?",
+        (handle.hex(),)).fetchone()
+    cfg = _CONFIG_HANDLES.get(handle)
+    if row is None:
+        return dict(cfg) if cfg else None
+    pwhash = None
+    if row["pwhash"]:
+        try:
+            pwhash = bytes.fromhex(row["pwhash"])
+        except ValueError:
+            log(f"  (!! {row['name']!r} has an unreadable pwhash in the store)")
+    return {"name": row["name"],
+            "user_id": row["user_id"] or (cfg["user_id"] if cfg else 0) or 0,
+            "pwhash": pwhash or (cfg["pwhash"] if cfg else None),
+            "src": "store" if not cfg else "config+store"}
 
 
 # Session keys we have issued, per account. The client relays the key back to the
@@ -2707,7 +2695,6 @@ def lsg_message_readable(dec: dict, strict: bool = False) -> bool:
     return all(b in (pad, 0) for b in tail)
 
 
-PROFILE_DB = CAP / "profile-db.json"
 NO_PROFILES = os.environ.get("WOW2_NO_PROFILES") == "1"
 # Phase 44. The one BdErrorCode this server sends on purpose. 800 is not a
 # failure: it is the CREATE op's other success, and the client's own error->string
@@ -2725,10 +2712,23 @@ BD_FILESIZE_LIMIT_EXCEEDED = 1002
 NO_PROFILE_EXISTS = os.environ.get("WOW2_NO_PROFILE_EXISTS") == "1"
 
 
-def profile_db() -> dict:
-    d = _jload(PROFILE_DB, {})
-    d.setdefault("public", {})
-    return d
+def profile_get(entity_hex: str, kind: str = "public") -> dict | None:
+    """One stored profile as the JSON kept it: {name, at, fields}. The rows
+    are the `profiles` table (§66 step 6; `capture/profile-db.json` before)."""
+    r = store.db().execute("SELECT name, at, fields FROM profiles WHERE entity = ? "
+                           "AND kind = ?", (entity_hex, kind)).fetchone()
+    if r is None:
+        return None
+    return {"name": r["name"] or "", "at": r["at"] or "", "fields": json.loads(r["fields"])}
+
+
+def profile_put(entity_hex: str, rec: dict, kind: str = "public") -> None:
+    with store.tx() as conn:
+        conn.execute("INSERT INTO profiles (entity, kind, name, at, fields) VALUES "
+                     "(?, ?, ?, ?, ?) ON CONFLICT (entity, kind) DO UPDATE SET "
+                     "name = excluded.name, at = excluded.at, fields = excluded.fields",
+                     (entity_hex, kind, rec.get("name"), rec.get("at"),
+                      json.dumps(rec.get("fields") or [])))
 
 
 def _field_to_json(t: int, v):
@@ -2818,10 +2818,10 @@ def profile_upload(dec: dict, who=None, peer_ip: str = "", create: bool = False)
     except Exception as e:
         log(f"  (profile upload decode failed: {e})")
         return 0, None
-    d = profile_db()
     key = f"{entity:016x}"
-    name = (who[0] if who else "") or friend_name(friends_db(), entity)
-    if create and key in d["public"]:
+    name = (who[0] if who else "") or name_of(entity)
+    old = profile_get(key)
+    if create and old is not None:
         if NO_PROFILE_EXISTS:
             log(f"  profile op1 (create): {name or key} already has a profile -- "
                 f"keeping it (WOW2_NO_PROFILE_EXISTS: answering err=0)")
@@ -2835,15 +2835,13 @@ def profile_upload(dec: dict, who=None, peer_ip: str = "", create: bool = False)
     # back what we served. If it ever carries all zeros over a populated record,
     # our op-2 row is wrong and the profile is about to be blanked -- say so
     # rather than let the store quietly lose longitude and latitude.
-    old = d["public"].get(key)
     if (old and any(v for _t, v in
                     [(f[0], f[1]) for f in old.get("fields", [])])
             and not any(v for _t, v in fields)):
         log(f"  *** PROFILE ABOUT TO BE BLANKED: {name or key} uploaded "
             f"{len(fields)} empty fields over a populated record")
-    d["public"][key] = {"name": name, "at": ts(),
-                        "fields": [_field_to_json(t, v) for t, v in fields]}
-    _jsave(PROFILE_DB, d)
+    profile_put(key, {"name": name, "at": store.now_iso(),
+                      "fields": [_field_to_json(t, v) for t, v in fields]})
     shown = ", ".join(str(v) for _t, v in fields[:4])
     log(f"  profile {'op1 (create)' if create else 'op4 (upload)'}: "
         f"{name or key} <- {len(fields)} fields ({shown}...)")
@@ -2926,10 +2924,9 @@ def profile_read_public(dec: dict, who=None, peer_ip: str = ""):
     except Exception as e:
         log(f"  (profile read decode failed: {e})")
         return 0, None
-    d = profile_db()
-    rec = d["public"].get(f"{target:016x}")
+    rec = profile_get(f"{target:016x}")
     fields = rec["fields"] if rec else [list(f) for f in PROFILE_EMPTY]
-    name = (rec or {}).get("name") or friend_name(friends_db(), target)
+    name = (rec or {}).get("name") or name_of(target)
     if not rec:
         # Nothing stored: at least put the player's name in the one displayable
         # field, so the screen has something on it rather than nothing.
@@ -2953,14 +2950,21 @@ def profile_read_public(dec: dict, who=None, peer_ip: str = ""):
     return None, emit
 
 
-def friends_db() -> dict:
-    d = _jload(FRIENDS_DB, {})
-    d.setdefault("names", {})
-    d.setdefault("friends", [])
-    d.setdefault("invites", [])
-    d.setdefault("blocked", [])
-    d.setdefault("messages", [])     # Phase 28: op 4 / op 13 withdraw messages
-    return d
+# The social store: the `names`, `friends`, `friend_invites`, `blocks` and
+# `messages` tables of the SQLite store (§66 step 4; `capture/friends-db.json`
+# before that, imported once at the first start). Entities are the 16-hex-digit
+# strings the JSON used, so a row reads the same in `sqlite3` as it did in the
+# file. Every handler's writes go inside one `store.tx()`.
+
+def _hx(entity) -> str:
+    return entity if isinstance(entity, str) else f"{int(entity):016x}"
+
+
+def name_of(entity) -> str:
+    """The display name on file for an account, or "" if none."""
+    r = store.db().execute("SELECT name FROM names WHERE entity = ?",
+                           (_hx(entity),)).fetchone()
+    return (r["name"] if r else "") or ""
 
 
 def blocked_by(entity: int) -> set:
@@ -2971,8 +2975,23 @@ def blocked_by(entity: int) -> set:
     it) and still offers Accept. So if a block is to mean anything it has to be
     enforced here, which is presumably what the real backend did.
     """
-    mine = f"{entity:016x}"
-    return {b.get("who") for b in friends_db()["blocked"] if b.get("by") == mine}
+    return {r["who_e"] for r in store.db().execute(
+        "SELECT who_e FROM blocks WHERE by_e = ?", (_hx(entity),))}
+
+
+def are_buddies(a, b) -> bool:
+    x, y = sorted((_hx(a), _hx(b)))
+    return store.db().execute("SELECT 1 FROM friends WHERE a = ? AND b = ?",
+                              (x, y)).fetchone() is not None
+
+
+def invite_pending(from_e, to_e) -> bool:
+    return store.db().execute("SELECT 1 FROM friend_invites WHERE from_e = ? AND to_e = ?",
+                              (_hx(from_e), _hx(to_e))).fetchone() is not None
+
+
+def _count(table: str) -> int:
+    return int(store.db().execute(f"SELECT COUNT(*) FROM {table}").fetchone()[0])
 
 
 def invite_blocked(target: int, sender: int, what: str) -> bool:
@@ -3011,29 +3030,24 @@ def invite_blocked(target: int, sender: int, what: str) -> bool:
     return True
 
 
-def friend_name(d: dict, entity: int) -> str:
-    return d["names"].get(f"{entity:016x}", "")
-
-
 def friends_note_name(entity: int, name: str) -> None:
     """Remember entity -> name so a buddy row can be labelled from either side."""
     if not entity or not name:
         return
-    d = friends_db()
-    if d["names"].get(f"{entity:016x}") == name:
-        return
-    d["names"][f"{entity:016x}"] = name
-    _jsave(FRIENDS_DB, d)
+    with store.tx() as conn:
+        conn.execute("INSERT INTO names (entity, name) VALUES (?, ?) "
+                     "ON CONFLICT (entity) DO UPDATE SET name = excluded.name "
+                     "WHERE names.name != excluded.name", (_hx(entity), name))
 
 
 def friends_of(entity: int) -> list:
-    d = friends_db()
-    out = []
-    for a, b in d["friends"]:
-        other = b if a == f"{entity:016x}" else (a if b == f"{entity:016x}" else None)
-        if other:
-            out.append((int(other, 16), d["names"].get(other, "")))
-    return out
+    """(other account, its name) for every buddy pair `entity` is in, oldest first."""
+    mine = _hx(entity)
+    return [(int(r["other"], 16), r["name"] or "") for r in store.db().execute(
+        "SELECT CASE WHEN f.a = ? THEN f.b ELSE f.a END AS other, n.name "
+        "FROM friends f LEFT JOIN names n "
+        "ON n.entity = CASE WHEN f.a = ? THEN f.b ELSE f.a END "
+        "WHERE f.a = ? OR f.b = ? ORDER BY f.seq", (mine, mine, mine, mine))]
 
 
 def friends_write_row(w, entity: int, name: str, kind: str) -> None:
@@ -3052,20 +3066,25 @@ def friends_list_result(op: int, dec: dict, who=None, peer_ip: str = ""):
     me = account_for(peer_ip)
     name = (who or (rigconfig.USERNAME, 0))[0]
     friends_note_name(me, name)
-    d = friends_db()
     kind = FRIEND_ROWS.get(op, "none")
     mine = f"{me:016x}"
+    conn = store.db()
     if op == 5:
         what = "friends"
         rows = friends_of(me)
     elif op == 19:
         what = "friend proposals"
-        rows = [(int(i["from"], 16), d["names"].get(i["from"], i.get("from_name", "")))
-                for i in d["invites"] if i.get("to") == mine]
+        rows = [(int(r["from_e"], 16), r["name"] or r["from_name"] or "")
+                for r in conn.execute(
+                    "SELECT i.from_e, i.from_name, n.name FROM friend_invites i "
+                    "LEFT JOIN names n ON n.entity = i.from_e WHERE i.to_e = ? "
+                    "ORDER BY i.seq", (mine,))]
     else:
         what = "block list"
-        rows = [(int(b["who"], 16), d["names"].get(b["who"], ""))
-                for b in d["blocked"] if b.get("by") == mine]
+        rows = [(int(r["who_e"], 16), r["name"] or "")
+                for r in conn.execute(
+                    "SELECT b.who_e, n.name FROM blocks b LEFT JOIN names n "
+                    "ON n.entity = b.who_e WHERE b.by_e = ? ORDER BY b.seq", (mine,))]
     # CAP THE LIST, because the client does not and it does not survive a long
     # one. Measured (TESTPLAN F18): 32 rows fine; **128 rows sign in and then
     # crash on opening the Buddy list** (`CPU Jump to 00000007`, RA
@@ -3140,7 +3159,6 @@ def friends_add(dec: dict, who=None, peer_ip: str = ""):
         log(f"  (friends op1 decode failed: {e})")
         return 0, None
     friends_note_name(me, name)
-    d = friends_db()
     mine, theirs = f"{me:016x}", f"{target:016x}"
     if target == me:
         # F12. `Add buddy by name` with your own name is refused by nobody: the
@@ -3152,10 +3170,10 @@ def friends_add(dec: dict, who=None, peer_ip: str = ""):
         log(f"  friends op1 (INVITE): {name} 0x{mine} invited ITSELF -- REFUSED "
             f"(a self-buddy has no verb that can undo it)")
         return 0, None
-    if sorted((mine, theirs)) in [sorted(p) for p in d["friends"]]:
+    if are_buddies(mine, theirs):
         log(f"  friends op1 (INVITE): {name} -> 0x{target:016x} (already buddies)")
         return 0, None
-    if any(i["from"] == mine and i["to"] == theirs for i in d["invites"]):
+    if invite_pending(mine, theirs):
         log(f"  friends op1 (INVITE): {name} -> 0x{target:016x} (already pending)")
         return 0, None
     # PHASE 28, extended to the other two invites in F19: honour the target's
@@ -3163,12 +3181,13 @@ def friends_add(dec: dict, who=None, peer_ip: str = ""):
     if (os.environ.get("WOW2_NO_FRIENDS_FIX") != "1"
             and invite_blocked(target, me, "friends op1 (INVITE)")):
         return 0, None
-    d["invites"].append({"from": mine, "from_name": name, "to": theirs,
-                         "to_name": d["names"].get(theirs, ""), "at": ts()})
-    _jsave(FRIENDS_DB, d)
+    with store.tx() as conn:
+        conn.execute("INSERT OR IGNORE INTO friend_invites (from_e, from_name, to_e, "
+                     "to_name, at) VALUES (?, ?, ?, ?, ?)",
+                     (mine, name, theirs, name_of(theirs), store.now_iso()))
     log(f"  friends op1 (INVITE): {name} 0x{me:016x} -> 0x{target:016x}"
-        f" ({d['names'].get(theirs) or 'unknown account'}) -- "
-        f"{len(d['invites'])} proposal(s) pending")
+        f" ({name_of(theirs) or 'unknown account'}) -- "
+        f"{_count('friend_invites')} proposal(s) pending")
     # Friends op 19 turned out to be the SENDER's own list ("Cancel buddy
     # invite"). The TARGET's copy is a lobby MESSAGE: it shows up under
     # `View messages` as "Buddy invite from <name>", and cross on it offers
@@ -3222,10 +3241,9 @@ def friends_match_invite(dec: dict, who=None, peer_ip: str = ""):
         return 0, None
     sid = int.from_bytes(session_id[:SESSION_ID_BYTES], "little")
     rec = SESSIONS.get(sid)
-    d = friends_db()
     theirs = f"{target:016x}"
     log(f"  friends op8 (MATCH INVITE): {name} 0x{me:016x} -> 0x{target:016x}"
-        f" ({d['names'].get(theirs) or 'unknown account'}) for session 0x{sid:x}"
+        f" ({name_of(theirs) or 'unknown account'}) for session 0x{sid:x}"
         + (f" ({rec['name']!r}, mode={'POINTS' if rec.get('points') else 'fun'})"
            if rec else " -- NO SUCH LIVE SESSION, relaying the id anyway"))
     mid = message_add(target, PUSH_MATCH_INVITE, me, name, session_id)
@@ -3259,11 +3277,10 @@ def friends_match_decline(dec: dict, who=None, peer_ip: str = ""):
         log(f"  (friends op10 decode failed: {e})")
         return 0, None
     friends_note_name(me, name)
-    d = friends_db()
     theirs = f"{inviter:016x}"
     log(f"  friends op10 (MATCH DECLINE): {name} 0x{me:016x} declined the match "
         f"invite from 0x{inviter:016x} "
-        f"({d['names'].get(theirs) or 'unknown account'})")
+        f"({name_of(theirs) or 'unknown account'})")
     push_to_account(inviter, PUSH_MATCH_REJECTED, me, name, notify_id())
     return 0, None
 
@@ -3295,11 +3312,10 @@ def friends_match_accept(dec: dict, who=None, peer_ip: str = ""):
         log(f"  (friends op9 decode failed: {e})")
         return 0, None
     friends_note_name(me, name)
-    d = friends_db()
     theirs = f"{inviter:016x}"
     log(f"  friends op9 (MATCH ACCEPT): {name} 0x{me:016x} accepted the match "
         f"invite from 0x{inviter:016x} "
-        f"({d['names'].get(theirs) or 'unknown account'})")
+        f"({name_of(theirs) or 'unknown account'})")
     push_to_account(inviter, PUSH_MATCH_ACCEPTED, me, name, notify_id())
     return 0, None
 
@@ -3345,43 +3361,55 @@ def friends_block(dec: dict, who=None, peer_ip: str = ""):
     if os.environ.get("WOW2_NO_FRIENDS_FIX") == "1":
         return friends_respond_legacy(dec, me, name, target, flag)
     friends_note_name(me, name)
-    d = friends_db()
     mine, theirs = f"{me:016x}", f"{target:016x}"
-    d["blocked"] = [b for b in d["blocked"]
-                    if not (b.get("by") == mine and b.get("who") == theirs)]
-    if flag:
-        d["blocked"].append({"by": mine, "who": theirs,
-                             "who_name": d["names"].get(theirs, ""), "at": ts()})
-    _jsave(FRIENDS_DB, d)
+    with store.tx() as conn:
+        conn.execute("DELETE FROM blocks WHERE by_e = ? AND who_e = ?", (mine, theirs))
+        if flag:
+            conn.execute("INSERT INTO blocks (by_e, who_e, who_name, at) VALUES (?, ?, ?, ?)",
+                         (mine, theirs, name_of(theirs), store.now_iso()))
+        blocked = conn.execute("SELECT COUNT(*) FROM blocks WHERE by_e = ?",
+                               (mine,)).fetchone()[0]
     log(f"  friends op6 ({'BLOCK' if flag else 'UNBLOCK'}): {name} "
         f"0x{me:016x} -> 0x{target:016x} "
-        f"({d['names'].get(theirs) or 'unknown account'}) -- "
-        f"{sum(1 for b in d['blocked'] if b.get('by') == mine)} blocked")
+        f"({name_of(theirs) or 'unknown account'}) -- {blocked} blocked")
     return 0, None
 
 
 def friends_respond_legacy(dec: dict, me: int, name: str, target: int, flag: int):
     """The pre-Phase-28 op 6 reading, kept for `WOW2_NO_FRIENDS_FIX=1` bisects."""
-    d = friends_db()
     mine, theirs = f"{me:016x}", f"{target:016x}"
-    pending = [i for i in d["invites"]
-               if (i["from"], i["to"]) in ((theirs, mine), (mine, theirs))]
-    if not pending:
-        log(f"  friends op6: {name} -> 0x{target:016x} flag={flag} "
-            "(no matching proposal -- recorded nothing)")
-        return 0, None
-    d["invites"] = [i for i in d["invites"] if i not in pending]
+    with store.tx() as conn:
+        pending = _drop_invites_between(conn, mine, theirs)
+        if not pending:
+            log(f"  friends op6: {name} -> 0x{target:016x} flag={flag} "
+                "(no matching proposal -- recorded nothing)")
+            return 0, None
+        if flag:
+            _add_pair(conn, mine, theirs)
     if flag:
-        if sorted((mine, theirs)) not in [sorted(p) for p in d["friends"]]:
-            d["friends"].append([mine, theirs])
         log(f"  friends op6: {name} ACCEPTED 0x{target:016x} -- now buddies "
-            f"({len(d['friends'])} pair(s))")
+            f"({_count('friends')} pair(s))")
         push_to_account(target, PUSH_BUDDY_ACCEPTED, me, name, notify_id())
     else:
         log(f"  friends op6: {name} REJECTED 0x{target:016x}")
         push_to_account(target, PUSH_BUDDY_REJECTED, me, name, notify_id())
-    _jsave(FRIENDS_DB, d)
     return 0, None
+
+
+def _drop_invites_between(conn, a: str, b: str) -> int:
+    """Delete every proposal between two accounts, either direction. How many."""
+    return conn.execute("DELETE FROM friend_invites WHERE (from_e = ? AND to_e = ?) "
+                        "OR (from_e = ? AND to_e = ?)", (a, b, b, a)).rowcount
+
+
+def _add_pair(conn, a: str, b: str) -> None:
+    x, y = sorted((a, b))
+    conn.execute("INSERT OR IGNORE INTO friends (a, b) VALUES (?, ?)", (x, y))
+
+
+def _drop_pair(conn, a: str, b: str) -> int:
+    x, y = sorted((a, b))
+    return conn.execute("DELETE FROM friends WHERE a = ? AND b = ?", (x, y)).rowcount
 
 
 def friends_revoke(dec: dict, who=None, peer_ip: str = ""):
@@ -3414,25 +3442,21 @@ def friends_revoke(dec: dict, who=None, peer_ip: str = ""):
         log(f"  (friends op4 decode failed: {e})")
         return 0, None
     friends_note_name(me, name)
-    d = friends_db()
     mine, theirs = f"{me:016x}", f"{target:016x}"
-    was_buddy = sorted((mine, theirs)) in [sorted(p) for p in d["friends"]]
-    incoming = [i for i in d["invites"] if (i["from"], i["to"]) == (theirs, mine)]
-    d["friends"] = [p for p in d["friends"] if sorted(p) != sorted((mine, theirs))]
-    d["invites"] = [i for i in d["invites"]
-                    if (i["from"], i["to"]) not in ((mine, theirs), (theirs, mine))]
-    # Declining leaves the invite MESSAGE behind unless we drop it too. The
-    # client sends its own `Messaging op 4` for the copy it can see, so this
-    # only matters for a target that was offline when the invite was filed.
-    d["messages"] = [m for m in d["messages"]
-                     if not (m.get("to") == mine and m.get("from") == theirs
-                             and int(m.get("type", 0)) == PUSH_BUDDY_INVITE)]
-    _jsave(FRIENDS_DB, d)
+    with store.tx() as conn:
+        incoming = invite_pending(theirs, mine)
+        was_buddy = _drop_pair(conn, mine, theirs) > 0
+        _drop_invites_between(conn, mine, theirs)
+        # Declining leaves the invite MESSAGE behind unless we drop it too. The
+        # client sends its own `Messaging op 4` for the copy it can see, so this
+        # only matters for a target that was offline when the invite was filed.
+        conn.execute("DELETE FROM messages WHERE to_e = ? AND from_e = ? AND type = ?",
+                     (mine, theirs, PUSH_BUDDY_INVITE))
     what = "DECLINED the invite from" if incoming else (
         "REMOVED the buddy" if was_buddy else "revoked nothing with")
     log(f"  friends op4 (REVOKE): {name} {what} 0x{target:016x} "
-        f"({d['names'].get(theirs) or 'unknown account'}) -- "
-        f"{len(d['friends'])} buddy pair(s), {len(d['invites'])} proposal(s)")
+        f"({name_of(theirs) or 'unknown account'}) -- "
+        f"{_count('friends')} buddy pair(s), {_count('friend_invites')} proposal(s)")
     # Tell the other side. "A decline is worth keeping in their mailbox because
     # they may be offline" was the reasoning here, and it is wrong: type 3 is a
     # NOTIFICATION, the client deletes it when it handles it, and a filed one is
@@ -3469,41 +3493,39 @@ def friends_remove(dec: dict, who=None, peer_ip: str = ""):
         log(f"  (friends op13 decode failed: {e})")
         return 0, None
     friends_note_name(me, name)
-    d = friends_db()
     mine, theirs = f"{me:016x}", f"{target:016x}"
-    before = (len(d["friends"]), len(d["invites"]))
-    outgoing = [i for i in d["invites"] if (i["from"], i["to"]) == (mine, theirs)]
-    if os.environ.get("WOW2_NO_FRIENDS_FIX") == "1":
-        d["friends"] = [p for p in d["friends"]
-                        if sorted(p) != sorted((mine, theirs))]
-        d["invites"] = [i for i in d["invites"]
-                        if (i["from"], i["to"]) not in ((mine, theirs), (theirs, mine))]
-    else:
-        # Only the proposal I sent -- op 13 never means "drop a buddy" (op 4 does),
-        # and dropping one here would silently delete a friendship on a console
-        # that only cancelled an invite.
-        d["invites"] = [i for i in d["invites"] if i not in outgoing]
-        # Withdraw the copy sitting in their mailbox, so a cancelled invite does
-        # not reappear at their next sign-in.
-        d["messages"] = [m for m in d["messages"]
-                         if not (m.get("to") == theirs and m.get("from") == mine
-                                 and int(m.get("type", 0)) == PUSH_BUDDY_INVITE)]
-    _jsave(FRIENDS_DB, d)
+    before = (_count("friends"), _count("friend_invites"))
+    with store.tx() as conn:
+        if os.environ.get("WOW2_NO_FRIENDS_FIX") == "1":
+            _drop_pair(conn, mine, theirs)
+            outgoing = _drop_invites_between(conn, mine, theirs)
+        else:
+            # Only the proposal I sent -- op 13 never means "drop a buddy" (op 4 does),
+            # and dropping one here would silently delete a friendship on a console
+            # that only cancelled an invite.
+            outgoing = conn.execute("DELETE FROM friend_invites WHERE from_e = ? AND to_e = ?",
+                                    (mine, theirs)).rowcount
+            # Withdraw the copy sitting in their mailbox, so a cancelled invite does
+            # not reappear at their next sign-in.
+            conn.execute("DELETE FROM messages WHERE to_e = ? AND from_e = ? AND type = ?",
+                         (theirs, mine, PUSH_BUDDY_INVITE))
     log(f"  friends op13 (CANCEL INVITE): {name} 0x{me:016x} -> 0x{target:016x} "
-        f"({d['names'].get(theirs) or 'unknown account'}, "
-        f"{len(outgoing)} proposal(s) withdrawn; "
-        f"friends {before[0]}->{len(d['friends'])}, "
-        f"proposals {before[1]}->{len(d['invites'])})")
+        f"({name_of(theirs) or 'unknown account'}, "
+        f"{outgoing} proposal(s) withdrawn; "
+        f"friends {before[0]}->{_count('friends')}, "
+        f"proposals {before[1]}->{_count('friend_invites')})")
     if outgoing and os.environ.get("WOW2_NO_FRIENDS_FIX") != "1":
         push_to_account(target, PUSH_PROPOSAL_CANCELLED, me, name, notify_id())
     return 0, None
 
 
-def messages_db() -> dict:
-    d = friends_db()
-    d.setdefault("messages", [])
-    d.setdefault("next_msg", 1)
-    return d
+def _next_msg(conn) -> int:
+    """Take the next message id. Inside the caller's transaction, so two
+    handlers cannot draw the same number; `meta.next_msg` is the counter the
+    JSON store kept, and it serves notifications too (see notify_id)."""
+    mid = int(store.meta_get(conn, "next_msg", "1"))
+    store.meta_set(conn, "next_msg", str(mid + 1))
+    return mid
 
 
 # The only message types the client FILES. Everything else deletes itself when
@@ -3533,14 +3555,12 @@ def message_add(to_entity: int, type_id: int, sender: int, sender_name: str,
             f"filed notification is re-delivered AND APPLIED at every sign-in "
             f"(§49.16). Push it with notify_id() instead.")
         return notify_id()
-    d = messages_db()
-    mid = int(d["next_msg"])
-    d["next_msg"] = mid + 1
-    d["messages"].append({"id": mid, "to": f"{to_entity:016x}", "type": type_id,
-                          "from": f"{sender:016x}", "from_name": sender_name,
-                          "session": bytes(session_id).hex(),
-                          "clan": clan_name, "at": ts()})
-    _jsave(FRIENDS_DB, d)
+    with store.tx() as conn:
+        mid = _next_msg(conn)
+        conn.execute("INSERT INTO messages (id, to_e, type, from_e, from_name, session, "
+                     "clan, at) VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+                     (mid, f"{to_entity:016x}", type_id, f"{sender:016x}", sender_name,
+                      bytes(session_id).hex(), clan_name, store.now_iso()))
     return mid
 
 
@@ -3563,11 +3583,8 @@ def notify_id() -> int:
     with a REAL mailbox id, and then one `Messaging op 4` would delete somebody's
     stored invite. That is the whole reason this shares `next_msg`.
     """
-    d = messages_db()
-    mid = int(d["next_msg"])
-    d["next_msg"] = mid + 1
-    _jsave(FRIENDS_DB, d)
-    return mid
+    with store.tx() as conn:
+        return _next_msg(conn)
 
 
 # The six clan NOTIFICATIONS, from the client's own message dispatcher
@@ -3591,7 +3608,7 @@ CLAN_MSG_CORDINARY = 39        # "You are no longer a clan %CLAN% administrator"
 def account_name(entity: int) -> str:
     """The display name we have on file for an account, or "" if none."""
     try:
-        return (friends_db().get("names") or {}).get(f"{entity:016x}", "") or ""
+        return name_of(entity)
     except Exception:
         return ""
 
@@ -3627,10 +3644,8 @@ def clan_notify(to_entity: int, type_id: int, tid: int, clan_name: str,
     if os.environ.get("WOW2_NO_CLAN_NOTIFY") == "1":
         log(f"  (clan notify type {type_id} suppressed by WOW2_NO_CLAN_NOTIFY)")
         return
-    d = messages_db()
-    mid = int(d["next_msg"])
-    d["next_msg"] = mid + 1
-    _jsave(FRIENDS_DB, d)
+    with store.tx() as conn:
+        mid = _next_msg(conn)
     ok = push_to_account(to_entity, type_id, actor, actor_name, msg_id=mid,
                          session_id=tid.to_bytes(8, "little"),
                          clan_name=clan_name,
@@ -3640,8 +3655,18 @@ def clan_notify(to_entity: int, type_id: int, tid: int, clan_name: str,
         + ("pushed" if ok else "not online, and a notification is never filed"))
 
 
-def messages_for(entity: int) -> list:
-    return [m for m in messages_db()["messages"] if m.get("to") == f"{entity:016x}"]
+def messages_for(entity: int, start: int = 0, count: int | None = None) -> list:
+    """This account's mailbox rows, oldest first, in the shape the JSON kept:
+    {id, to, type, from, from_name, session, clan, at}."""
+    sql = "SELECT * FROM messages WHERE to_e = ? ORDER BY id"
+    args: list = [f"{entity:016x}"]
+    if count is not None:
+        sql += " LIMIT ? OFFSET ?"
+        args += [count, start]
+    return [{"id": r["id"], "to": r["to_e"], "type": r["type"], "from": r["from_e"],
+             "from_name": r["from_name"] or "", "session": r["session"] or "",
+             "clan": r["clan"] or "", "at": r["at"] or ""}
+            for r in store.db().execute(sql, args)]
 
 
 def messages_result(dec: dict, who=None, peer_ip: str = ""):
@@ -3668,7 +3693,7 @@ def messages_result(dec: dict, who=None, peer_ip: str = ""):
             log(f"  *** messaging op1 flags are not both false: {flags}")
     except Exception as e:
         log(f"  (messaging op1 decode failed: {e})")
-    rows = messages_for(me)[start:start + max(1, count)]
+    rows = messages_for(me, start, max(1, count))
     log(f"  messaging op1 (inbox) for {name} 0x{me:016x}: {len(rows)} message(s)"
         + (" -> " + ", ".join(f"type {m['type']} from {m['from_name']}" for m in rows)
            if rows else ""))
@@ -3677,7 +3702,6 @@ def messages_result(dec: dict, who=None, peer_ip: str = ""):
         # NO count here: build_lsg_taskreply_encrypted already wrote the
         # [u32 numResults] this arm reads. Writing it again would put the rows
         # one field late -- the mistake that cost Phase 22 five sign-ins.
-        fd = friends_db()
         for m in rows:
             to_hex = m.get("to", "0")
             write_push_body(w, int(m["type"]), int(m["id"]),
@@ -3685,7 +3709,7 @@ def messages_result(dec: dict, who=None, peer_ip: str = ""):
                             bytes.fromhex(m.get("session", "")),
                             m.get("clan", ""),
                             int(to_hex, 16),
-                            fd["names"].get(to_hex, ""))
+                            name_of(to_hex))
     return len(rows), emit
 
 
@@ -3699,13 +3723,11 @@ def messages_delete(dec: dict, who=None, peer_ip: str = ""):
     except Exception as e:
         log(f"  (messaging op4 decode failed: {e})")
         return 0, None
-    d = messages_db()
-    before = len(d["messages"])
-    d["messages"] = [m for m in d["messages"]
-                     if not (int(m["id"]) == mid and m.get("to") == f"{me:016x}")]
-    _jsave(FRIENDS_DB, d)
+    before = _count("messages")
+    with store.tx() as conn:
+        conn.execute("DELETE FROM messages WHERE id = ? AND to_e = ?", (mid, f"{me:016x}"))
     log(f"  messaging op4: 0x{me:016x} deleted message {mid} "
-        f"({before} -> {len(d['messages'])} stored)")
+        f"({before} -> {_count('messages')} stored)")
     return 0, None
 
 
@@ -3727,16 +3749,14 @@ def friends_answer(dec: dict, accept: bool, who=None, peer_ip: str = ""):
     except Exception as e:
         log(f"  (friends op{2 if accept else 3} decode failed: {e})")
         return 0, None
-    d = friends_db()
     mine, theirs = f"{me:016x}", f"{sender:016x}"
-    d["invites"] = [i for i in d["invites"]
-                    if (i["from"], i["to"]) not in ((theirs, mine), (mine, theirs))]
-    if accept and sorted((mine, theirs)) not in [sorted(p) for p in d["friends"]]:
-        d["friends"].append([mine, theirs])
-    _jsave(FRIENDS_DB, d)
+    with store.tx() as conn:
+        _drop_invites_between(conn, mine, theirs)
+        if accept:
+            _add_pair(conn, mine, theirs)
     verb = "ACCEPTED" if accept else "DECLINED"
     log(f"  friends op{2 if accept else 3}: {name} {verb} the invite from "
-        f"0x{sender:016x} ({len(d['friends'])} buddy pair(s))")
+        f"0x{sender:016x} ({_count('friends')} buddy pair(s))")
     kind = PUSH_BUDDY_ACCEPTED if accept else PUSH_BUDDY_REJECTED
     # PUSH, DO NOT FILE. Types 2 and 3 are NOTIFICATIONS -- the client deletes
     # them when it handles them -- and the rule is the one in CLAUDE.md: "a
@@ -3762,21 +3782,89 @@ TEAM_RANK_ADMIN = 1
 TEAM_RANK_OWNER = 2
 
 
-def teams_db() -> dict:
-    d = _jload(TEAMS_DB, {})
-    d.setdefault("next", 1)
-    d.setdefault("teams", {})
-    return d
+# Clans live in the `teams`, `team_members` and `team_proposals` tables (§66
+# step 5; `capture/teams-db.json` before that). A handler works on the same
+# record shape the JSON held -- {name, owner, members, proposals, created,
+# ranks} -- assembled by `team_get()` and written back whole by `team_put()`
+# inside one transaction; a clan has a few dozen rows at most, so the record
+# is cheap and every rule written against the dict still holds.
+
+def team_get(key: str) -> dict | None:
+    """One clan's record by id (16 hex digits), or None."""
+    conn = store.db()
+    t = conn.execute("SELECT * FROM teams WHERE id = ?", (key,)).fetchone()
+    if t is None:
+        return None
+    members = conn.execute("SELECT entity, rank FROM team_members WHERE team = ? "
+                           "ORDER BY seq", (key,)).fetchall()
+    rec = {"name": t["name"] or "", "owner": t["owner"], "created": t["created"] or "",
+           "members": [m["entity"] for m in members],
+           "proposals": [{"to": p["to_e"], "from": p["from_e"],
+                          "from_name": p["from_name"] or "", "at": p["at"] or ""}
+                         for p in conn.execute(
+                             "SELECT * FROM team_proposals WHERE team = ? ORDER BY seq",
+                             (key,))]}
+    ranks = {m["entity"]: int(m["rank"]) for m in members if m["rank"] is not None}
+    if ranks:
+        rec["ranks"] = ranks
+    return rec
+
+
+def team_put(key: str, rec: dict) -> None:
+    """Write one clan's record back, members and proposals included."""
+    with store.tx() as conn:
+        conn.execute("INSERT INTO teams (id, name, owner, created) VALUES (?, ?, ?, ?) "
+                     "ON CONFLICT (id) DO UPDATE SET name = excluded.name, "
+                     "owner = excluded.owner, created = excluded.created",
+                     (key, rec.get("name") or "", rec.get("owner"), rec.get("created")))
+        conn.execute("DELETE FROM team_members WHERE team = ?", (key,))
+        ranks = rec.get("ranks") or {}
+        for m in rec.get("members", []):
+            conn.execute("INSERT OR IGNORE INTO team_members (team, entity, rank) "
+                         "VALUES (?, ?, ?)", (key, m, ranks.get(m)))
+        conn.execute("DELETE FROM team_proposals WHERE team = ?", (key,))
+        for pr in rec.get("proposals", []):
+            conn.execute("INSERT OR IGNORE INTO team_proposals (team, to_e, from_e, "
+                         "from_name, at) VALUES (?, ?, ?, ?, ?)",
+                         (key, pr.get("to"), pr.get("from"), pr.get("from_name"),
+                          pr.get("at")))
+
+
+def team_delete(key: str) -> None:
+    with store.tx() as conn:
+        conn.execute("DELETE FROM team_proposals WHERE team = ?", (key,))
+        conn.execute("DELETE FROM team_members WHERE team = ?", (key,))
+        conn.execute("DELETE FROM teams WHERE id = ?", (key,))
+
+
+def clan_invite_push_type() -> int:
+    """The lobby-message type a clan invite is delivered as; `meta.invite_push_type`
+    (the JSON's top-level key) overrides the default, as it did before."""
+    v = store.meta_get(store.db(), "invite_push_type")
+    return int(v) if v is not None else CLAN_INVITE_PUSH_DEFAULT
 
 
 def team_of(entity: int) -> tuple[int, dict] | tuple[int, None]:
-    for tid, rec in teams_db()["teams"].items():
-        if f"{entity:016x}" in rec.get("members", []):
-            return int(tid, 16), rec
-    return 0, None
+    r = store.db().execute("SELECT team FROM team_members WHERE entity = ? ORDER BY seq "
+                           "LIMIT 1", (f"{entity:016x}",)).fetchone()
+    if r is None:
+        return 0, None
+    rec = team_get(r["team"])
+    return (int(r["team"], 16), rec) if rec else (0, None)
 
 
-def clan_invite_backfill(me: int, name: str, d: dict) -> None:
+def proposals_to(entity: int) -> list[tuple[str, str, str, str]]:
+    """(team id, clan name, inviter, inviter's name) for every clan invite
+    addressed to `entity`, oldest first."""
+    return [(r["team"], r["cname"] or "", r["from_e"],
+             r["from_name"] or name_of(r["from_e"]))
+            for r in store.db().execute(
+                "SELECT p.team, p.from_e, p.from_name, t.name AS cname FROM team_proposals p "
+                "JOIN teams t ON t.id = p.team WHERE p.to_e = ? ORDER BY p.seq",
+                (f"{entity:016x}",))]
+
+
+def clan_invite_backfill(me: int, name: str) -> None:
     """Put a mailbox row behind any clan invite that has none, at sign-in.
 
     `Teams op 20` -- "which clans am I in" -- is the FIRST clan RPC of every
@@ -3797,25 +3885,18 @@ def clan_invite_backfill(me: int, name: str, d: dict) -> None:
     if os.environ.get("WOW2_NO_CLAN_BACKFILL") == "1":
         return
     mine = f"{me:016x}"
-    fd = friends_db()
     have = {(m.get("from"), m.get("clan")) for m in messages_for(me)
             if int(m.get("type", 0)) == PUSH_CLAN_INVITE}
-    for tid, rec in d["teams"].items():
-        if mine in rec.get("members", []):
+    for tid, cname, frm, iname in proposals_to(me):
+        if (frm, cname) in have or store.db().execute(
+                "SELECT 1 FROM team_members WHERE team = ? AND entity = ?",
+                (tid, mine)).fetchone():
             continue
-        for pr in rec.get("proposals", []):
-            if pr.get("to") != mine:
-                continue
-            cname = rec.get("name", "")
-            if (pr.get("from"), cname) in have:
-                continue
-            inviter = int(pr["from"], 16)
-            iname = pr.get("from_name") or fd["names"].get(pr["from"], "")
-            log(f"  (clan invite waiting for {name}: {cname!r} from {iname!r} "
-                f"-- no mailbox row, filing one now so this sign-in's inbox "
-                f"read delivers it)")
-            message_add(me, PUSH_CLAN_INVITE, inviter, iname,
-                        int(tid, 16).to_bytes(8, "little"), cname)
+        log(f"  (clan invite waiting for {name}: {cname!r} from {iname!r} "
+            f"-- no mailbox row, filing one now so this sign-in's inbox "
+            f"read delivers it)")
+        message_add(me, PUSH_CLAN_INVITE, int(frm, 16), iname,
+                    int(tid, 16).to_bytes(8, "little"), cname)
 
 
 def teams_memberships_result(dec: dict, who=None, peer_ip: str = ""):
@@ -3832,15 +3913,14 @@ def teams_memberships_result(dec: dict, who=None, peer_ip: str = ""):
     lsg_request_noargs(dec, "teams op20")
     me = account_for(peer_ip)
     name = (who or (rigconfig.USERNAME, 0))[0]
-    d = teams_db()
-    rows = [(int(tid, 16), rec.get("name", ""),
-             1 if rec.get("owner") == f"{me:016x}" else 0)
-            for tid, rec in d["teams"].items()
-            if f"{me:016x}" in rec.get("members", [])]
+    rows = [(int(r["id"], 16), r["name"] or "", 1 if r["owner"] == f"{me:016x}" else 0)
+            for r in store.db().execute(
+                "SELECT t.id, t.name, t.owner FROM team_members m JOIN teams t "
+                "ON t.id = m.team WHERE m.entity = ? ORDER BY m.seq", (f"{me:016x}",))]
     log(f"  teams op20 (memberships) for {name} 0x{me:016x}: {len(rows)} clan(s)"
         + (" -> " + ", ".join(f"{n!r} 0x{t:016x}{' owner' if o else ''}"
                               for t, n, o in rows) if rows else ""))
-    clan_invite_backfill(me, name, d)
+    clan_invite_backfill(me, name)
 
     def emit(w):
         # NO count here: build_lsg_taskreply_encrypted already wrote the
@@ -3873,10 +3953,10 @@ def team_rank(rec: dict, member: str) -> int:
     not an administrator, so you may not invite".
 
     It is read from the team record so the value can be changed without touching
-    code -- `teams_db()` is `_jload`ed per request. The client caches the roster,
+    code -- the record is read per request. The client caches the roster,
     though, so a change still needs a fresh sign-in to be seen:
 
-        "ranks": { "<entity hex>": 2 }        in capture/teams-db.json
+        UPDATE team_members SET rank = 2 WHERE entity = '<hex>';   in wow2.sqlite3
     """
     ranks = rec.get("ranks") or {}
     if member in ranks:
@@ -3907,12 +3987,11 @@ def teams_members_result(dec: dict, who=None, peer_ip: str = ""):
     except Exception as e:
         log(f"  (teams op21 decode failed: {e})")
         return 0, None
-    rec = teams_db()["teams"].get(f"{tid:016x}")
-    fd = friends_db()
+    rec = team_get(f"{tid:016x}")
     rows = []
     if rec:
         for m in rec.get("members", []):
-            rows.append((int(m, 16), fd["names"].get(m, ""),
+            rows.append((int(m, 16), name_of(m),
                          m == rec.get("owner"), team_rank(rec, m)))
     log(f"  teams op21 (members of 0x{tid:016x} {rec.get('name') if rec else '?'!r}): "
         f"{len(rows)} member(s)")
@@ -3953,9 +4032,8 @@ def teams_invite(dec: dict, who=None, peer_ip: str = ""):
     except Exception as e:
         log(f"  (teams op6 decode failed: {e})")
         return 0, None
-    d = teams_db()
     key = f"{tid:016x}"
-    rec = d["teams"].get(key)
+    rec = team_get(key)
     theirs = f"{target:016x}"
     if rec is None:
         log(f"  teams op6 (CLAN INVITE): no such clan 0x{key} -- ignored")
@@ -3980,11 +4058,10 @@ def teams_invite(dec: dict, who=None, peer_ip: str = ""):
     props = rec.setdefault("proposals", [])
     if not any(p.get("to") == theirs for p in props):
         props.append({"to": theirs, "from": f"{me:016x}", "from_name": name,
-                      "at": ts()})
-        _jsave(TEAMS_DB, d)
-    fd = friends_db()
+                      "at": store.now_iso()})
+        team_put(key, rec)
     log(f"  teams op6 (CLAN INVITE): {name} invites 0x{theirs} "
-        f"({fd['names'].get(theirs) or 'unknown account'}) to "
+        f"({name_of(theirs) or 'unknown account'}) to "
         f"{rec.get('name')!r} 0x{key} -- {len(props)} proposal(s) outstanding")
     # `Teams op 24` is NOT the delivery path: it only fires for a console that
     # already belongs to a clan (measured -- the invited, clanless console never
@@ -3992,15 +4069,15 @@ def teams_invite(dec: dict, who=None, peer_ip: str = ""):
     # The invited console must therefore be told the same way a buddy or match
     # invite tells it: a lobby message. The game has the inbox string
     # `Clan %CLAN% invite from %GAMER%` to render it.
-    ptype = int(d.get("invite_push_type", CLAN_INVITE_PUSH_DEFAULT))
+    ptype = clan_invite_push_type()
     if not ptype:
         log("  (clan invite filed but NOT delivered: the lobby-message layout "
             "for a clan type is unsolved -- see netrecon.md Phase 25. Set "
-            "\"invite_push_type\" in capture/teams-db.json to try an id.)")
+            "meta.invite_push_type in the store to try an id.)")
         return 0, None
     blob = tid.to_bytes(8, "little")
     cname = rec.get("name", "")
-    tname = fd["names"].get(theirs, "")
+    tname = name_of(theirs)
     mid = message_add(target, ptype, me, name, blob, cname)
     push_to_account(target, ptype, me, name, mid, blob, cname,
                     target=target, target_name=tname)
@@ -4024,17 +4101,16 @@ def clan_invite_mail_drop(tid: int, ptype: int, recipients=None) -> int:
     with it. `recipients` limits it further; None means every outstanding one.
     """
     blob = tid.to_bytes(8, "little").hex()
-    want = None if recipients is None else {r for r in recipients}
-    d = messages_db()
-    before = len(d["messages"])
-    d["messages"] = [m for m in d["messages"]
-                     if not (int(m.get("type", 0)) == ptype
-                             and m.get("session") == blob
-                             and (want is None or m.get("to") in want))]
-    gone = before - len(d["messages"])
-    if gone:
-        _jsave(FRIENDS_DB, d)
-    return gone
+    want = None if recipients is None else sorted({r for r in recipients})
+    with store.tx() as conn:
+        if want is None:
+            return conn.execute("DELETE FROM messages WHERE type = ? AND session = ?",
+                                (ptype, blob)).rowcount
+        if not want:
+            return 0
+        marks = ",".join("?" * len(want))
+        return conn.execute(f"DELETE FROM messages WHERE type = ? AND session = ? "
+                            f"AND to_e IN ({marks})", (ptype, blob, *want)).rowcount
 
 
 def teams_cancel_invite(dec: dict, who=None, peer_ip: str = ""):
@@ -4072,9 +4148,8 @@ def teams_cancel_invite(dec: dict, who=None, peer_ip: str = ""):
     except Exception as e:
         log(f"  (teams op25 decode failed: {e})")
         return 0, None
-    d = teams_db()
     key, theirs, mine = f"{tid:016x}", f"{target:016x}", f"{me:016x}"
-    rec = d["teams"].get(key)
+    rec = team_get(key)
     if rec is None:
         log(f"  teams op25 (CANCEL CLAN INVITE): no such clan 0x{key} -- ignored")
         return 0, None
@@ -4085,16 +4160,15 @@ def teams_cancel_invite(dec: dict, who=None, peer_ip: str = ""):
     props = rec.get("proposals", [])
     had = any(p.get("to") == theirs for p in props)
     rec["proposals"] = [p for p in props if p.get("to") != theirs]
-    _jsave(TEAMS_DB, d)
+    team_put(key, rec)
     # Withdraw the invite from the invitee's mailbox too. Matched on all three
     # of (to, type, team) rather than just the recipient, so cancelling one clan
     # invite cannot take a buddy invite or a second clan's invite with it.
-    ptype = int(d.get("invite_push_type", CLAN_INVITE_PUSH_DEFAULT))
+    ptype = clan_invite_push_type()
     pulled = clan_invite_mail_drop(tid, ptype, [theirs])
-    fd = friends_db()
     log(f"  teams op25 (CANCEL CLAN INVITE): {name} 0x{mine} withdraws the "
         f"invite to 0x{theirs} "
-        f"({fd['names'].get(theirs) or 'unknown account'}) for "
+        f"({name_of(theirs) or 'unknown account'}) for "
         f"{rec.get('name')!r} 0x{key}"
         + ("" if had else " -- but no proposal was on file")
         + f" ({len(rec['proposals'])} proposal(s) left, "
@@ -4126,9 +4200,8 @@ def teams_answer_invite(accept: bool, dec: dict, who=None, peer_ip: str = ""):
     except Exception as e:
         log(f"  (teams op{8 if accept else 7} decode failed: {e})")
         return 0, None
-    d = teams_db()
     key = f"{tid:016x}"
-    rec = d["teams"].get(key)
+    rec = team_get(key)
     mine = f"{me:016x}"
     if rec is None:
         log(f"  teams op{8 if accept else 7} ({verb} CLAN INVITE): no such clan "
@@ -4155,7 +4228,7 @@ def teams_answer_invite(accept: bool, dec: dict, who=None, peer_ip: str = ""):
     rec["proposals"] = [p for p in props if p.get("to") != mine]
     if accept and mine not in rec.setdefault("members", []):
         rec["members"].append(mine)
-    _jsave(TEAMS_DB, d)
+    team_put(key, rec)
     log(f"  teams op{8 if accept else 7} ({verb} CLAN INVITE): {name} "
         f"0x{mine} {'joins' if accept else 'declines'} {rec.get('name')!r} "
         f"0x{key} (invited by 0x{inviter:016x}"
@@ -4227,9 +4300,8 @@ def teams_set_rank(promote: bool, dec: dict, who=None, peer_ip: str = ""):
     except Exception as e:
         log(f"  (teams op{op} decode failed: {e})")
         return 0, None
-    d = teams_db()
     key, mine, them = f"{tid:016x}", f"{me:016x}", f"{target:016x}"
-    rec = d["teams"].get(key)
+    rec = team_get(key)
     if rec is None:
         log(f"  teams op{op} ({verb}): no such clan 0x{key} -- ignored")
         return 0, None
@@ -4243,7 +4315,7 @@ def teams_set_rank(promote: bool, dec: dict, who=None, peer_ip: str = ""):
         return 0, None
     ranks = rec.setdefault("ranks", {})
     ranks[them] = TEAM_RANK_ADMIN if promote else TEAM_RANK_MEMBER
-    _jsave(TEAMS_DB, d)
+    team_put(key, rec)
     log(f"  teams op{op} ({verb} CLAN MEMBER): {name} 0x{mine} sets 0x{them} "
         f"to {'administrator' if promote else 'member'} (rank "
         f"{ranks[them]}) in {rec.get('name')!r} 0x{key}")
@@ -4267,9 +4339,8 @@ def teams_remove_member(dec: dict, who=None, peer_ip: str = ""):
     except Exception as e:
         log(f"  (teams op4 decode failed: {e})")
         return 0, None
-    d = teams_db()
     key, mine, them = f"{tid:016x}", f"{me:016x}", f"{target:016x}"
-    rec = d["teams"].get(key)
+    rec = team_get(key)
     if rec is None:
         log(f"  teams op4 (REMOVE): no such clan 0x{key} -- ignored")
         return 0, None
@@ -4281,7 +4352,7 @@ def teams_remove_member(dec: dict, who=None, peer_ip: str = ""):
         log(f"  teams op4 (REMOVE): 0x{them} is not in {rec.get('name')!r} "
             f"-- ignored")
         return 0, None
-    _jsave(TEAMS_DB, d)
+    team_put(key, rec)
     log(f"  teams op4 (REMOVE FROM CLAN): {name} 0x{mine} removes 0x{them} "
         f"from {rec.get('name')!r} 0x{key} -- {len(rec['members'])} member(s) left")
     clan_notify(target, CLAN_MSG_CKICKED, tid, rec.get("name") or "", me, name,
@@ -4325,9 +4396,8 @@ def teams_leave(dec: dict, who=None, peer_ip: str = ""):
     except Exception as e:
         log(f"  (teams op5 decode failed: {e})")
         return 0, None
-    d = teams_db()
     key, mine, them = f"{tid:016x}", f"{me:016x}", f"{target:016x}"
-    rec = d["teams"].get(key)
+    rec = team_get(key)
     if rec is None:
         log(f"  teams op5 (LEAVE/DISBAND): no such clan 0x{key} -- ignored")
         return 0, None
@@ -4340,7 +4410,7 @@ def teams_leave(dec: dict, who=None, peer_ip: str = ""):
         if not _team_drop(rec, them):
             log(f"  teams op5 (REMOVE): 0x{them} is not in {cname!r} -- ignored")
             return 0, None
-        _jsave(TEAMS_DB, d)
+        team_put(key, rec)
         log(f"  teams op5 (REMOVE FROM CLAN): {name} 0x{mine} removes 0x{them} "
             f"from {cname!r} 0x{key} -- {len(rec['members'])} member(s) left")
         clan_notify(target, CLAN_MSG_CKICKED, tid, cname or "", me, name,
@@ -4349,14 +4419,12 @@ def teams_leave(dec: dict, who=None, peer_ip: str = ""):
     if rec.get("owner") == mine:
         members = [m for m in rec.get("members", []) if m != mine]
         invited = [p.get("to") for p in rec.get("proposals", []) if p.get("to")]
-        del d["teams"][key]
-        _jsave(TEAMS_DB, d)
+        team_delete(key)
         # The proposals died with the record; their MAILBOX rows did not, and
         # the inbox is re-read at every sign-in. Without this the invitee is
         # still offered `Accept clan invite` for a clan that no longer exists
         # (§49.17) -- the same defect `Teams op 25` had, one screen along.
-        pulled = clan_invite_mail_drop(
-            tid, int(d.get("invite_push_type", CLAN_INVITE_PUSH_DEFAULT)), invited)
+        pulled = clan_invite_mail_drop(tid, clan_invite_push_type(), invited)
         log(f"  teams op5 (DISBAND CLAN): {name} 0x{mine} disbands {cname!r} "
             f"0x{key} -- {len(members)} other member(s) lose it, "
             f"{len(invited)} outstanding invite(s) withdrawn "
@@ -4366,7 +4434,7 @@ def teams_leave(dec: dict, who=None, peer_ip: str = ""):
                         target=me, target_name=name)
         return 0, None
     _team_drop(rec, mine)
-    _jsave(TEAMS_DB, d)
+    team_put(key, rec)
     log(f"  teams op5 (LEAVE CLAN): {name} 0x{mine} leaves {cname!r} 0x{key} "
         f"-- {len(rec['members'])} member(s) left")
     for m in rec.get("members", []):
@@ -4394,9 +4462,8 @@ def teams_transfer_owner(dec: dict, who=None, peer_ip: str = ""):
     except Exception as e:
         log(f"  (teams op27 decode failed: {e})")
         return 0, None
-    d = teams_db()
     key, mine, them = f"{tid:016x}", f"{me:016x}", f"{target:016x}"
-    rec = d["teams"].get(key)
+    rec = team_get(key)
     if rec is None:
         log(f"  teams op27 (TRANSFER): no such clan 0x{key} -- ignored")
         return 0, None
@@ -4412,7 +4479,7 @@ def teams_transfer_owner(dec: dict, who=None, peer_ip: str = ""):
     ranks = rec.setdefault("ranks", {})
     ranks.pop(them, None)                      # the owner's rank is implied
     ranks[mine] = TEAM_RANK_MEMBER
-    _jsave(TEAMS_DB, d)
+    team_put(key, rec)
     log(f"  teams op27 (TRANSFER OWNERSHIP): {name} 0x{mine} hands "
         f"{rec.get('name')!r} 0x{key} to 0x{them}; the old owner is now an "
         f"ordinary member")
@@ -4469,14 +4536,8 @@ def teams_proposals_result(dec: dict, who=None, peer_ip: str = ""):
     lsg_request_noargs(dec, "teams op24")
     me = account_for(peer_ip)
     mine = f"{me:016x}"
-    fd = friends_db()
-    rows = []
-    for tid, rec in teams_db()["teams"].items():
-        for pr in rec.get("proposals", []):
-            if pr.get("to") == mine:
-                rows.append((int(tid, 16), int(pr["from"], 16),
-                             rec.get("name", ""),
-                             pr.get("from_name") or fd["names"].get(pr["from"], "")))
+    rows = [(int(tid, 16), int(frm, 16), cname, iname)
+            for tid, cname, frm, iname in proposals_to(me)]
     log(f"  teams op24 (clan proposals) for 0x{mine}: {len(rows)}"
         + ("".join(f" -> {n!r} from {who_!r}" for _t, _f, n, who_ in rows)
            if rows else ""))
@@ -4506,43 +4567,39 @@ def teams_proposals_result(dec: dict, who=None, peer_ip: str = ""):
 # isPrivate is not a guess: net::tStorage prints "private:\%s" when it is set
 # and "public:\%s" when it is not (0x08d38ba4 / 0x08d38b98).
 #
-# capture/storage-db.json lists what to serve; the bytes live beside it in
-# capture/storage/. Empty (the default) is a legal, quiet answer.
-STORAGE_DB = CAP / "storage-db.json"
+# The `storage` table lists what to serve (§66 step 6; `capture/storage-db.json`
+# before that); the bytes live in capture/storage/. Empty (the default) is a
+# legal, quiet answer.
 STORAGE_DIR = CAP / "storage"
+STORAGE_FIRST_ID = 0x5001          # ids the server allocates; hand-seeded rows sit below
 
 
-def storage_files() -> list:
-    d = _jload(STORAGE_DB, {})
-    return d.get("files", []) if isinstance(d.get("files"), list) else []
+def _storage_row(r) -> dict:
+    """One `storage` row as the dict the handlers always used, NULLs omitted so
+    `f.get("created", 0)` and friends read as they did from the JSON."""
+    out = {"id": r["id"], "name": r["name"] or "", "private": bool(r["private"])}
+    for k in ("owner", "file", "size", "created", "modified"):
+        if r[k] is not None:
+            out[k] = r[k]
+    return out
 
 
-_STORAGE_DUPS_SEEN: set = set()
+def storage_row(fid: int) -> dict | None:
+    r = store.db().execute("SELECT * FROM storage WHERE id = ?", (fid,)).fetchone()
+    return _storage_row(r) if r else None
 
 
-def storage_warn_duplicate_ids(files: list) -> None:
-    """Shout once if two rows share a file id. Nothing else notices.
-
-    `Storage op 5` fetches by id with a `next()`, so the SECOND row with a
-    duplicated id is unreachable and the first one's bytes are served in its
-    place; worse, `op 1`'s replace step drops every row with the id it is about
-    to write, so one upload can silently delete both. `capture/storage-db.json`
-    carried exactly this for several phases -- id 40 was a snapshot AND a shared
-    landscape, same owner -- and no check anywhere would have said so. Warned
-    once per distinct id per process, at the list the sign-in always fetches.
-    """
-    seen, dups = set(), set()
-    for f in files:
-        fid = _storage_id(f)
-        if fid in seen:
-            dups.add(fid)
-        seen.add(fid)
-    for fid in sorted(dups - _STORAGE_DUPS_SEEN):
-        _STORAGE_DUPS_SEEN.add(fid)
-        names = [f.get("name") for f in files if _storage_id(f) == fid]
-        log(f"  !!!! storage-db has {len(names)} rows with file id 0x{fid:x} "
-            f"({', '.join(map(str, names))}) -- op 5 can only ever reach the "
-            f"first, and an op 1 onto that id would delete them all")
+def storage_rows(owner: int | None, everyone: bool = False) -> list:
+    """The rows one list op serves: op 8 the GLOBAL rows (no owner), op 7 the
+    global rows plus `owner`'s. In id order, which is upload order for
+    anything the server allocated."""
+    conn = store.db()
+    if everyone:
+        cur = conn.execute("SELECT * FROM storage WHERE owner IS NULL OR owner = ? "
+                           "ORDER BY id", (f"{owner:016x}",))
+    else:
+        cur = conn.execute("SELECT * FROM storage WHERE owner IS NULL ORDER BY id")
+    return [_storage_row(r) for r in cur]
 
 
 def storage_list_result(op: int, dec: dict, who=None, peer_ip: str = ""):
@@ -4596,23 +4653,11 @@ def storage_list_result(op: int, dec: dict, who=None, peer_ip: str = ""):
         filt = next((v for t, v in bd.read_fields(r) if t == bd.BD_STR and v), "")
     except Exception as e:
         log(f"  (storage op{op} request decode failed: {e}; serving unwindowed)")
-    files = storage_files()
-    # D7. WARN HERE, on the list the sign-in always fetches -- not only on
-    # upload. The guard was hooked into `op 1` alone, which is the handler whose
-    # replace step is the thing that destroys the rows, so on the one run where
-    # it mattered it fired in the same breath as the damage. Its own docstring
-    # said "at the list the sign-in always fetches" and that was not true of the
-    # code. The whole point of the warning is to be read BEFORE an upload.
-    #
-    # Scanned over the UNFILTERED store, because a duplicate is a property of
-    # the file id and not of who is asking: op 7 is windowed to 128 rows and
-    # filtered by owner, so a pair split across that boundary would otherwise
-    # never be seen. `_STORAGE_DUPS_SEEN` keeps it to once per id per process.
-    storage_warn_duplicate_ids(files)
-    if op == 7:
-        files = [f for f in files if f.get("owner") in (None, f"{owner:016x}")]
-    else:
-        files = [f for f in files if not f.get("owner")]
+    # D7 used to be a warning here -- two rows with one file id, which op 5
+    # could only half reach and op 1's replace step deleted together. The
+    # store's primary key makes the second row impossible (§66), and the
+    # importer refuses a JSON file that has one rather than pick.
+    files = storage_rows(owner, everyone=(op == 7))
     total = len(files)
     if count > 0:
         files = files[start:start + count]
@@ -4643,8 +4688,8 @@ def storage_list_result(op: int, dec: dict, who=None, peer_ip: str = ""):
 
 
 def storage_bytes(f: dict) -> bytes:
-    if f.get("data") is not None:
-        return str(f["data"]).encode("latin1", "replace")
+    """The file's bytes from storage/. (The Phase 26 seeds carried them inline
+    as `data`; the import wrote those out, so every row is a file now.)"""
     try:
         return (STORAGE_DIR / f.get("file", "")).read_bytes()
     except OSError:
@@ -4702,7 +4747,7 @@ def storage_get_result(dec: dict, who=None, peer_ip: str = ""):
     except Exception as e:
         log(f"  (storage op5 decode failed: {e})")
         return 0, None
-    f = next((x for x in storage_files() if int(x.get("id", 0)) == fid), None)
+    f = storage_row(fid)
     body = storage_bytes(f) if f else b""
     blob_only = os.environ.get("WOW2_STORAGE_BLOB_ONLY") == "1"
     log(f"  storage op5 (get file 0x{fid:x}): "
@@ -4800,17 +4845,18 @@ def storage_upload_result(dec: dict, who=None, peer_ip: str = ""):
     except Exception as e:
         log(f"  (storage op1 decode failed: {e})")
         return 0, None
-    d = _jload(STORAGE_DB, {})
-    storage_warn_duplicate_ids(d.get("files") or [])
-    files = d.setdefault("files", [])
-    fid = 0
-    for f in files:
-        if f.get("name") == name and _storage_owner(f) == me:
-            fid = _storage_id(f)
-            break
+    conn = store.db()
+    mine = f"{me:016x}"
+    r = conn.execute("SELECT id FROM storage WHERE name = ? AND owner = ? ORDER BY id "
+                     "LIMIT 1", (name, mine)).fetchone()
+    fid = int(r["id"]) if r else 0
     if not fid:
-        used = {_storage_id(f) for f in files}
-        fid = next(i for i in range(0x5001, 0x5001 + 4096) if i not in used)
+        # The smallest free id at or above STORAGE_FIRST_ID, as before; the
+        # hand-seeded rig rows live below it and never collide.
+        used = {int(x[0]) for x in conn.execute("SELECT id FROM storage WHERE id >= ?",
+                                                 (STORAGE_FIRST_ID,))}
+        fid = next(i for i in range(STORAGE_FIRST_ID, STORAGE_FIRST_ID + 65536)
+                   if i not in used)
     blob_name = f"{fid:x}-{name}"
     try:
         STORAGE_DIR.mkdir(parents=True, exist_ok=True)
@@ -4845,11 +4891,13 @@ def storage_upload_result(dec: dict, who=None, peer_ip: str = ""):
     # which is why nobody noticed -- the only dated rows on the rig were dated
     # by hand.
     now = int(time.time())
-    rec = {"id": fid, "name": name, "owner": f"{me:016x}", "file": blob_name,
-           "private": bool(private), "size": len(data),
-           "created": now, "modified": now}
-    files[:] = [f for f in files if _storage_id(f) != fid] + [rec]
-    _jsave(STORAGE_DB, d)
+    with store.tx():
+        conn.execute("INSERT INTO storage (id, name, owner, file, private, size, created, "
+                     "modified) VALUES (?, ?, ?, ?, ?, ?, ?, ?) ON CONFLICT (id) DO UPDATE SET "
+                     "name = excluded.name, owner = excluded.owner, file = excluded.file, "
+                     "private = excluded.private, size = excluded.size, "
+                     "created = excluded.created, modified = excluded.modified",
+                     (fid, name, mine, blob_name, 1 if private else 0, len(data), now, now))
     log(f"  storage op1 (UPLOAD): {name!r} {len(data)} bytes from "
         f"0x{me:016x} -> file id 0x{fid:x} "
         f"(published={published} private={private})")
@@ -4880,9 +4928,7 @@ def storage_overwrite_result(dec: dict, who=None, peer_ip: str = ""):
     except Exception as e:
         log(f"  (storage op2 decode failed: {e})")
         return 0, None
-    d = _jload(STORAGE_DB, {})
-    files = d.setdefault("files", [])
-    rec = next((f for f in files if _storage_id(f) == fid), None)
+    rec = storage_row(fid)
     if rec is None:
         log(f"  storage op2 (OVERWRITE): no file 0x{fid:x} -- ignored")
         return 0, None
@@ -4901,14 +4947,15 @@ def storage_overwrite_result(dec: dict, who=None, peer_ip: str = ""):
         log(f"  (storage op2 could not write {blob_name}: {e})")
         return 0, None
     was = int(rec.get("size", 0) or 0)
-    rec["size"] = len(data)
     # D4, the other half. An overwrite replaces the bytes in place and keeps the
     # id, so `created` is still true -- but `modified` must move, or a snapshot
     # re-saved over an old slot renders the date it first had. Same silent
     # class: a well-shaped field with a stale value.
-    rec["modified"] = int(time.time())
-    rec.setdefault("created", rec["modified"])
-    _jsave(STORAGE_DB, d)
+    now = int(time.time())
+    with store.tx() as conn:
+        conn.execute("UPDATE storage SET size = ?, modified = ?, file = ?, "
+                     "created = COALESCE(created, ?) WHERE id = ?",
+                     (len(data), now, blob_name, now, fid))
     log(f"  storage op2 (OVERWRITE): file 0x{fid:x} {rec.get('name')!r} "
         f"{was} -> {len(data)} bytes, from 0x{me:016x}")
     return 0, None
@@ -4926,9 +4973,7 @@ def storage_delete_result(dec: dict, who=None, peer_ip: str = ""):
     except Exception as e:
         log(f"  (storage op4 decode failed: {e})")
         return 0, None
-    d = _jload(STORAGE_DB, {})
-    files = d.setdefault("files", [])
-    rec = next((f for f in files if _storage_id(f) == fid), None)
+    rec = storage_row(fid)
     if rec is None:
         log(f"  storage op4 (DELETE): no file 0x{fid:x} -- ignored")
         return 0, None
@@ -4937,13 +4982,14 @@ def storage_delete_result(dec: dict, who=None, peer_ip: str = ""):
         log(f"  storage op4 (DELETE): file 0x{fid:x} {rec.get('name')!r} "
             f"belongs to 0x{owner:016x}, not 0x{me:016x} -- REFUSED")
         return 0, None
-    files[:] = [f for f in files if _storage_id(f) != fid]
-    _jsave(STORAGE_DB, d)
+    with store.tx() as conn:
+        conn.execute("DELETE FROM storage WHERE id = ?", (fid,))
+        left = conn.execute("SELECT COUNT(*) FROM storage").fetchone()[0]
     # The blob is kept. A delete here removes the file from every listing, which
     # is what the client asked for; leaving the bytes on disk costs nothing and
     # has twice saved a landscape that was deleted from the wrong console.
     log(f"  storage op4 (DELETE): file 0x{fid:x} {rec.get('name')!r} removed by "
-        f"0x{me:016x} ({len(files)} file(s) left; the blob is kept on disk)")
+        f"0x{me:016x} ({left} file(s) left; the blob is kept on disk)")
     return 0, None
 
 
@@ -4962,7 +5008,6 @@ def teams_create_result(dec: dict, who=None, peer_ip: str = ""):
     except Exception as e:
         log(f"  (teams op1 decode failed: {e})")
         return 0, None
-    d = teams_db()
     mine = f"{me:016x}"
     # C20 -- A CLAN NAME IS NOT A KEY, and this used to treat it as one: a
     # create whose name already existed JOINED that clan instead, so two clans
@@ -4979,29 +5024,34 @@ def teams_create_result(dec: dict, who=None, peer_ip: str = ""):
     # work now (`op 6`/`op 8`), so it is just a lie. WOW2_CLAN_NAME_IS_KEY=1
     # puts it back for a bisect.
     existing = ""
+    conn = store.db()
     if os.environ.get("WOW2_CLAN_NAME_IS_KEY") == "1":
-        existing = next((tid for tid, rec in d["teams"].items()
-                         if rec.get("name", "").lower() == clan.lower()), "")
+        r = conn.execute("SELECT id FROM teams WHERE lower(name) = ? ORDER BY id LIMIT 1",
+                         (clan.lower(),)).fetchone()
+        existing = r["id"] if r else ""
     if existing:
-        rec = d["teams"][existing]
+        rec = team_get(existing)
         if mine not in rec["members"]:
             rec["members"].append(mine)
+        team_put(existing, rec)
         tid = int(existing, 16)
         log(f"  teams op1 (CREATE): {who_name} joined existing clan {clan!r} "
             f"id=0x{tid:016x} ({len(rec['members'])} member(s)) "
             f"[WOW2_CLAN_NAME_IS_KEY]")
     else:
-        dupes = sum(1 for rec in d["teams"].values()
-                    if rec.get("name", "").lower() == clan.lower())
-        tid = TEAM_ID_BASE + d["next"]
-        d["next"] += 1
-        d["teams"][f"{tid:016x}"] = {"name": clan, "owner": mine, "members": [mine],
-                                     "created": ts()}
+        with store.tx():
+            dupes = conn.execute("SELECT COUNT(*) FROM teams WHERE lower(name) = ?",
+                                 (clan.lower(),)).fetchone()[0]
+            nxt = int(store.meta_get(conn, "teams_next", "1"))
+            store.meta_set(conn, "teams_next", str(nxt + 1))
+            tid = TEAM_ID_BASE + nxt
+            team_put(f"{tid:016x}", {"name": clan, "owner": mine, "members": [mine],
+                                     "created": store.now_iso()})
+            total = conn.execute("SELECT COUNT(*) FROM teams").fetchone()[0]
         log(f"  teams op1 (CREATE): {who_name} created clan {clan!r} "
-            f"id=0x{tid:016x} ({len(d['teams'])} clan(s))"
+            f"id=0x{tid:016x} ({total} clan(s))"
             + (f" -- {dupes} other clan(s) already share that name, which is "
                f"allowed: the name is not a key" if dupes else ""))
-    _jsave(TEAMS_DB, d)
     friends_note_name(me, who_name)
 
     def emit(w):
@@ -6551,6 +6601,16 @@ async def start_nat_type_sockets(loop, bind: str) -> None:
 
 async def main():
     check_tiger()
+    # The store, before the port: an import of a JSON store happens here, in
+    # the log, and a damaged database or an unreadable file stops the process
+    # before a console can reach it (§66).
+    store.set_logger(log)
+    try:
+        store.startup()
+    except store.StoreError as e:
+        log(f"!!!! {e}")
+        print(f"!! {e}", file=sys.stderr, flush=True)
+        raise SystemExit(2)
     loop = asyncio.get_running_loop()
     bind, port = serverconfig.BIND, serverconfig.PORT
     server = await loop.create_server(AuthConnection, bind, port)

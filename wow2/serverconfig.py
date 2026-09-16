@@ -192,7 +192,7 @@ DEFAULTS: dict[str, dict] = {
         "starting_rating": 400,
     },
     "storage": {
-        # Where the JSON stores and uploaded blobs live.
+        # Where the store (wow2.sqlite3), the uploaded blobs and the logs live.
         "data_dir": str(_DEFAULT_DATA),
     },
 }

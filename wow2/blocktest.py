@@ -207,11 +207,25 @@ def seed(tmp: Path) -> None:
 
 
 def friends(tmp: Path) -> dict:
-    return json.loads((tmp / "friends-db.json").read_text())
+    """The social store as the JSON file had it -- exported from the scratch
+    server's own SQLite store (§66 step 4), same keys, same shapes."""
+    import store
+    conn = store.connect(tmp / store.DB_NAME)
+    try:
+        return store.export_friends(conn)
+    finally:
+        conn.close()
 
 
 def teams(tmp: Path) -> dict:
-    return json.loads((tmp / "teams-db.json").read_text())
+    """The clan store as the JSON file had it, exported from the scratch
+    server's own SQLite store (§66 step 5)."""
+    import store
+    conn = store.connect(tmp / store.DB_NAME)
+    try:
+        return store.export_teams(conn)
+    finally:
+        conn.close()
 
 
 def mail_for(tmp: Path, entity: int) -> list:

@@ -26,6 +26,11 @@ THE STORE HOLDS DIGESTS AND NEVER PASSWORDS. The client sends
 `Tiger192(password)`, which *is* the key the login reply is built with, so the
 digest is the credential -- which also means `list` does not print it. Anyone
 holding it can impersonate the server to that account.
+
+The rows are the `accounts` table of `wow2.sqlite3` in the data directory
+(§66; `accounts.json` before that, imported once by the server's first start
+on this build). `sqlite3 wow2.sqlite3 'select name, handle, user_id from
+accounts'` is the same list.
 """
 from __future__ import annotations
 
@@ -37,22 +42,23 @@ from pathlib import Path
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 
 import authserver as srv
+import store
 
 
 def cmd_list(_args) -> int:
-    db = srv._jload(srv.ACCOUNTS_DB, {})
-    if not db:
-        print(f"no accounts in {srv.ACCOUNTS_DB}")
+    rows = store.db().execute("SELECT * FROM accounts ORDER BY name").fetchall()
+    if not rows:
+        print(f"no accounts in {store.path()}")
         print("  (a console writes one when it CREATES an account; one that "
               "already had\n   an account signs straight in and never sends "
               "its name, so add it here)")
         return 0
-    print(f"{srv.ACCOUNTS_DB}  --  {len(db)} account(s)\n")
+    print(f"{store.path()}  --  {len(rows)} account(s)\n")
     print(f"  {'name':<20} {'handle':<18} {'cred':<5} {'id':<4} last seen")
-    for name, row in sorted(db.items()):
-        print(f"  {name:<20} {row.get('handle', '?'):<18} "
-              f"{'yes' if row.get('pwhash') else 'NO':<5} "
-              f"{row.get('user_id', 0):<4} {row.get('last_seen', '-')}")
+    for row in rows:
+        print(f"  {row['name']:<20} {row['handle'] or '?':<18} "
+              f"{'yes' if row['pwhash'] else 'NO':<5} "
+              f"{row['user_id'] or 0:<4} {row['last_seen'] or '-'}")
     return 0
 
 
@@ -83,12 +89,11 @@ def cmd_set(args) -> int:
 
 
 def cmd_remove(args) -> int:
-    db = srv._jload(srv.ACCOUNTS_DB, {})
-    if args.name not in db:
+    with store.tx() as conn:
+        cur = conn.execute("DELETE FROM accounts WHERE name = ?", (args.name,))
+    if cur.rowcount == 0:
         print(f"no such account: {args.name}")
         return 1
-    del db[args.name]
-    srv._jsave(srv.ACCOUNTS_DB, db)
     print(f"removed {args.name!r}")
     return 0
 
@@ -115,8 +120,14 @@ def main() -> int:
     p.add_argument("name")
 
     args = ap.parse_args()
-    return {"list": cmd_list, "set": cmd_set,
-            "handle": cmd_handle, "remove": cmd_remove}[args.cmd](args)
+    try:
+        return {"list": cmd_list, "set": cmd_set,
+                "handle": cmd_handle, "remove": cmd_remove}[args.cmd](args)
+    except store.StoreError as e:
+        # An un-imported accounts.json (an older server still running on it)
+        # or a damaged database: one line, not a traceback.
+        print(f"!! {e}")
+        return 1
 
 
 if __name__ == "__main__":

@@ -54,7 +54,7 @@ lobby goes through `startTask`.
 
 | op | what it is | request | reply | fired by | state |
 |---:|---|---|---|---|---|
-| 1 | leaderboard WRITE | `[u8 0][u8][i32][u64 0][i64][i32 0][i32][i32 0]` | bare | match start (from a LOBBY only), one board per second | served |
+| 1 | leaderboard WRITE | `[u8 0][u8][i32][u64 0][i64][i32 0][i64][i64 0]` | bare | match start (from a LOBBY only), one board per second | served |
 | 4 | read board by entity | `[u8 0][i32][u32 1][u64]` | count+rows | sign-in, boards 1..5 | served |
 | 5 | read a board page | `[u8 0][i32][u64][u64][i64]` | count+rows | Leader boards -> View board; Daily awards sweeps boards 24..9 | served |
 
@@ -66,8 +66,8 @@ lobby goes through `startTask`.
 
 | op | what it is | request | reply | fired by | state |
 |---:|---|---|---|---|---|
-| 1 | create session | `[u8 0][blob][blob][blob][i32 3][i32 1][i32 0][i32 0][i32 3][i32 0][i32][i32 0][i32 0][str][i32][i32 4][i32][i32][i32][i64 0][i64 0][i64][i64][str][i32]` | count+rows | Host Game -> Start lobby | served |
-| 2 | update session | `[u8 0][blob][blob][blob][i32][i32][i32 0][i32 0][i32][i32 0][i32][i32 0][i32 0][str][i32][i32 4][i32][i32][i32][i64 0][i64 0][i64][i64][str][i32]` | bare | each JOIN (a roster update) | served |
+| 1 | create session | `[u8 0][blob][blob][blob][i32 3][i32 1][i32 0][i32 0][i32 3][i32 0][i32][i32 0][i32 0][str][i32][i32 4][i32][i32][i32][i64][i64 0][i64][i64][str][i32]` | count+rows | Host Game -> Start lobby | served |
+| 2 | update session | `[u8 0][blob][blob][blob][i32][i32][i32 0][i32 0][i32][i32 0][i32][i32 0][i32 0][str][i32][i32 4][i32][i32][i32][i64][i64 0][i64][i64][str][i32]` | bare | each JOIN (a roster update) | served |
 | 3 | delete session | `[u8 0][blob]` | bare | leaving or quitting a hosted match | served |
 | 4 | get session by id | `[u8 0][blob]` | 1 row, no count -- one bdMatchMakingInfo | opening a match invite in View messages | served |
 | 5 | search sessions | `[u8 0][i32 1][i32 25][i32 0][i32][i32 0][i32][i32][i32][i32][i32][i32][i64 0][i64][i64]` | count+rows | Find Game | served |

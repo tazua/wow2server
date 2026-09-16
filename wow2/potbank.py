@@ -58,8 +58,10 @@ Neither signal exists in a match that was quit. There, nothing carries a result
 `Sessions op 3` and nothing else -- so `wow2 award NAME` and the `unresolved`
 policy still apply to abandoned matches only.
 
-    capture/pot.json      the ledger: open pots, settled pots, the policy
-    capture/stats-db.json where a payout actually lands (board 5)
+    pots table in wow2.sqlite3   the ledger: live pots (open, pending) and the
+                                 settled ones, one JSON document each (§66;
+                                 before that, capture/pot.json)
+    stats table                  where a payout actually lands (board 5)
 
 A payout is visible to the client at its NEXT FULL SIGN-IN: re-entering
 Infrastructure reconnects without re-reading boards 1..5, so restart the server
@@ -68,15 +70,13 @@ and run tools/login.py to see a new rating on screen.
 from __future__ import annotations
 
 import json
-import os
 import sys
 import time
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 import statsdb
-
-POT_DB = statsdb.CAP / "pot.json"
+import store
 
 # What a brand-new account is worth on board 5. NOTHING in the game decides this
 # -- the client reads its rating from us and the only constant it carries is the
@@ -105,32 +105,77 @@ DEFAULT_POLICY = {
 }
 
 
-def load() -> dict:
-    try:
-        d = json.loads(POT_DB.read_text())
-    except (OSError, ValueError):
-        d = {}
-    d.setdefault("policy", dict(DEFAULT_POLICY))
-    for k, v in DEFAULT_POLICY.items():
-        d["policy"].setdefault(k, v)
-    d.setdefault("open", {})
-    d.setdefault("pending", {})
-    d.setdefault("settled", [])
-    return d
+# ------------------------------------------------------------------ the rows
+# One row per pot: `session` is the id in hex, `state` is open / pending /
+# settled, `doc` is the ledger entry as one JSON document -- the same dict the
+# JSON file held under "open", "pending" or in the "settled" list. A session
+# has at most ONE live row (a partial unique index says so) and any number of
+# settled ones, because session ids restart at 0x5701 with the process.
+
+def policy() -> dict:
+    d = {}
+    raw = store.meta_get(store.db(), "pot_policy")
+    if raw:
+        try:
+            d = json.loads(raw)
+        except ValueError:
+            d = {}
+    out = dict(DEFAULT_POLICY)
+    out.update({k: v for k, v in d.items() if k in DEFAULT_POLICY})
+    return out
 
 
-def save(d: dict) -> bool:
-    """Atomic, like `statsdb.save` and `authserver._jsave`: a crash between
-    truncate and write used to leave a short file that `load()` read as no pots
-    at all, i.e. every open wager forgotten."""
-    try:
-        POT_DB.parent.mkdir(parents=True, exist_ok=True)
-        tmp = POT_DB.with_suffix(".json.tmp")
-        tmp.write_text(json.dumps(d, indent=1))
-        os.replace(tmp, POT_DB)
-        return True
-    except OSError:
-        return False
+def _live() -> list[tuple[str, str, dict]]:
+    """(state, session, doc) for every open or pending pot, oldest first."""
+    return [(r["state"], r["session"], json.loads(r["doc"])) for r in store.db().execute(
+        "SELECT state, session, doc FROM pots WHERE state != 'settled' ORDER BY seq")]
+
+
+def _find_live(key: str) -> tuple[str | None, dict | None]:
+    r = store.db().execute("SELECT state, doc FROM pots WHERE session = ? AND "
+                           "state != 'settled'", (key,)).fetchone()
+    return (r["state"], json.loads(r["doc"])) if r else (None, None)
+
+
+def _write_live(key: str, state: str, doc: dict) -> None:
+    conn = store.db()
+    cur = conn.execute("UPDATE pots SET state = ?, doc = ? WHERE session = ? AND "
+                       "state != 'settled'", (state, json.dumps(doc), key))
+    if cur.rowcount == 0:
+        conn.execute("INSERT INTO pots (session, state, doc) VALUES (?, ?, ?)",
+                     (key, state, json.dumps(doc)))
+
+
+def _settle(key: str, doc: dict, keep_empty: bool = False) -> None:
+    """The live row becomes a settled one; a pot with nothing in it just goes,
+    unless the caller wants the record (a client payout with nothing banked
+    is an anomaly worth keeping)."""
+    conn = store.db()
+    conn.execute("DELETE FROM pots WHERE session = ? AND state != 'settled'", (key,))
+    if doc.get("pot") or keep_empty:
+        conn.execute("INSERT INTO pots (session, state, doc) VALUES (?, 'settled', ?)",
+                     (key, json.dumps(doc)))
+
+
+def _settled(limit: int | None = None, session: str | None = None) -> list[dict]:
+    """Settled pots, newest first."""
+    sql, args = "SELECT doc FROM pots WHERE state = 'settled'", []
+    if session is not None:
+        sql += " AND session = ?"
+        args.append(session)
+    sql += " ORDER BY seq DESC"
+    if limit:
+        sql += " LIMIT ?"
+        args.append(limit)
+    return [json.loads(r["doc"]) for r in store.db().execute(sql, args)]
+
+
+def _when(when: str | None) -> str:
+    """A timestamp WITH the date. `ts()` wrote `HH:MM:SS.mmm` into the JSON
+    ledger for sixty phases, which sorted wrongly across midnight and could not
+    say which day a pot was opened; a caller that passes one still gets it
+    stored, but nothing here passes one any more."""
+    return when or store.now_iso()
 
 
 def _pot_of(rec: dict) -> int:
@@ -169,69 +214,69 @@ def _now() -> float:
     return time.time()
 
 
-def sweep(d: dict | None = None) -> list[str]:
+def sweep() -> list[str]:
     """Apply the `unresolved` policy to any pending pot whose grace has expired.
 
     Returns the messages produced. Call it from anywhere that touches the bank;
-    it is cheap and idempotent."""
-    own = d is None
-    d = load() if own else d
+    it is cheap and idempotent, and it runs inside the caller's transaction."""
     msgs, now = [], _now()
-    for key, rec in list(d.get("pending", {}).items()):
-        if now < float(rec.get("deadline", 0)):
-            continue
-        pot = _pot_of(rec)
-        how = d["policy"].get("unresolved", "refund")
-        if pot and how == "refund":
-            for eh, st in rec["stakes"].items():
-                _pay(eh, st.get("name", ""), int(st.get("stake", 0)))
-            msgs.append(f"pot {pot} REFUNDED (session 0x{key} ended with no winner "
-                        f"declared and no client payout within {SETTLE_GRACE_S:.0f}s; "
-                        f"policy 'refund')")
-        elif pot:
-            msgs.append(f"pot {pot} FORFEIT (session 0x{key} ended with no winner "
-                        f"declared; policy 'forfeit' -- what the real servers did)")
-        rec = d["pending"].pop(key)
-        rec.update({"pot": pot, "settled": how, "closed": rec.get("ended", "")})
-        if pot:
-            d["settled"].append(rec)
-    if msgs and own:
-        save(d)
+    with store.tx():
+        how = policy().get("unresolved", "refund")
+        for state, key, rec in _live():
+            if state != "pending" or now < float(rec.get("deadline", 0)):
+                continue
+            pot = _pot_of(rec)
+            if pot and how == "refund":
+                for eh, st in rec["stakes"].items():
+                    _pay(eh, st.get("name", ""), int(st.get("stake", 0)))
+                msgs.append(f"pot {pot} REFUNDED (session 0x{key} ended with no winner "
+                            f"declared and no client payout within {SETTLE_GRACE_S:.0f}s; "
+                            f"policy 'refund')")
+            elif pot:
+                msgs.append(f"pot {pot} FORFEIT (session 0x{key} ended with no winner "
+                            f"declared; policy 'forfeit' -- what the real servers did)")
+            rec.update({"pot": pot, "settled": how, "closed": rec.get("ended", "")})
+            _settle(key, rec)
     return msgs
 
 
 # ------------------------------------------------------------------ recording
 
-def open_pot(sid: int, host: str, when: str) -> dict:
+def open_pot(sid: int, host: str, when: str | None = None) -> dict:
     """A ranked session was created. Open a pot for it (idempotent)."""
-    d = load()
     k = f"{sid:x}"
-    rec = d["open"].setdefault(k, {})
-    rec.setdefault("session", k)
-    rec.setdefault("opened", when)
-    rec.setdefault("host", host)
-    rec.setdefault("stakes", {})
-    save(d)
-    return rec
+    with store.tx():
+        state, rec = _find_live(k)
+        if rec is None:
+            rec = {"session": k, "opened": _when(when), "host": host, "stakes": {}}
+            _write_live(k, "open", rec)
+        return rec
 
 
 def note_stake(sid: int, entity: int, name: str, before: int, after: int,
-               when: str = "") -> tuple[int, int]:
-    """Record one player's stake (`served - written`). Returns (stake, pot)."""
+               when: str | None = None) -> tuple[int, int]:
+    """Record one player's stake (`served - written`). Returns (stake, pot).
+
+    A stake that arrives for a pot already HELD (the session deleted, the
+    grace running) joins that pot rather than opening a second one under the
+    same id -- the JSON ledger could hold both, one live row per session
+    cannot, and one pot is what the players see."""
     stake = max(0, int(before) - int(after))
-    d = load()
     k = f"{sid:x}"
-    rec = d["open"].setdefault(k, {"session": k, "opened": when, "host": "",
-                                   "stakes": {}})
-    rec["stakes"][f"{entity:016x}"] = {"name": name, "before": int(before),
-                                       "after": int(after), "stake": stake,
-                                       "at": when}
-    save(d)
-    return stake, _pot_of(rec)
+    with store.tx():
+        state, rec = _find_live(k)
+        if rec is None:
+            state, rec = "open", {"session": k, "opened": _when(when), "host": "",
+                                  "stakes": {}}
+        rec.setdefault("stakes", {})[f"{entity:016x}"] = {
+            "name": name, "before": int(before), "after": int(after), "stake": stake,
+            "at": _when(when)}
+        _write_live(k, state, rec)
+        return stake, _pot_of(rec)
 
 
 def note_payout(sid: int, entity: int, name: str, before: int, after: int,
-                when: str = "") -> str:
+                when: str | None = None) -> str:
     """The CLIENT paid the pot out. Close the pot; do not pay it again.
 
     Phase 24: a finished match ends with the winner re-uploading boards 2..5,
@@ -241,27 +286,24 @@ def note_payout(sid: int, entity: int, name: str, before: int, after: int,
     server did on top of that (an award, or the `refund` policy on session
     delete) would be a second payment out of nothing.
     """
-    d = load()
-    sweep(d)
     k = f"{sid:x}"
-    # A pending pot is one whose session has already been deleted but whose
-    # grace has not expired -- exactly the case this race produces, because the
-    # losing host leaves before the winner's board-5 write arrives.
-    pending = k in d.get("pending", {})
-    rec = d["open"].get(k) or d.get("pending", {}).get(k)
     gain = int(after) - int(before)
-    if not rec:
-        return (f"{name} gained {gain} on board {RATING_BOARD_NAME} with no open "
-                f"pot for session 0x{k} -- not banked, nothing to close")
-    pot = _pot_of(rec)
-    rec = (d["pending"] if pending else d["open"]).pop(k)
-    rec.pop("deadline", None)
-    rec.update({"pot": pot, "settled": "client", "closed": when,
-                "winner": {"entity": f"{entity:016x}", "name": name,
-                           "before": int(before), "after": int(after),
-                           "gain": gain}})
-    d["settled"].append(rec)
-    save(d)
+    with store.tx():
+        sweep()
+        # A pending pot is one whose session has already been deleted but whose
+        # grace has not expired -- exactly the case this race produces, because
+        # the losing host leaves before the winner's board-5 write arrives.
+        state, rec = _find_live(k)
+        if not rec:
+            return (f"{name} gained {gain} on board {RATING_BOARD_NAME} with no open "
+                    f"pot for session 0x{k} -- not banked, nothing to close")
+        pot = _pot_of(rec)
+        rec.pop("deadline", None)
+        rec.update({"pot": pot, "settled": "client", "closed": _when(when),
+                    "winner": {"entity": f"{entity:016x}", "name": name,
+                               "before": int(before), "after": int(after),
+                               "gain": gain}})
+        _settle(k, rec, keep_empty=True)
     msg = (f"pot {pot} PAID BY THE CLIENT to {name} ({before} -> {after}, "
            f"+{gain}); session 0x{k} closed, `wow2 award` not needed")
     if gain != pot:
@@ -273,16 +315,14 @@ def note_payout(sid: int, entity: int, name: str, before: int, after: int,
 RATING_BOARD_NAME = "5"
 
 
-def newest_open(d: dict | None = None) -> tuple[str, dict] | tuple[None, None]:
+def newest_open() -> tuple[str, dict] | tuple[None, None]:
     """The pot with stakes in it, most recently opened first.
 
     PENDING pots count: a pot whose session has been deleted but whose grace has
     not expired is still payable, and `wow2 award` must be able to reach it --
     that window is exactly when a person is most likely to be typing the
     command."""
-    d = d or load()
-    staked = [(k, v) for k, v in list(d["open"].items()) + list(d.get("pending", {}).items())
-              if _pot_of(v) > 0]
+    staked = [(k, v) for _state, k, v in _live() if _pot_of(v) > 0]
     if not staked:
         return None, None
     staked.sort(key=lambda kv: kv[1].get("opened", ""), reverse=True)
@@ -335,115 +375,104 @@ def _shares(rec: dict, order: list[str], policy: dict) -> dict:
 
 def award(order: list[str], sid: str | None = None) -> str:
     """Pay an open pot out to a finishing order (winner first). Returns a report."""
-    d = load()
-    sweep(d)
-    if sid:
-        key = sid.lower().removeprefix("0x")
-        rec = d["open"].get(key) or d.get("pending", {}).get(key)
-    else:
-        key, rec = newest_open(d)
-    if not rec:
-        for done in reversed(d["settled"]):
-            if done.get("settled") == "client" and (not sid or
-                    done.get("session") == (sid or "").lower().removeprefix("0x")):
-                w = done.get("winner", {})
-                return (f"session 0x{done.get('session')} was already settled BY "
-                        f"THE CLIENT: {w.get('name', '?')} took the pot of "
-                        f"{done.get('pot', 0)} ({w.get('before')} -> "
-                        f"{w.get('after')}). Awarding again would pay it twice.")
-        return "no open pot with stakes in it -- nothing to award"
-    pot = _pot_of(rec)
-    try:
-        shares = _shares(rec, order, d["policy"])
-    except KeyError as e:
-        who = ", ".join(f"{s.get('name')} ({eh[:8]}...)"
-                        for eh, s in rec.get("stakes", {}).items())
-        return f"{e.args[0]!r} did not stake in session {key} -- staked: {who or 'nobody'}"
-    lines = [f"pot {pot} from session {key} ({len(rec['stakes'])} player(s))"]
-    paid = []
-    for eh, amount in sorted(shares.items(), key=lambda kv: -kv[1]):
-        s = rec["stakes"][eh]
-        before, after = _pay(eh, s.get("name", ""), amount)
-        lines.append(f"  {s.get('name', eh[:8]):<16} staked {s.get('stake', 0):>6}"
-                     f"   +{amount:<6} rating {before} -> {after}")
-        paid.append({"entity": eh, "name": s.get("name", ""), "won": amount,
-                     "before": before, "after": after})
-    rec = d["open"].pop(key, None) or d["pending"].pop(key)
-    rec.pop("deadline", None)
-    rec.update({"pot": pot, "settled": "award", "order": order, "paid": paid})
-    d["settled"].append(rec)
-    save(d)
+    with store.tx():
+        sweep()
+        if sid:
+            key = sid.lower().removeprefix("0x")
+            _state, rec = _find_live(key)
+        else:
+            key, rec = newest_open()
+        if not rec:
+            for done in _settled(session=key if sid else None):
+                if done.get("settled") == "client":
+                    w = done.get("winner", {})
+                    return (f"session 0x{done.get('session')} was already settled BY "
+                            f"THE CLIENT: {w.get('name', '?')} took the pot of "
+                            f"{done.get('pot', 0)} ({w.get('before')} -> "
+                            f"{w.get('after')}). Awarding again would pay it twice.")
+            return "no open pot with stakes in it -- nothing to award"
+        pot = _pot_of(rec)
+        try:
+            shares = _shares(rec, order, policy())
+        except KeyError as e:
+            who = ", ".join(f"{s.get('name')} ({eh[:8]}...)"
+                            for eh, s in rec.get("stakes", {}).items())
+            return f"{e.args[0]!r} did not stake in session {key} -- staked: {who or 'nobody'}"
+        lines = [f"pot {pot} from session {key} ({len(rec['stakes'])} player(s))"]
+        paid = []
+        for eh, amount in sorted(shares.items(), key=lambda kv: -kv[1]):
+            s = rec["stakes"][eh]
+            before, after = _pay(eh, s.get("name", ""), amount)
+            lines.append(f"  {s.get('name', eh[:8]):<16} staked {s.get('stake', 0):>6}"
+                         f"   +{amount:<6} rating {before} -> {after}")
+            paid.append({"entity": eh, "name": s.get("name", ""), "won": amount,
+                         "before": before, "after": after})
+        rec.pop("deadline", None)
+        rec.update({"pot": pot, "settled": "award", "order": order, "paid": paid,
+                    "closed": store.now_iso()})
+        _settle(key, rec)
     return "\n".join(lines)
 
 
-def settle_unresolved(sid: int, when: str = "", policy: str | None = None) -> str | None:
+def settle_unresolved(sid: int, when: str | None = None,
+                      policy_override: str | None = None) -> str | None:
     """The session went away. HOLD the pot; do not settle it yet.
 
     See SETTLE_GRACE_S: the client's own payout arrives about a second AFTER the
     session delete when the host is the loser, and settling here paid the pot
-    twice. `policy` forces an immediate settlement (used by `wow2 award`)."""
-    d = load()
-    msgs = sweep(d)
+    twice. `policy_override` forces an immediate settlement (`wow2 award`)."""
     key = f"{sid:x}"
-    rec = d["open"].get(key)
-    if not rec:
-        save(d)
-        return "; ".join(msgs) or None
-    pot = _pot_of(rec)
-    if pot and policy is None:
-        rec = d["open"].pop(key)
-        rec["ended"] = when
-        rec["deadline"] = _now() + SETTLE_GRACE_S
-        d["pending"][key] = rec
-        save(d)
-        held = (f"pot {pot} HELD for {SETTLE_GRACE_S:.0f}s (session 0x{key} deleted; "
-                f"waiting to see whether the winner's client pays it out). "
-                f"`wow2 award NAME` settles it now.")
-        return "; ".join(msgs + [held])
-    how = policy or d["policy"].get("unresolved", "refund")
-    if pot and how == "refund":
-        for eh, st in rec["stakes"].items():
-            _pay(eh, st.get("name", ""), int(st.get("stake", 0)))
-        msg = (f"pot {pot} REFUNDED (session 0x{key}; policy 'refund')")
-    elif pot:
-        msg = (f"pot {pot} FORFEIT (session 0x{key}; policy 'forfeit')")
-    else:
-        msg = None
-    rec = d["open"].pop(key)
-    rec.update({"pot": pot, "settled": how, "closed": when})
-    if pot:
-        d["settled"].append(rec)
-    save(d)
+    with store.tx():
+        msgs = sweep()
+        state, rec = _find_live(key)
+        if not rec or state != "open":
+            return "; ".join(msgs) or None
+        pot = _pot_of(rec)
+        if pot and policy_override is None:
+            rec["ended"] = _when(when)
+            rec["deadline"] = _now() + SETTLE_GRACE_S
+            _write_live(key, "pending", rec)
+            held = (f"pot {pot} HELD for {SETTLE_GRACE_S:.0f}s (session 0x{key} deleted; "
+                    f"waiting to see whether the winner's client pays it out). "
+                    f"`wow2 award NAME` settles it now.")
+            return "; ".join(msgs + [held])
+        how = policy_override or policy().get("unresolved", "refund")
+        if pot and how == "refund":
+            for eh, st in rec["stakes"].items():
+                _pay(eh, st.get("name", ""), int(st.get("stake", 0)))
+            msg = (f"pot {pot} REFUNDED (session 0x{key}; policy 'refund')")
+        elif pot:
+            msg = (f"pot {pot} FORFEIT (session 0x{key}; policy 'forfeit')")
+        else:
+            msg = None
+        rec.update({"pot": pot, "settled": how, "closed": _when(when)})
+        _settle(key, rec)
     return "; ".join(msgs + ([msg] if msg else [])) or None
 
 
 # --------------------------------------------------------------------- report
 
 def describe() -> str:
-    d = load()
-    swept = sweep(d)
-    if swept:
-        save(d)
-    out = [f"policy: payout={d['policy']['payout']}  "
-           f"unresolved={d['policy']['unresolved']}  "
-           f"placing={d['policy']['placing']}  start rating={RATING_START}"]
-    if swept:
-        out.extend("swept: " + m for m in swept)
-    if not d["open"] and not d.get("pending"):
+    swept = sweep()
+    pol = policy()
+    out = [f"policy: payout={pol['payout']}  unresolved={pol['unresolved']}  "
+           f"placing={pol['placing']}  start rating={RATING_START}"]
+    out.extend("swept: " + m for m in swept)
+    live = sorted(_live(), key=lambda t: t[2].get("opened", ""))
+    if not live:
         out.append("no open pot")
-    for k, rec in sorted(list(d["open"].items()) + list(d.get("pending", {}).items()),
-                         key=lambda kv: kv[1].get("opened", "")):
+    for state, k, rec in live:
         pot = _pot_of(rec)
         held = rec.get("deadline")
-        tag = "OPEN" if held is None else f"HELD({max(0, held - _now()):.0f}s left)"
+        tag = "OPEN" if state == "open" else f"HELD({max(0, float(held or 0) - _now()):.0f}s left)"
         out.append(f"{tag} session 0x{k}  host={rec.get('host', '?')!r}  "
                    f"opened {rec.get('opened', '?')}  pot {pot}")
-        for eh, s in rec["stakes"].items():
+        for eh, s in rec.get("stakes", {}).items():
             out.append(f"    {s.get('name', eh[:8]):<16} {s.get('before')} -> "
                        f"{s.get('after')}   staked {s.get('stake')}")
         if pot:
             out.append(f"    -> wow2 award <winner>          (pays {pot})")
-    for rec in d["settled"][-5:]:
+    for rec in reversed(_settled(limit=5)):
         who = ", ".join(f"{p['name']}+{p['won']}" for p in rec.get("paid", [])
                         if p.get("won"))
         out.append(f"settled 0x{rec.get('session', '?')} pot {rec.get('pot', 0)} "

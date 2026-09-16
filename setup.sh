@@ -127,9 +127,19 @@ fi
 # -P: do not put the current directory on sys.path, so this imports the
 # INSTALLED package and not the checkout it was installed from.
 "$VENV/bin/python" -P - <<'PY'
+import sys
+try:
+    import sqlite3
+except ImportError:
+    # Every distribution here ships it with python3 (Debian, Ubuntu, Fedora,
+    # Arch and Alpine were checked), but a python built from source without
+    # the SQLite headers would not, and the store is where every account lives.
+    sys.exit("!! this python has no sqlite3 module; install the distribution's "
+             "python3 (Debian/Ubuntu: libpython3-stdlib) and re-run")
 import wow2.authserver as a
 a.check_tiger()
-print("    installed; tiger192 self-test ok  (" + a.__file__ + ")")
+print("    installed; tiger192 self-test ok, sqlite %s  (%s)"
+      % (sqlite3.sqlite_version, a.__file__))
 PY
 
 # ------------------------------------------------------------------- config
@@ -233,7 +243,8 @@ if [ "$SYSTEM" = 1 ]; then
     note "config   $CONF        (edit, then: systemctl restart wow2-server)"
     note "data     $STATE"
     note "log      journalctl -u wow2-server -f"
-    note "accounts WOW2_CONFIG=$CONF $VENV/bin/wow2-account list"
+    note "accounts sudo -u $SVC_USER $VENV/bin/wow2-account list"
+    note "backup   sudo -u $SVC_USER $VENV/bin/wow2-db backup /var/backups/wow2.sqlite3"
     if [ -z "$DNS_ADDR" ]; then
         note "a retail PSP needs the DNS responder too:  sudo $0 --system --dns <this machine's public address>"
     fi
@@ -241,6 +252,7 @@ else
     note "run       $SHOW/bin/wow2-server        (from this directory: it reads"
     note "                                    wow2-server.toml here, data in wow2-data/)"
     note "accounts  $SHOW/bin/wow2-account list"
+    note "backup    $SHOW/bin/wow2-db backup wow2-data/backup.sqlite3"
     note ""
     note "THIS STARTED NOTHING and installed only the game server. A real PSP"
     note "also needs the DNS responder, in a second terminal, as root:"

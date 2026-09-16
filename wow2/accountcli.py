@@ -1,36 +1,10 @@
 #!/usr/bin/env python3
 """`wow2-account` -- the operator's way in and out of the credential store.
 
-WHY THIS HAD TO EXIST. A console only ever tells the server its name ONCE, in
-the create-account message. Every later message identifies the account by its
-**handle**, `Tiger192(name)[:8]`, which is a one-way hash -- so a server that
-missed the create, or lost its store, can never learn that name again from the
-console. It cannot even help: `Change password` names itself by handle too, so
-it answers 704 BD_AUTH_BAD_ACCOUNT, and the escape hatch the README used to
-recommend is exactly the thing that cannot work.
-
-Measured the hard way: a deployment's store was deleted, a real PSP signed in
-fine on the shared-password fallback, and then could not write its credential by
-any route available to it. The name was recoverable only because a human
-remembered it.
-
-So the operator supplies the name, and the console proves the password by
-signing in. That is all this does.
-
     wow2-account list
     wow2-account set player1b                 # prompts, nothing in shell history
     wow2-account handle player1b              # match a log line to a name
     wow2-account remove player1b
-
-THE STORE HOLDS DIGESTS AND NEVER PASSWORDS. The client sends
-`Tiger192(password)`, which *is* the key the login reply is built with, so the
-digest is the credential -- which also means `list` does not print it. Anyone
-holding it can impersonate the server to that account.
-
-The rows are the `accounts` table of `wow2.sqlite3` in the data directory
-(§66; `accounts.json` before that, imported once by the server's first start
-on this build). `sqlite3 wow2.sqlite3 'select name, handle, user_id from
-accounts'` is the same list.
 """
 from __future__ import annotations
 
@@ -124,8 +98,6 @@ def main() -> int:
         return {"list": cmd_list, "set": cmd_set,
                 "handle": cmd_handle, "remove": cmd_remove}[args.cmd](args)
     except store.StoreError as e:
-        # An un-imported accounts.json (an older server still running on it)
-        # or a damaged database: one line, not a traceback.
         print(f"!! {e}")
         return 1
 

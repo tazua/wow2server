@@ -7,18 +7,6 @@
     wow2-db export DIR            the database -> the seven JSON files, for an editor or a diff
     wow2-db backup PATH           a consistent copy, safe while the server runs
     wow2-db roundtrip DIR         import DIR into a scratch database, export, compare field by field
-
-`--db PATH` names another database; the default is `wow2.sqlite3` in the
-configured data directory (`storage.data_dir`, or `WOW2_DATA_DIR`). Blobs
-belong beside the database: an import that writes inline `data` rows out as
-files puts them in that database's `storage/`, never in DIR's.
-
-The server imports the JSON stores itself the first time it starts on a
-data directory that has them (`store.startup()`), so none of this is needed
-for an upgrade. It is here for the operator who wants to look, to keep a
-copy, or to move a store between machines -- and `roundtrip` is the proof
-that the importer and exporter lose nothing, run against the rig's own
-files before the store went in.
 """
 from __future__ import annotations
 
@@ -57,8 +45,6 @@ def cmd_check(args) -> int:
 def cmd_import(args) -> int:
     conn, data_dir = _open(args)
     src = Path(args.dir)
-    # From the database's own data directory the files are renamed aside, as
-    # the server would have; from anywhere else they are left as they are.
     own = src.resolve() == data_dir.resolve()
     try:
         done = store.import_dir(conn, src, data_dir, log=lambda m: print(m), rename=own)

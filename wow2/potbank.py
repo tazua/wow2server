@@ -1,71 +1,9 @@
 """The pot: who staked what on a ranked match, and who gets paid.
 
-PHASE 21 established the mechanic and PHASE 22 implements the missing half.
-
-A ranked ("Play for points") lobby shows every player a stake worth 10% of their
-board-5 rating and the sum of the stakes as `Pot`. The client pays its own stake:
-`bdStats op 1` fires ~1 s after the `Sessions op 2` that starts the match and
-writes `max(10, served - served//10)` -- the rating it read at sign-in, minus its
-stake, floored so nobody is left under 10.
-
-**PHASE 24 OVERTURNS THE REST OF THIS FILE'S PREMISE: the CLIENT pays the pot
-out.** Phases 21-22 concluded "nothing ever pays the pot out" because no match on
-this rig had ever *finished* -- every one was quit, and a quit skips the whole
-end-of-match chain. Played to a real finish (2026-09-11 11:14), the winner
-re-uploads boards 2,3,4,5, each raised by exactly the sum of both stakes on that
-board, and the loser re-uploads none of them:
-
-    board  served   staked(start)   paid(end)   pot        check
-      2     4242     -424 -> 3818    4552       424+310    3818+734 = 4552
-      3     3300     -330 -> 2970    3580       330+280    2970+610 = 3580
-      4     2100     -210 -> 1890    2360       210+260    1890+470 = 2360
-      5     4444     -444 -> 4000    4824       444+380    4000+824 = 4824
-
-Exact on all four, and zero-sum across the two accounts (8244 before, 8244
-after). So the mechanic never needed our half at all.
-
-What that means for this file: `note_payout()` closes a pot the client has
-already settled, and `award()` refuses to pay one twice. `wow2 award` is now only
-for matches that did NOT finish cleanly -- and for those the original servers'
-behaviour (both stakes burned) is the `forfeit` policy, not `refund`.
-
-So the payout is ours. Two things constrain the design and both come from the
-Team17 forum archive, where the developers and players described the live system:
-
-  * "If you complete a match as the victor, you gain points toward your rank. If
-    you complete a match as the loser, you lose points" -- so the pot went
-    somewhere, and it went to the winner.
-  * "If your opponent leaves the match at any point (whether you are winning or
-    losing), your rank and completion percentage both go down, and there is
-    nothing you can do about it" -- the single loudest complaint about the PSP
-    version. That is EXACTLY this mechanic with the payout skipped: both stakes
-    are already paid when the match starts, so an abandoned match burns both.
-
-Which means winner-takes-the-pot reproduces the original, and it is also a good
-ladder on its own terms: with ratings W and L the winner ends on W + 0.1*L and
-the loser on 0.9*L, so beating someone far above you pays enormously and beating
-someone far below you pays nearly nothing. It is zero-sum, which is what the word
-"pot" on the lobby screen says it is.
-
-THE SERVER CAN SEE WHO WON, after all -- twice over, in a FINISHED match:
-
-  * the rating-board write that goes UP is the winner's payout (above), and
-  * only the non-loser uploads board 8 ("Hard cases"): `Init_Hc_Stat` is gated on
-    the result global being >= 0. The loser uploads no board 8 at all.
-
-Neither signal exists in a match that was quit. There, nothing carries a result
--- the two `Sessions op 2` firings decode as occupancy only, quitting sends
-`Sessions op 3` and nothing else -- so `wow2 award NAME` and the `unresolved`
-policy still apply to abandoned matches only.
-
-    pots table in wow2.sqlite3   the ledger: live pots (open, pending) and the
-                                 settled ones, one JSON document each (§66;
-                                 before that, capture/pot.json)
-    stats table                  where a payout actually lands (board 5)
-
-A payout is visible to the client at its NEXT FULL SIGN-IN: re-entering
-Infrastructure reconnects without re-reading boards 1..5, so restart the server
-and run tools/login.py to see a new rating on screen.
+The client pays its stake at match start and the winner pays the pot out at
+the end (netrecon §21, §24, §26); this records both, holds a pot through the
+session-delete/payout race, and settles what the client never did (`wow2
+award`). The ledger is the `pots` table, the ratings the `stats` table (§66).
 """
 from __future__ import annotations
 
@@ -78,39 +16,16 @@ sys.path.insert(0, str(Path(__file__).resolve().parent))
 import statsdb
 import store
 
-# What a brand-new account is worth on board 5. NOTHING in the game decides this
-# -- the client reads its rating from us and the only constant it carries is the
-# floor of 10, so a fresh account served nothing writes back max(10, 0) = 10 and
-# can never wager.
-#
-# It USED TO BE 1000 and it used to be WRITTEN, by `ensure_start()` at the first
-# sign-in. Two things were wrong with that and only the second is about the
-# number (T12, §57):
-#
-#   * a written row puts every account that has ever signed in onto the RANKED
-#     LEADERBOARD, whether or not it has played a ranked match. Measured on the
-#     rig: eight rows on board 5 against six on board 1 (games started), with
-#     player7 and player8 sitting at exactly 1000 having started nothing.
-#   * 1000 is not where the two formulas agree. See statsdb.STARTING_RATING.
-#
-# So the value is SERVED on a miss now and the row appears when the player first
-# stakes, which is the moment they join the board. This name is kept because the
-# pot status line prints it.
 RATING_START = statsdb.STARTING_RATING
 
 DEFAULT_POLICY = {
-    "payout": "winner-takes-all",   # or "placing"
-    "unresolved": "refund",         # or "forfeit" (faithful to the original)
+    "payout": "winner-takes-all",
+    "unresolved": "refund",
     "placing": [0.6, 0.25, 0.15],
 }
 
 
 # ------------------------------------------------------------------ the rows
-# One row per pot: `session` is the id in hex, `state` is open / pending /
-# settled, `doc` is the ledger entry as one JSON document -- the same dict the
-# JSON file held under "open", "pending" or in the "settled" list. A session
-# has at most ONE live row (a partial unique index says so) and any number of
-# settled ones, because session ids restart at 0x5701 with the process.
 
 def policy() -> dict:
     d = {}
@@ -149,7 +64,8 @@ def _write_live(key: str, state: str, doc: dict) -> None:
 def _settle(key: str, doc: dict, keep_empty: bool = False) -> None:
     """The live row becomes a settled one; a pot with nothing in it just goes,
     unless the caller wants the record (a client payout with nothing banked
-    is an anomaly worth keeping)."""
+    is an anomaly worth keeping).
+    """
     conn = store.db()
     conn.execute("DELETE FROM pots WHERE session = ? AND state != 'settled'", (key,))
     if doc.get("pot") or keep_empty:
@@ -171,10 +87,7 @@ def _settled(limit: int | None = None, session: str | None = None) -> list[dict]
 
 
 def _when(when: str | None) -> str:
-    """A timestamp WITH the date. `ts()` wrote `HH:MM:SS.mmm` into the JSON
-    ledger for sixty phases, which sorted wrongly across midnight and could not
-    say which day a pot was opened; a caller that passes one still gets it
-    stored, but nothing here passes one any more."""
+    """A timestamp WITH the date."""
     return when or store.now_iso()
 
 
@@ -182,32 +95,7 @@ def _pot_of(rec: dict) -> int:
     return sum(int(s.get("stake", 0)) for s in rec.get("stakes", {}).values())
 
 
-# How long a pot is held after its session is deleted, before the `unresolved`
-# policy is applied.
-#
-# PHASE 26 -- THE RACE THIS FIXES. In a finished three-player ranked match the
-# order on the wire was:
-#
-#   15:29:21.534  session delete  (the HOST sent Sessions op 3 -- and the host
-#                                  had LOST, so it left as soon as it was out)
-#   15:29:21.535  pot 924 REFUNDED by the `unresolved` policy
-#   15:29:22.422  the WINNER's board-5 payout: 900 -> 1824
-#
-# The refund and the client's own payout both landed, so 924 rating was created
-# out of nothing and the match stopped being zero-sum. note_payout() could not
-# help: it looks for an OPEN pot and the pot had been closed 0.9 s earlier.
-#
-# Phase 24 measured this on a 1v1 where the winner happened to be the host, so
-# the delete came after the payout and the ordering never showed. It is not
-# safe to assume: the host is whoever created the lobby, and a host can lose.
-#
-# So a session delete no longer settles -- it moves the pot to `pending` with a
-# deadline, and the policy is applied only once the deadline passes with no
-# payout. sweep() is called from every entry point rather than from a timer, so
-# there is no thread and no clock to get wrong; the cost is that a pending pot
-# settles on the next pot operation rather than exactly on time, which only
-# delays the bookkeeping, never the player's rating.
-SETTLE_GRACE_S = 20.0
+SETTLE_GRACE_S = 20.0    # the winner's payout lands ~1 s AFTER a losing host's session delete
 
 
 def _now() -> float:
@@ -215,10 +103,7 @@ def _now() -> float:
 
 
 def sweep() -> list[str]:
-    """Apply the `unresolved` policy to any pending pot whose grace has expired.
-
-    Returns the messages produced. Call it from anywhere that touches the bank;
-    it is cheap and idempotent, and it runs inside the caller's transaction."""
+    """Apply the `unresolved` policy to any pending pot whose grace has expired."""
     msgs, now = [], _now()
     with store.tx():
         how = policy().get("unresolved", "refund")
@@ -255,12 +140,7 @@ def open_pot(sid: int, host: str, when: str | None = None) -> dict:
 
 def note_stake(sid: int, entity: int, name: str, before: int, after: int,
                when: str | None = None) -> tuple[int, int]:
-    """Record one player's stake (`served - written`). Returns (stake, pot).
-
-    A stake that arrives for a pot already HELD (the session deleted, the
-    grace running) joins that pot rather than opening a second one under the
-    same id -- the JSON ledger could hold both, one live row per session
-    cannot, and one pot is what the players see."""
+    """Record one player's stake (`served - written`). Returns (stake, pot)."""
     stake = max(0, int(before) - int(after))
     k = f"{sid:x}"
     with store.tx():
@@ -277,22 +157,11 @@ def note_stake(sid: int, entity: int, name: str, before: int, after: int,
 
 def note_payout(sid: int, entity: int, name: str, before: int, after: int,
                 when: str | None = None) -> str:
-    """The CLIENT paid the pot out. Close the pot; do not pay it again.
-
-    Phase 24: a finished match ends with the winner re-uploading boards 2..5,
-    each raised by the whole pot for that board (`start_write + sum(stakes)`),
-    measured exact on all four. So a rating-board write that goes UP is not a
-    stake -- it is the payout, and the player who sent it WON. Anything the
-    server did on top of that (an award, or the `refund` policy on session
-    delete) would be a second payment out of nothing.
-    """
+    """The CLIENT paid the pot out. Close the pot; do not pay it again."""
     k = f"{sid:x}"
     gain = int(after) - int(before)
     with store.tx():
         sweep()
-        # A pending pot is one whose session has already been deleted but whose
-        # grace has not expired -- exactly the case this race produces, because
-        # the losing host leaves before the winner's board-5 write arrives.
         state, rec = _find_live(k)
         if not rec:
             return (f"{name} gained {gain} on board {RATING_BOARD_NAME} with no open "
@@ -316,12 +185,7 @@ RATING_BOARD_NAME = "5"
 
 
 def newest_open() -> tuple[str, dict] | tuple[None, None]:
-    """The pot with stakes in it, most recently opened first.
-
-    PENDING pots count: a pot whose session has been deleted but whose grace has
-    not expired is still payable, and `wow2 award` must be able to reach it --
-    that window is exactly when a person is most likely to be typing the
-    command."""
+    """The pot with stakes in it, most recently opened first."""
     staked = [(k, v) for _state, k, v in _live() if _pot_of(v) > 0]
     if not staked:
         return None, None
@@ -369,7 +233,7 @@ def _shares(rec: dict, order: list[str], policy: dict) -> dict:
         cut = int(round(pot * weights[i] / total))
         out[eh] = cut
         spent += cut
-    out[placed[0]] = pot - spent          # first place absorbs the rounding
+    out[placed[0]] = pot - spent
     return out
 
 
@@ -416,11 +280,7 @@ def award(order: list[str], sid: str | None = None) -> str:
 
 def settle_unresolved(sid: int, when: str | None = None,
                       policy_override: str | None = None) -> str | None:
-    """The session went away. HOLD the pot; do not settle it yet.
-
-    See SETTLE_GRACE_S: the client's own payout arrives about a second AFTER the
-    session delete when the host is the loser, and settling here paid the pot
-    twice. `policy_override` forces an immediate settlement (`wow2 award`)."""
+    """The session went away. HOLD the pot; do not settle it yet."""
     key = f"{sid:x}"
     with store.tx():
         msgs = sweep()

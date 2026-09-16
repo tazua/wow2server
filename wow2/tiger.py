@@ -1,36 +1,10 @@
 #!/usr/bin/env python3
-"""Tiger/192 in pure Python -- the hash the whole auth path is built on.
-
-WHY THIS EXISTS. Every credential in this protocol goes through Tiger192: the
-login-proof key is `Tiger192(password)`, an account's handle is
-`Tiger192(name)[:8]`, the CBC IV is `Tiger192(seed)[:8]`. No Python standard
-library provides Tiger, so for sixty phases the server shelled out to the
-`rhash` binary for every digest -- which made a system package the one
-dependency `pip install` could not satisfy, and the one a deployment forgot:
-on the first real deployment `apt install rhash` was rolled back by an
-unrelated failure and every sign-in hung with nothing else looking broken
-(`authserver.check_tiger`). Now there is nothing to install.
-
-This is the reference algorithm (Anderson & Biham, 1996): three passes over
-eight 64-bit words with multipliers 5, 7 and 9, the key schedule between the
-passes, feed-forward at the end. The four S-boxes are the published ones,
-embedded below as one base85 blob (8 KB) rather than 1024 hex literals, and
-checked against the reference digest of the empty string at import, so a
-damaged table cannot load quietly.
-
-Tiger has two paddings. This is the ORIGINAL one (a 0x01 byte), which is what
-`rhash --tiger` produces and what the game's bd library uses; "Tiger2" pads
-with 0x80 and is NOT this hash.
+"""Tiger/192 in pure Python: the reference algorithm with the original 0x01
+padding (not Tiger2), its S-boxes checked against the empty-string digest at
+import.
 
     >>> tiger192(b"").hex()
     '3293ac630c13f0245f92bbb1766e16167a4e58492dde73f3'
-    >>> tiger192(b"abc").hex()
-    '2aab1484e8c158f2bfb8c5ff41b57a525129131c957b5f93'
-
-Verified against rhash 1.4.6 on every length 0..300 with random bytes, on the
-published vectors and on a 1 MB input (Phase 64). Speed does not matter here
--- the inputs are passwords, names and 4-byte seeds -- but for the record a
-short digest is ~15 us here against ~1.4 ms for the subprocess it replaced.
 """
 from __future__ import annotations
 
@@ -39,9 +13,6 @@ import struct
 
 _MASK = (1 << 64) - 1
 
-# t1..t4, 256 u64 each, little-endian, as published with the reference
-# implementation (sboxes.c). sha256 of the 8192 raw bytes:
-# 364d73427379144b709fb0565ba1536c2c32ef9b02ab6201b1aefc30857372ea
 _SBOX_B85 = """
 UJU8?e6gwm?5IQH14}}z)BM#9<6F&gI)C~0lbZo;laU|N|9F|r;wgY|$)R&~!-Fc4Ycgc9a9EK9?
 mmb{=IjG;1>>yhTvMY6xM@Mfe8k?3kyPhQ4D=1$-}Isi`o2x47;m=_YOB#&Beu-O|KcxKAz^Y89+
@@ -185,10 +156,7 @@ _T1, _T2, _T3, _T4 = _T[0:256], _T[256:512], _T[512:768], _T[768:1024]
 
 
 def _pass(a: int, b: int, c: int, x: list[int], mul: int) -> tuple[int, int, int]:
-    """One pass: eight rounds, the three state words rotating one place per
-    round. The roles (a, b, c) are positional, so the caller permutes the
-    state on the way in and back on the way out, exactly as the reference
-    macros do by naming the variables in a different order."""
+    """One pass: eight rounds, the three state words rotating one place per round."""
     t1, t2, t3, t4, m = _T1, _T2, _T3, _T4, _MASK
     for i in range(8):
         c ^= x[i]
@@ -198,7 +166,6 @@ def _pass(a: int, b: int, c: int, x: list[int], mul: int) -> tuple[int, int, int
                   ^ t2[(c >> 40) & 0xff] ^ t1[(c >> 56) & 0xff])) & m
         b = (b * mul) & m
         a, b, c = b, c, a
-    # Eight rotations of three words leave them two places round; undo it.
     return b, c, a
 
 
@@ -244,8 +211,6 @@ def tiger192(data: bytes) -> bytes:
     return struct.pack("<3Q", a, b, c)
 
 
-#: The reference digest of the empty string. Checked at import: a wrong table
-#: or a wrong round is refused before anything is keyed with it.
 TIGER_EMPTY = "3293ac630c13f0245f92bbb1766e16167a4e58492dde73f3"
 
 if tiger192(b"").hex() != TIGER_EMPTY:

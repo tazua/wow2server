@@ -1,13 +1,12 @@
 #!/usr/bin/env python3
-"""WOW2 PSP revival server — iteration build.
+"""The WOW2 server: the Demonware auth, lobby (LSG), bdNAT and NAT-type
+services the game reaches, in one process on one port.
 
-One process serving the whole Demonware surface the game reaches so far:
-  * UDP 3074 : bdNAT discovery (IP-discovery 0x1e/0x1f, NAT-test 0x14/0x15)  [WORKING]
-  * TCP 3074 : bd connection framing + ping + auth service                   [WIP]
+    tools/wow2 server start          # the rig; reads the committed wow2-server.toml
+    wow2-server                      # an install; WOW2_CONFIG names the file
 
-Everything in/out is hex-logged to capture/ so each live launch is maximally
-informative. The auth reply is intentionally easy to tweak between launches —
-this is the iteration surface. Run:  ../.venv/bin/python tools/authserver.py
+What each handler answers, and why, is in netrecon.md (by phase) and
+tools/README.md §4; the deployment settings are in wow2-server.example.toml.
 """
 from __future__ import annotations
 
@@ -33,21 +32,11 @@ import natrelay
 import serverconfig
 
 ROOT = Path(__file__).resolve().parent.parent
-# Where the rig WRITES. Derived from the source tree by default, which is right
-# for the rig and wrong for an installed server -- site-packages is not a data
-# directory. `storage.data_dir` / WOW2_DATA_DIR moves it.
 CAP = serverconfig.DATA_DIR
 
 
 class _SessionLog:
-    """The session log, opened on the first line written to it.
-
-    It used to be opened at import, which meant every `import authserver` --
-    `wow2-account list`, `lsgauth.py`, `setup.sh`'s self-test -- created the
-    data directory and left an empty `session-*.log` in it, as root when run
-    with sudo. The server itself logs its banner within a millisecond of
-    starting, so for it nothing changes.
-    """
+    """The session log, opened on the first line written to it."""
     _f = None
 
     @property
@@ -79,41 +68,22 @@ def ts_file() -> str:
 
 def log(msg: str):
     line = f"[{ts()}] {msg}"
-    # flush=True because Python block-buffers stdout when it is not a tty. On the
-    # rig that is invisible (everything reads the session log), but under systemd
-    # or in a container the journal is stdout, and an unflushed server looks hung
-    # for as long as it takes to fill 8 KB.
     print(line, flush=True)
     SESSION_LOG.write(line + "\n")
 
 
 def debug(msg: str):
-    """Per-PACKET detail: every read, every message body, every reply.
-
-    This is ~90% of the log volume and all of the reason a session log grows
-    without bound -- and it is also exactly what the recon needs, which is why it
-    is on by default. `logging.level = "info"` (or WOW2_LOG_LEVEL=info) leaves one
-    line per RPC.
-
-    Only the highest-volume call sites go through here. Classifying all ~400 of
-    them would be churn for no gain: the rest fire once per sign-in or once per
-    lobby, and an operator wants to see those.
-    """
+    """Per-PACKET detail: every read, every message body, every reply."""
     if _DEBUG[0]:
         log(msg)
 
 
-# Set from serverconfig once it is imported (below -- this file sets sys.path
-# first, so the config import cannot come before the helpers that use it). A list
-# so the flag is mutable without a `global`.
 _HEXDUMPS = [True]
 _DEBUG = [True]
 
 
 def hexdump(data: bytes, pfx="    ") -> str:
-    """A full hexdump of every message is how this protocol got reversed, and it
-    is also how a session log reaches hundreds of megabytes. `logging.hexdumps`
-    (or WOW2_HEXDUMPS=0) replaces the body with a one-line summary."""
+    """A hexdump of a message body, or a one-line summary with `logging.hexdumps` off."""
     if not _HEXDUMPS[0]:
         return f"{pfx}({len(data)}B; hexdumps off -- set logging.hexdumps = true)"
     return _hexdump_full(data, pfx)
@@ -130,26 +100,19 @@ def _hexdump_full(data: bytes, pfx="    ") -> str:
 
 
 # ------------------------------------------------------------------ auth reply
-# Reference message-type numbering (bd auth_handler mod.rs). WOW2 is the 2007
-# SDK; create/login reply numbers confirmed against BOOT.BIN where possible.
 AUTH_CREATE_ACCOUNT_REQ = 0x00
 AUTH_CREATE_ACCOUNT_REPLY = 0x01
 AUTH_CHANGE_PASSWORD_REQ = 0x02
-AUTH_CHANGE_PASSWORD_REPLY = 0x03   # by the 0x00 -> 0x01 convention; see below
+AUTH_CHANGE_PASSWORD_REPLY = 0x03
 
-# The FULL bdAuth error enum, read out of the client's own code->string mapper
-# (`0x0898a168`): it binary-searches to `0x0898a2a4`, checks `code >= 700`, and
-# indexes a 17-entry jump table at `0x08d38260` with `code - 700`. Each entry
-# loads the name below. So these are the client's numbers, not a guess -- and 707
-# (already known from the create-account path) lands exactly where it should.
-BD_AUTH_NO_ERROR = 700  # == 0x2bc, the success code the client checks for
+BD_AUTH_NO_ERROR = 700
 BD_AUTH_BAD_REQUEST = 701
 BD_AUTH_SERVER_CONFIG_ERROR = 702
 BD_AUTH_BAD_TITLE_ID = 703
 BD_AUTH_BAD_ACCOUNT = 704
 BD_AUTH_ILLEGAL_OPERATION = 705
 BD_AUTH_INCORRECT_LICENSE_CODE = 706
-BD_AUTH_CREATE_USERNAME_EXISTS = 707  # returning-user: name taken -> client logs in instead
+BD_AUTH_CREATE_USERNAME_EXISTS = 707
 BD_AUTH_CREATE_USERNAME_ILLEGAL = 708
 BD_AUTH_CREATE_USERNAME_VULGAR = 709
 BD_AUTH_CREATE_MAX_ACC_EXCEEDED = 710
@@ -160,106 +123,34 @@ BD_AUTH_ACCOUNT_LOCKED = 714
 BD_AUTH_UNKNOWN_ERROR = 715
 BD_AUTH_INCORRECT_PASSWORD = 716
 
-# The title id the client stamps into every auth request as field [1]. The
-# immediate 0x131d occurs ONCE in the whole image (0x0896fd84), feeding
-# bdAuthService's constructor, and all 64 captured auth bodies carry it.
 BD_TITLE_ID = 0x131D
 
-# The magic the client puts at the head of an encrypted auth payload
-# (global 0x08d6a2a8). Same constant the login proof is checked against.
 BD_AUTH_MAGIC = 0xEFBDADDE
 
-# The 24-byte key the client uses when it has NO account yet -- i.e. for
-# create-account. `0x08c19d60` is a hash wrapper whose very first test is
-# whether the input pointer is NULL: a NULL input does not hash anything, it
-# memcpy's 24 bytes from the constant at `0x08d6a290`. This is that constant.
-#
-# It is not really 3DES. K1 == K2 (`deadbeefdeadbeef` twice), so EDE collapses:
-# D_K2(E_K1(P)) == P, leaving C = E_K3(P) with K3 = eight ZERO bytes -- single
-# DES under a key that is one of DES's four WEAK keys, and a weak key is an
-# involution (E(E(x)) == x). That is not a footnote, it is the thing that made
-# these bodies look encrypted-but-odd for months: in CBC a run of zero plaintext
-# becomes C[i+2] == C[i], so the unused tail of the 64-byte username buffer comes
-# out as a 16-byte pattern repeating to the end of the buffer. Every capture shows
-# it, and it stops exactly where the password hash begins.
 BD_BOOTSTRAP_KEY = bytes.fromhex("deadbeefdeadbeefdeadbeefdeadbeef"
                                  "0000000000000000")
 
-# How to answer the create-account request (0x00). Flip via env WOW2_CREATE_MODE:
-#
-#   "refuse_duplicates"  (DEFAULT) 707 if we already hold a credential for that
-#                        name, else 700 and store it. This is the flow the CLIENT
-#                        was built for -- see §56 and netrecon §50.9.
-#   "success"            700 always, and overwrite the stored credential. The
-#                        pre-§56 behaviour, kept as a bisect switch ONLY: it is
-#                        an account takeover by anyone who picks the same name.
-#   "name_exists"        707 always; the old returning-user experiment.
-#
-# WHY THE DEFAULT CHANGED. The ONLINE account name is not typed anywhere -- it is
-# the local player profile's name, read straight out of the active profile
-# record (0x089ec7a8: *(0x08d9019c)+0x50 -> +0x18). Two people who both call a
-# profile `lukas1` are one account, and nothing on the console warns either of
-# them. With "success" the second one's create-account OVERWROTE the first one's
-# password digest, so the newcomer silently took the account -- rating, clan,
-# buddies, storage -- and the original owner could never sign in again, because
-# the proof was now keyed on a password they did not know.
-#
-# 707 is not a workaround for that; it is the designed answer. The client does
-# not render it as an error: at 0x08a68b84 it copies the name and password back
-# into the task and re-issues as a SIGN-IN. So the returning owner signs straight
-# in, and only a genuine collision fails -- and when it does, the message the
-# client picks is `Net.Err.AccDup`, "Online profile name %ACCOUNT% is already in
-# use", which is exactly what the second `lukas1` needs to be told.
 import os
 import rigconfig
 _HEXDUMPS[0] = serverconfig.HEXDUMPS
 _DEBUG[0] = serverconfig.DEBUG
 CREATE_MODE = serverconfig.CREATE_MODE
 if CREATE_MODE not in ("refuse_duplicates", "success", "name_exists"):
-    # A typo here decides who may sign in, and the failure it used to produce
-    # was silence: anything unrecognised fell through to "success", which is the
-    # takeover. serverconfig already refuses to start on a config file it cannot
-    # parse, for the same reason.
     raise SystemExit(
         f"!! accounts.create_mode = {CREATE_MODE!r} is not a mode. "
         f"Use 'refuse_duplicates' (default), 'success' or 'name_exists'.")
-# The account password the client uses. K_client = Tiger192(password) is the key the
-# client decrypts the login proof with, so the server must key the proof with the SAME
-# password the game typed at the on-screen keyboard. Both sides read it from
-# tools/rigconfig.py so they cannot drift apart (they did once: the input sequence
-# typed "111111" while the server assumed "123456", which fails as a bogus proof and
-# shows up as a misleading "couldn't sign in" dialog).
-# TODO(persist): learn this per-account from the create-account request / an account
-# store. Blocked: that request's identity blob does not decrypt with the deadbeef
-# bootstrap key (retested 2026-09-10, tools/decode_create.py) -- its key is unknown.
 ACCOUNT_PASSWORD = rigconfig.ACCOUNT_PASSWORD
 
 
 import tiger
 from Crypto.Cipher import DES, DES3
 
-# SOLVED (Phase 8, 2026-09-09): the login proof is decrypted by the client with
-#   K_client = Tiger192(password)
-# a per-ACCOUNT key derived from the player's password. Proven live: the client's
-# captured decrypt key == Tiger192(exact password typed) (24-byte full match, stable
-# across cycles). Phase 7's "authobj+0xB8 = Tiger192(bdSecurityID)" was a red herring
-# (authobj+0xB8 simply HOLDS Tiger192(password)). Encrypting the proof with deadbeef
-# made the client's magic check (expects 0xEFBDADDE) fail -> "profile name already in
-# use". Encrypting with Tiger192(password) makes it pass -> "Signing in..." -> LSG.
-# The create-account request (0x00) is encrypted with the universal deadbeef default
-# key (first-contact bootstrap) and carries the account material the server records.
 TICKET_MAGIC = 0xEFBDADDE
-# The opaque-proof magic (reference auth_proof.rs ClientOpaqueAuthProof::MAGIC). This
-# blob is opaque TO THE CLIENT: it stores it verbatim (authobj+0x20) and relays it to
-# the LSG on connect. Our server is both auth and LSG, so we can format it freely; we
-# keep the reference layout unencrypted so the LSG side can read it back directly.
 OPAQUE_PROOF_MAGIC = 0xC0FFEEFFEEAA1337
 
 
 def tiger192(data: bytes) -> bytes:
-    """Full 24-byte Tiger192 digest. Pure Python since Phase 64 (`tools/tiger.py`);
-    it shelled out to `rhash` for sixty phases, which made a system package the
-    one dependency `pip install` could not satisfy."""
+    """The 24-byte Tiger192 digest (tools/tiger.py)."""
     return tiger.tiger192(data)
 
 
@@ -269,15 +160,12 @@ def tiger_iv(seed: int) -> bytes:
 
 
 def account_key(password: str) -> bytes:
-    """K_client = Tiger192(password) -- the 24-byte per-account key the client derives
-    and uses to decrypt the login proof. This is what the original server keyed on."""
+    """Tiger192(password): the per-account key the login proof is encrypted with."""
     return tiger192(password.encode())
 
 
 def cbc_3des_encrypt(plaintext: bytes, key24: bytes, iv: bytes) -> bytes:
-    """Real 3DES-EDE-CBC with a 24-byte key. For the login proof key24 is the
-    account key Tiger192(password); the client 3DES-decrypts the proof with the
-    identical key it derived from its own password."""
+    """3DES-EDE-CBC with a 24-byte key."""
     return DES3.new(key24, DES3.MODE_CBC, iv).encrypt(plaintext)
 
 
@@ -285,26 +173,19 @@ def build_client_opaque_proof(session_key: bytes, username: str = rigconfig.USER
                               user_id: int = rigconfig.USER_ID,
                               license_id: int = rigconfig.LICENSE_ID,
                               title: int = rigconfig.TITLE_ID) -> bytes:
-    """The 128-byte ClientOpaqueAuthProof the client reads into authobj+0x20 (login-reply
-    handler +0x410964, read_bits 0x400) right after the encrypted proof, then relays to
-    the LSG in bdRemoteTaskManager::onConnected (the 180B RPC, from conn+0x54). Layout is
-    the reference's ClientOpaqueAuthProof::serialize (auth_proof.rs), LE, exactly 128 B:
-      u64 magic, u32 title, i64 time_expires, u64 license, u64 user_id,
-      24B session_key, 64B username(zero-pad), u32 pad.
-    Left UNENCRYPTED — it is opaque to the client (stored/relayed verbatim), and our own
-    LSG can parse it directly. NOTE(before this fix the client read 128 B PAST the end of
-    our reply -> uninitialised memory -> it relayed garbage to the LSG, stalling sign-in)."""
+    """The 128-byte ClientOpaqueAuthProof: sent in clear beside the ticket, relayed
+    verbatim by the client at the LSG connect (netrecon §9, §33, §60)."""
     import struct as _s
     p = bytearray()
-    p += _s.pack("<Q", OPAQUE_PROOF_MAGIC)   # 8
-    p += _s.pack("<I", title)                # 4
-    p += _s.pack("<q", 0x7FFFFFFF)           # 8  time_expires (far future)
-    p += _s.pack("<Q", license_id)           # 8
-    p += _s.pack("<Q", user_id)              # 8
-    p += session_key                         # 24
+    p += _s.pack("<Q", OPAQUE_PROOF_MAGIC)
+    p += _s.pack("<I", title)
+    p += _s.pack("<q", 0x7FFFFFFF)
+    p += _s.pack("<Q", license_id)
+    p += _s.pack("<Q", user_id)
+    p += session_key
     ub = username.encode()[:63]
-    p += ub + b"\x00" * (64 - len(ub))       # 64
-    p += _s.pack("<I", 0)                    # 4  pad
+    p += ub + b"\x00" * (64 - len(ub))
+    p += _s.pack("<I", 0)
     assert len(p) == 128, len(p)
     return bytes(p)
 
@@ -314,136 +195,83 @@ def build_login_reply(session_key: bytes, key24: bytes, seed: int = 0,
                       user_id: int = rigconfig.USER_ID,
                       license_id: int = rigconfig.LICENSE_ID,
                       proof_key: bytes | None = None) -> bytes:
-    """Valid AccountForMmpReply (0x0b): [seed][3DES-CBC proof]. The client's proof
-    deserializer (0x410ec4) reads fields SEQUENTIALLY, so byte layout matters:
-      [0:4] magic  [4:5] type  [5:9] title  [9:13] t_issued  [13:17] t_expires
-      [17:25] license_id(u64)  [25:33] user_id(u64)  [33:97] username(64)
-      [97:121] session_key(24)  [121:128] pad
-
-    `proof_key` is what the CLEAR opaque proof carries in its session-key slot;
-    it defaults to the ticket's key, which is what the reply always said until
-    §60. See PROOF_HANDLE.
-    """
+    """Valid AccountForMmpReply (0x0b): [seed][3DES-CBC proof]."""
     import struct as _s
     p = bytearray(128)
     p[0:4]   = _s.pack("<I", TICKET_MAGIC)
-    p[4]     = 0                              # ticket type (UserToService)
+    p[4]     = 0                              # ticket type
     p[5:9]   = _s.pack("<I", 0x131D)          # title id
-    p[9:13]  = _s.pack("<I", 0)               # time issued
-    p[13:17] = _s.pack("<I", 0x7FFFFFFF)      # time expires (far future)
-    p[17:25] = _s.pack("<Q", license_id)      # license id (non-zero!)
-    p[25:33] = _s.pack("<Q", user_id)         # user id (non-zero -> not anonymous)
+    p[9:13]  = _s.pack("<I", 0)               # issued
+    p[13:17] = _s.pack("<I", 0x7FFFFFFF)      # expires
+    p[17:25] = _s.pack("<Q", license_id)
+    p[25:33] = _s.pack("<Q", user_id)
     ub = username.encode()[:63]
-    p[33:33 + len(ub)] = ub                   # username, matches the client's name
-    p[97:121] = session_key                   # LSG session key we assign
-    # The client 3DES-CBC-decrypts the proof with a FIXED seed of 0 (IV=Tiger192(0)),
-    # NOT a seed from our reply. Verified live 2026-09-09.
-    iv = tiger_iv(0)
-    enc = cbc_3des_encrypt(bytes(p), key24, iv)   # key24 = Tiger192(password)
+    p[33:33 + len(ub)] = ub
+    p[97:121] = session_key
+    iv = tiger_iv(0)                              # the client decrypts with seed 0, not ours
+    enc = cbc_3des_encrypt(bytes(p), key24, iv)
 
-    # The client reads the reply as ONE continuous bitstream and reads the 1024-bit
-    # (128-byte) proof at a FIXED bit position: right after the 46-bit header
-    # [type u8 + type_checked bit + typed-u32 error] plus 5 bits, i.e. payload bit 51.
-    # So bit-pack the proof continuously (NO byte padding, NO seed field) -- byte-
-    # appending it (the old build_auth_reply path) lands it 29 bits too late and the
-    # client decrypts stale stack bytes -> "profile name already in use". Verified live.
-    # The 128-byte opaque proof the client reads (bit-continuous, right after the encrypted
-    # proof) into authobj+0x20 and later relays to the LSG. Same session_key/identity as the
-    # encrypted ticket above so both halves of the reply describe one account.
     opaque = build_client_opaque_proof(proof_key or session_key, username, user_id,
                                        license_id)
 
     w = bd.BdWriter()
     w.bitmode = True
     w.type_checked = False
-    w.u8(0x0B)                       # reply type (8 bits, untyped)
+    w.u8(0x0B)
     w.type_checked = True
-    w.write_bits(b"\x01", 1)         # type_checked bit
-    w.u32(BD_AUTH_NO_ERROR)          # typed u32 error 700 (5-bit tag + 32 bits) -> bit 46
+    w.write_bits(b"\x01", 1)
+    w.u32(BD_AUTH_NO_ERROR)
     w.type_checked = False
-    w.write_bits(b"\x00", 5)         # 5 filler bits: read as the seed's type tag; != u32(8)
-                                     # so the client's seed read is skipped (seed=0 ->
-                                     # IV=Tiger(0)) and the proof begins at payload bit 51.
-    w.write_bits(enc, len(enc) * 8)          # 1024-bit encrypted proof (-> decrypt+magic)
-    w.write_bits(opaque, len(opaque) * 8)    # 1024-bit opaque proof (-> authobj+0x20 -> LSG)
+    w.write_bits(b"\x00", 5)
+    w.write_bits(enc, len(enc) * 8)
+    w.write_bits(opaque, len(opaque) * 8)
     return bd.frame_unencrypted(w.getvalue())
 
 
 # ------------------------------------------------------------------ LSG reply
-# After auth, the client opens a 2nd TCP connection to the LSG (Lobby Service
-# Gateway = bdLobbyConnection) and presents its (relayed) auth to it, then waits
-# for a reply. Reversed from the live client (pspram-live.bin, RAM=fileoff+0x7dfc000):
-#   * reply dispatcher z_un_08c17c88 reads a 1-byte message TYPE, switch:
-#       1 BD_LOBBY_SERVICE_TASK_REPLY   2 BD_LOBBY_SERVICE_PUSH_MESSAGE
-#       3 LsgServiceError               4 LsgServiceConnectionId   (else unknown)
-#   * type-4 handler @0x08c180ac: readType(expect 0x0A=BD_UINT64) then read 64 bits
-#     = the connection id (u64), stores it in the task manager (obj+0x18/+0x1C),
-#     logs "Received LSG connection ID:%llu". This is the "you're connected" reply.
-# Matches reference ConnectionIdResponse: byte-mode [u8 4][typed u64]. The client's
-# LSG connect carries enc flag 0xff; whether the reply must be unencrypted (enc=0,
-# like the auth replies) or echo/enc is being pinned live -> WOW2_LSG_ENC.
-# Lobby service ids (reference lobby/mod.rs LobbyServiceId). The ones this title
-# actually uses so far: 7 = the LSG connect RPC, 10 = Storage (the "global storage"
-# step the game blocks on right after "connected to bit demon lobby").
 LSG_SERVICE_NAMES = {3: "Teams", 4: "Stats", 5: "Sessions", 6: "Messaging",
                      7: "LobbyService", 8: "Profile", 9: "Friends", 10: "Storage",
                      12: "TitleUtilities", 21: "Matchmaking", 23: "Counter"}
 
-# EVERY LSG reply body must start with a 1-bit type_checked flag, before the first
-# typed field. The client's receive buffer constructor (bdBitBuffer @0x08be5d88)
-# ends by doing `read_bits(&this->type_checked, 1)` -- it eats the first bit of the
-# body as the flag, exactly like the client's own outgoing messages write it
-# (bdRemoteTaskManager::startTask @0x08c2486c writes the bit, then typed fields).
-# Omit it and the flag reads as the LSB of your first 5-bit type tag: with tag 0x0A
-# that is 0, so the reader turns type-checking OFF, stops consuming tags, and reads
-# every field one bit late with the tag bits folded into the value. That silently
-# turned a ConnectionId of 1 into 0x15 (harmless -- nothing validates it) and a
-# TaskReply error code of 0 into 128, which the storage result reader (0x08c273cc)
-# treats as a failed task -> "Couldn't sign in". The auth-service replies always had
-# this bit (see build_login_reply); the LSG ones did not.
 LSG_TYPE_CHECKED_BIT = 1
 
-LSG_SERVICE_LOBBY = 7      # the LSG connect/auth presentation
-LSG_SERVICE_STORAGE = 10   # "global storage" -- the step sign-in blocks on
-LSG_SERVICE_STATS = 4      # leaderboards; the last RPC of the sign-in chain
-LSG_SERVICE_SESSIONS = 5   # bdMatchMaking: the game lobby itself (create/delete)
-LSG_SERVICE_TEAMS = 3      # clans; op 1 = create, and it MUST return the new id
-LSG_SERVICE_FRIENDS = 9    # buddies; ops 5/7/19 are the three lists (Phase 22)
-LSG_SERVICE_MESSAGING = 6  # the lobby mailbox -- where a buddy invite is ANSWERED
-LSG_SERVICE_PROFILE = 8    # player profiles
+LSG_SERVICE_LOBBY = 7
+LSG_SERVICE_STORAGE = 10
+LSG_SERVICE_STATS = 4
+LSG_SERVICE_SESSIONS = 5
+LSG_SERVICE_TEAMS = 3
+LSG_SERVICE_FRIENDS = 9
+LSG_SERVICE_MESSAGING = 6
+LSG_SERVICE_PROFILE = 8
 
-# How much of an unconsumed parse buffer a debug line will hexdump. See the
-# leftover log in on_data(): without a cap the logging cost is quadratic in what a
-# hostile peer sends, which turns the byte cap into an amplifier.
 LEFTOVER_HEXDUMP_MAX = 96
 
 LSG_MSG_TASK_REPLY = 1
 LSG_MSG_PUSH_MESSAGE = 2
 LSG_MSG_ERROR = 3
 LSG_MSG_CONNECTION_ID = 4
-LSG_ENC_FLAG = int(os.environ.get("WOW2_LSG_ENC", "0"), 0)  # 0 = unencrypted reply
+LSG_ENC_FLAG = int(os.environ.get("WOW2_LSG_ENC", "0"), 0)
 
 
 def build_lsg_connid_reply(connection_id: int = 1, enc_flag: int = LSG_ENC_FLAG) -> bytes:
     """LsgServiceConnectionId (type 4): byte-mode [u8 4][typed u64 conn_id].
-    Framed [u32 len][enc_flag][body]. enc_flag defaults 0 (unencrypted)."""
-    w = bd.BdWriter()                 # byte mode
+    Framed [u32 len][enc_flag][body]. enc_flag defaults 0 (unencrypted).
+    """
+    w = bd.BdWriter()
     w.type_checked = False
-    w.u8(LSG_MSG_CONNECTION_ID)       # message type (untyped u8)
+    w.u8(LSG_MSG_CONNECTION_ID)
     w.type_checked = True
-    w.u64(connection_id)              # typed u64 -> [tag 0x0A][8 bytes LE]
+    w.u64(connection_id)
     body = w.getvalue()
     return len((bytes([enc_flag]) + body)).to_bytes(4, "little") + bytes([enc_flag]) + body
 
 
-RESPONSE_SIGNATURE = 0xDEADBEEF  # bd_response.rs prepends this before the payload (the
-                                 # client reads it as the 4-byte hmac slot; not validated)
+RESPONSE_SIGNATURE = 0xDEADBEEF
 
 
 def session_cbc_encrypt(plaintext: bytes, session_key: bytes, iv: bytes) -> bytes:
-    """3DES-EDE-CBC with the 24-byte session key. Our assigned key is \\x42*24 whose
-    K1==K2==K3, which pycryptodome DES3 rejects and which is cryptographically identical
-    to single DES-E(K1) under EDE -- so fall back to DES for that degenerate case."""
+    """3DES-EDE-CBC under the session key; a key whose halves repeat is single DES,
+    which pycryptodome refuses, so fall back to DES for that case."""
     if session_key[0:8] == session_key[8:16] == session_key[16:24]:
         return DES.new(session_key[:8], DES.MODE_CBC, iv).encrypt(plaintext)
     return DES3.new(session_key, DES3.MODE_CBC, iv).encrypt(plaintext)
@@ -457,15 +285,7 @@ def session_cbc_decrypt(ciphertext: bytes, session_key: bytes, iv: bytes) -> byt
 
 
 def decode_lsg_client_message(payload: bytes, session_key: bytes) -> dict:
-    """Decode one client->server LSG message body (everything after [u32 len]).
-
-    Layout mirrors bd_message.rs, and the client's own sender
-    (bdRemoteTaskManager::startTask @0x08c2486c, verified by disassembly):
-      plain      [u8 enc!=1][u8 service_id][bit-mode: tc-bit, typed u8 op_id, params]
-      encrypted  [u8 enc==1][u32 seed][ 3DES-CBC( [u32 hmac][u8 service_id][bits] ) ]
-    Only enc==1 means encrypted -- the client reads that flag with a *signed* load
-    and compares == 1, so its own 0xff connect frame is plaintext (Phase 9).
-    """
+    """Decode one client->server LSG message body (everything after [u32 len])."""
     out = {"enc": payload[0], "seed": None, "hmac": None,
            "service": None, "op": None, "plain": b""}
     if payload[0] == 1:
@@ -491,23 +311,17 @@ def decode_lsg_client_message(payload: bytes, session_key: bytes) -> dict:
 
 def build_lsg_connid_reply_encrypted(connection_id: int, session_key: bytes,
                                      seed: int = 0x11223344) -> bytes:
-    """Encrypted LsgServiceConnectionId, per bd_response.rs `encrypted_if_available`:
-      frame  = [u32 len][u8 enc=1][u32 seed][ciphertext]
-      cipher = 3DES-CBC(session_key, IV=Tiger192(seed)[:8]) of
-               [u32 sig 0xDEADBEEF][u8 type=4][typed u64 conn_id]  (zero-padded to 8)
-    The client (enc==1 path) reads seed, decrypts with the session key it took from the
-    login proof (verified = \\x42*24), reads the 4-byte sig slot (byte), the 1-byte type
-    (byte), then hands the REST to a BIT-mode reader. So the typed-u64 must be BIT-packed
-    ([5-bit tag 0x0A][64-bit value]) -- byte-mode packing is misread (conn-id came out
-    0x85 instead of 1). Verified: the auth proof reader is bit-mode too."""
-    r = bd.BdWriter()                 # bit-mode reader payload (after the byte type)
+    """The encrypted LsgServiceConnectionId reply: [u32 len][u8 1][u32 seed] then
+    3DES-CBC under the session key of [u32 0xDEADBEEF][u8 4][typed u64 conn_id],
+    the u64 bit-packed (netrecon §9)."""
+    r = bd.BdWriter()
     r.bitmode = True
     r.type_checked = False
-    r.write_bits(b"\x01", 1)          # <- the type_checked BIT (see LSG_TYPE_CHECKED_BIT)
+    r.write_bits(b"\x01", 1)
     r.type_checked = True
-    r.u64(connection_id)              # [5-bit tag 0x0A][64 bits], flushed to 9 bytes
+    r.u64(connection_id)
     plaintext = (RESPONSE_SIGNATURE.to_bytes(4, "little")
-                 + bytes([LSG_MSG_CONNECTION_ID])   # type 4 (byte-aligned, read by framing)
+                 + bytes([LSG_MSG_CONNECTION_ID])
                  + r.getvalue())
     if len(plaintext) % 8:
         plaintext += b"\x00" * (8 - len(plaintext) % 8)
@@ -520,46 +334,23 @@ def build_lsg_taskreply_encrypted(session_key: bytes, transaction_id: int = 0,
                                   error_code: int = 0, operation_id: int = 0,
                                   num_results: int = 0, results=None,
                                   seed: int = 0x22446688) -> bytes:
-    """Type-1 LobbyServiceTaskReply (Phase 9b): completes the pending auth bdRemoteTask the
-    client registered in bdRemoteTaskManager::onConnected. Same envelope as the conn-id reply
-    (enc=1, DES-CBC session key, 0xDEADBEEF sig, then a BIT-mode reader). Wire (per
-    reference task_reply.rs, bit-packed for this client's reader):
-      [sig u32=0xDEADBEEF][u8 type=1] then bit-mode:
-      [typed u64 txn_id][typed u32 err][typed u8 op_id][typed u32 numResults][typed u32 total]
-    The dispatcher routes type 1 -> task manager (z_un_08c24bec) which matches by txn_id."""
+    """A type-1 LobbyServiceTaskReply, matched to its request by txn_id:
+    [u32 0xDEADBEEF][u8 1] then bit-mode [u64 txn][u32 err][u8 op][u32 numResults]
+    [u32 total] and the rows (netrecon §9b)."""
     r = bd.BdWriter()
     r.bitmode = True
     r.type_checked = False
-    r.write_bits(b"\x01", 1)  # <- the type_checked BIT (see LSG_TYPE_CHECKED_BIT)
+    r.write_bits(b"\x01", 1)
     r.type_checked = True
-    r.u64(transaction_id)     # typed u64: [5-bit tag 0x0A][64 bits]  (read by 0x08c24bec)
-    r.u32(error_code)         # typed u32: [5-bit tag 0x08][32 bits]  (read by 0x08c273cc)
-    r.u8(operation_id)        # typed u8:  [5-bit tag 0x03][8 bits]
-    # numResults -- rows follow IMMEDIATELY; this SDK has no totalNumResults
-    # field (0x08c273cc goes straight from the count to the row loop), unlike
-    # the newer reference.
-    #
-    # PHASE 22: the count is NOT universal. Whether it is in the stream is decided
-    # per (service, op) by the arm the service's reply reader jumps to:
-    #   bdStats  0x08c2529c        reads [u32 numResults] itself   -> send it
-    #   Friends  arm 0x08c18dac    reads [u32 numResults]          -> send it
-    #   Teams op 1 arm 0x08c29704  does NOT: it calls the result   -> DO NOT send it
-    #                              deserializer with a hard-coded
-    #                              count of 1 (an immediate)
-    # Sending it anyway put a typed u32 where bdCreateTeamResult::deserialize
-    # expected its typed u64, the tag check failed, and the clan came back
-    # "Unable to create clan <name>" with the id sitting unread in the packet.
-    # num_results=None means "no count field".
+    r.u64(transaction_id)
+    r.u32(error_code)
+    r.u8(operation_id)
     if num_results is not None:
         r.u32(num_results)
-    # `results` is a callback that appends the service-specific result rows. It
-    # writes into THIS writer rather than returning bytes: the block starts at a
-    # non-byte-aligned bit position (a typed u32 is 37 bits), so splicing a
-    # separately-packed byte string in here would shift every field.
     if results is not None:
         results(r)
     plaintext = (RESPONSE_SIGNATURE.to_bytes(4, "little")
-                 + bytes([LSG_MSG_TASK_REPLY])          # type 1
+                 + bytes([LSG_MSG_TASK_REPLY])
                  + r.getvalue())
     if len(plaintext) % 8:
         plaintext += b"\x00" * (8 - len(plaintext) % 8)
@@ -569,48 +360,11 @@ def build_lsg_taskreply_encrypted(session_key: bytes, transaction_id: int = 0,
 
 
 # ------------------------------------------------------ LSG service result rows
-#
-# PHASE 12 -- bdStats op 4 ("read leaderboard rows for these entity IDs").
-#
-# Answering an RPC with error=0 and numResults=0 is enough for Storage, Friends,
-# Teams, Profile and Messaging, but NOT for Stats: its reply reader has no
-# zero-results early-out. The chain is
-#
-#   bdStats reply reader        0x08c2529c   reads [u32 err][u8 opID][u32 numResults]
-#     ops 3,4,5,6 -> 0x08c25394 calls container->vtable[2](count, &buf)
-#   bdLeaderBoardResult<1>      0x08ce5d98   reads [u32 totalEntries] -> this+0x70,
-#                                            then `count` rows (capacity is ONE;
-#                                            more logs "Received %u results but can
-#                                            only store %u")
-#   row deserialize (game)      0x089a9480   base row, then the Worms stat blob
-#   row deserialize (SDK base)  0x08c25770   the four fields below
-#
-# 0x08ce5d98 returns the success flag of its FIRST read, so a reply with no
-# [u32 totalEntries] at all returns false -> the reply reader returns false ->
-# "Couldn't sign in". That single missing u32 is what ended the Phase 11 chain.
-#
-# Row layout (0x08c25770, field offsets are into the 0x68-byte row object):
-#   +0x08  typed u64  entityID   echo the ID the client asked about
-#   +0x10  typed i64  score      the number bdStats op 1 UPLOADS (0x08c25714
-#                                serialises this field and no other)
-#   +0x18  typed u64  rank       server-computed; nothing uploads a rank
-#   +0x20  typed str  name       NUL-terminated, <= 64 chars, no length prefix
-# After the base row the game parses its own stat blob (0x089ad31c). That is a
-# table-driven loop over stat descriptors gated by a bitmask at fp+0x10, every
-# read is individually fault-tolerant, and its return value is DISCARDED -- so
-# leaving it out costs stats content, not sign-in.
 LEADERBOARD_NAME_MAX = 64
 
 
 def write_leaderboard_row(w, entity_id: int, score: int, rank: int, name: str):
-    """One bdLeaderBoardRow, appended to an in-progress type-checked bit writer.
-
-    FIELD ORDER CONFIRMED ON SCREEN (2026-09-10). Serving score=2111, rank=2
-    rendered as "2,111. player1   2", and serving score=4242, rank=7 rendered as
-    "7. player1   4,242" -- so the i64 is the SCORE shown on the right and the u64
-    is the RANK shown as the "N." prefix. The previous parameter names had these
-    two the wrong way round.
-    """
+    """One bdLeaderBoardRow, appended to an in-progress type-checked bit writer."""
     w.u64(entity_id)
     w.i64(score)
     w.u64(rank)
@@ -619,33 +373,23 @@ def write_leaderboard_row(w, entity_id: int, score: int, rank: int, name: str):
 
 def _request_reader(dec: dict):
     body = dec["plain"][4:] if dec["enc"] == 1 else dec["plain"]
-    r = bd.BdReader(body[1:])          # skip the service-id byte
+    r = bd.BdReader(body[1:])
     r.bitmode = True
     r.read_type_checked_bit()
     r.type_checked = True
-    r.u8()                             # op id
+    r.u8()
     return r
 
 
 def lsg_request_params(dec: dict):
-    """A BdReader on a decoded client RPC, positioned just past the typed op id.
-
-    It parks the reader for `census_note()`, which is how the server can tell
-    what a handler did NOT read. See tools/blindspots.py."""
+    """A BdReader on a decoded client RPC, positioned just past the typed op id."""
     r = _request_reader(dec)
     _LAST_READER.append(r)
     return r
 
 
 def lsg_request_noargs(dec: dict, what: str) -> None:
-    """Consume the request of an RPC that takes NO parameters.
-
-    Several sign-in reads (`Friends` 5/7/19, `Teams` 20, `Teams` 24) are nothing
-    but the `[u8 0]` lead-in. Reading it costs nothing and buys two things: the
-    request census stops listing them as ignored, so that list can be driven to
-    empty and any entry in it becomes a genuine surprise; and if one of them ever
-    turns out to carry an argument after all, this says so instead of dropping it
-    in silence -- which is the whole failure mode blindspots.py exists for."""
+    """Consume the request of an RPC that takes NO parameters."""
     try:
         r = lsg_request_params(dec)
         lead = r.u8()
@@ -659,21 +403,6 @@ def lsg_request_noargs(dec: dict, what: str) -> None:
 
 
 # ---------------------------------------------------------- the request census
-# What the client SENDS, against what a handler READS.
-#
-# The whole class of bug this exists for is silent by construction: a field of
-# the right type in the right position carrying a value nobody derived. A wrong
-# field COUNT drops the LSG connection ~330 ms later and is loud; a wrong field
-# VALUE produces nothing at all -- no error, no log line, and a console that
-# looks like it simply ignored us. `+0xb8` cost two phases that way.
-#
-# So decode every request TWICE: once generically (bdproto walks any bd message
-# without knowing the RPC, because every field carries its own 5-bit tag), and
-# once as the handler actually read it. The difference is the blind spot. It
-# also records the DISTINCT VALUES of each field, which is what turns "that
-# leading u8 is probably always 0" from an assumption into a measurement.
-#
-# WOW2_NO_CENSUS=1 turns it off.
 REQ_CENSUS_PATH = CAP / "request-census.json"
 REQ_CENSUS: dict[str, dict] = {}
 _LAST_READER: list = []
@@ -681,8 +410,8 @@ _CENSUS_LOGGED: set[str] = set()
 _CENSUS_WRITES = 0
 _CENSUS_LOADED = False
 _CENSUS_SAVED_AT = 0.0
-CENSUS_MAX_VALUES = 12                 # distinct values kept per field
-CENSUS_SAVE_S = 30.0                   # debounce; the store is small
+CENSUS_MAX_VALUES = 12
+CENSUS_SAVE_S = 30.0
 
 
 def _census_val(v) -> str:
@@ -695,9 +424,7 @@ def _census_val(v) -> str:
 
 
 def census_load() -> None:
-    """Carry the census across restarts. It accumulates what the client has EVER
-    sent, so starting empty and saving would quietly erase every RPC that did not
-    happen to fire again this run."""
+    """Carry the census across restarts: it accumulates what the client has ever sent."""
     global _CENSUS_LOADED
     _CENSUS_LOADED = True
     try:
@@ -721,19 +448,16 @@ def census_note(svc: int, op: int, dec: dict) -> None:
         fields = bd.read_fields(_request_reader(dec))
         tail = bd.read_fields(reader) if reader is not None else list(fields)
     except Exception:
-        return                          # a message we cannot walk is not a finding
+        return
     key = f"{svc}:{op}"
     fresh = key not in REQ_CENSUS
     rec = REQ_CENSUS.setdefault(key, {"count": 0, "read": 0, "unread": 0,
                                       "fields": []})
     rec["count"] += 1
-    # LATEST, not max. The question this answers is "does the handler ignore
-    # fields NOW", so a max() would leave a blind spot flagged forever after it
-    # was fixed -- which is exactly what it did the first time one was closed.
     nread, nun = len(fields) - len(tail), len(tail)
     if (rec["read"], rec["unread"]) != (nread, nun):
-        fresh = True                    # a handler changed: worth writing out
-    rec["read"], rec["unread"] = nread, nun
+        fresh = True
+    rec["read"], rec["unread"] = nread, nun    # the latest reading, not the max: a closed blind spot must clear
     for i, (t, v) in enumerate(fields):
         while len(rec["fields"]) <= i:
             rec["fields"].append({"type": "", "values": [], "more": False})
@@ -753,10 +477,6 @@ def census_note(svc: int, op: int, dec: dict) -> None:
         log(f"  *** UNREAD REQUEST FIELD service={svc} op={op}: handler read "
             f"{len(fields) - len(tail)} of {len(fields)} fields, ignored "
             f"{len(tail)}: {shown}")
-    # Write whenever the census LEARNS something (a new RPC, a value never seen
-    # before), and otherwise at most every CENSUS_SAVE_S. A plain every-Nth-call
-    # save would leave the file empty exactly when it is most interesting: a
-    # whole sign-in is thirteen RPCs.
     global _CENSUS_SAVED_AT
     _CENSUS_WRITES += 1
     if fresh or time.time() - _CENSUS_SAVED_AT > CENSUS_SAVE_S:
@@ -773,26 +493,10 @@ atexit.register(census_flush)
 
 
 # --------------------------------------------------------------- identities
-# The server ISSUES the account identity: the client's login request (0x0a) is
-# 19 bytes -- type, iv_seed, proof -- and carries no name at all, so there is
-# nothing to echo back. With one console that did not matter and every account
-# was rigconfig.USERNAME/USER_ID. With two it does: handing both consoles the
-# same user_id makes them ONE player to the matchmaker, so the host would see
-# its own entity join.
-#
-# One console is one address. Console 1 is the host namespace (127.0.0.1) and
-# console 2..N live at 10.42.0.N inside their own network namespace
-# (tools/netns.sh), so the source address of the connection is exactly what
-# tells the two players apart.
 IDENTITIES: dict[str, tuple[str, int]] = {
     "127.0.0.1": (rigconfig.USERNAME, rigconfig.USER_ID),
     "10.42.0.2": (os.environ.get("WOW2_USERNAME2", "testuser"), 2),
 }
-# Consoles 3..8 (tools/newemu.py) are named after their bridge octet, and the
-# name here must be the one typed into that console's GAME PROFILE -- the
-# profile is what the player sees, this is what the matchmaker sees, and two
-# consoles showing different names for the same seat is the kind of confusion
-# that costs an hour. All are >= 6 characters, which is the game's own rule.
 for _n in range(3, 9):
     IDENTITIES.setdefault(f"10.42.0.{_n}",
                           (os.environ.get(f"WOW2_USERNAME{_n}", f"player{_n}"), _n))
@@ -802,14 +506,7 @@ _AUTO_IDS: dict[str, tuple[str, int]] = {}
 
 
 def identity_for(ip: str) -> tuple[str, int]:
-    """(username, user_id) for a console, keyed by where it connects from.
-
-    An id must be STABLE per console and unique across consoles -- two consoles
-    sharing a user_id are one player to the matchmaker, so the host watches its
-    own entity join. The bridge makes that exact: console N is 10.42.0.N and
-    nothing else, so the last octet IS the id. The old fallback numbered
-    consoles by ARRIVAL ORDER, which meant the same console got a different id
-    depending on who signed in first -- harmless with two, a trap with eight."""
+    """(username, user_id) for a console, keyed by where it connects from."""
     if ip in IDENTITIES:
         return IDENTITIES[ip]
     if ip not in _AUTO_IDS:
@@ -826,98 +523,22 @@ def identity_for(ip: str) -> tuple[str, int]:
 
 
 # --------------------------------------------------------------- stats store
-#
-# PHASE 20 -- bdStats is ONE WRITE and TWO READS, and op 1 is the WRITE.
-#
-#   op 1  writeStats            [u8 0][u8 f][i32 boardID][u64 0][i64 score]<RankData>
-#   op 4  readStatsByEntityIDs  [u8 0][i32 boardID][u32 n][u64 entityID x n]
-#   op 5  readStatsByPivot      [u8 0][i32 boardID][u64 pivot][u64 startRank][i64 numRows]
-#
-# This corrects TWO earlier readings, both of which had the write in the wrong
-# place. op 5 was first documented as the upload -- it is a read: it fires as you
-# merely BROWSE the boards, and its last field is a row count (10 while browsing,
-# 1 at lobby creation). op 1 was then implemented as "readStatsByRank" -- it is
-# the upload. The disassembly settles it: the bdStats reply dispatcher
-# (0x08c2529c) jumps through a table at 0x08d6ae00 indexed opID-1, and op 1's arm
-# (0x08c2538c) reads NOTHING after the opID -- no numResults, no rows; only ops
-# 3/4/5/6 read a result container. The single caller that sends op 1,
-# net::tStatsEditor, logs "uploading stats (board %u64)" the moment it queues the
-# task (0x089a8aa4); net::tStatsViewer sends ops 4 and 5 and logs "downloading
-# stats (board %u64)" -- its string pool has no upload strings at all.
-#
-# WHERE A SCORE COMES FROM -- the frontier question, answered: THE CLIENT
-# COMPUTES IT AND UPLOADS IT. On the wire in session-20260910-204010.log every
-# op 1 lands ~1 s after the `Sessions op 2` that starts a match, from BOTH
-# consoles, and the numbers move between matches:
-#
-#   21:16:44  board 1        score 2   <blob i32 0, i64 4,  i64 0>
-#   21:41:19  board 1        score 3   <blob i32 0, i64 12, i64 0>
-#   21:41:20  boards 2,3,4,5 score 10  (no blob)
-#
-# So a finished match DOES reach this server -- at the START OF THE NEXT ONE, not
-# at the end of the one that produced it. That is why every capture taken at
-# "the match ended", on the results screen and on the awards screen showed
-# nothing: the report was still a minute in the future. (Phase 19's negative
-# result was correct about where it looked and wrong about the conclusion.)
-#
-# bdStatsInfo::serialize (0x08c25714) writes exactly ONE field -- the i64 at
-# row+0x10 -- and does NOT send the entity id, so the server must attribute the
-# write to the signed-in account. We learn that 64-bit account id from the op 4
-# the same console sends at sign-in, which asks about ITSELF on boards 1..5.
-# (In a ranked lobby each console reads the OPPONENT on boards 5..8, so only the
-# first entity a console ever asks about may be treated as its own.)
-#
-# RANK IS OURS. Nothing uploads a rank; the client only ever reads one. The store
-# therefore keeps a SCORE per (board, entity) and the rank we serve is the row's
-# position with the board ordered by score, best first.
-#
-# The rows live in the `stats` table of the SQLite store (tools/store.py,
-# §66; `capture/stats-db.json` before that, imported once at startup) and
-# every read goes to the database, so a row can be edited with the server
-# running -- no restart, no re-login. The rank is derived per read and never
-# stored; board 1's row keeps the decoded RankData tail of the last upload.
-STATS_UPLOADS = CAP / "stats-uploads.jsonl"     # append-only forensic trail
+STATS_UPLOADS = CAP / "stats-uploads.jsonl"
 NO_STATS_STORE = os.environ.get("WOW2_NO_STATS_STORE") == "1"
-LEADERBOARD_CAPACITY = 50      # bdLeaderBoardResultTemplate<50> (0x08ce6080); the
-                               # editor's own container holds 1, but it only ever
-                               # asks for 1, so one cap covers both.
+LEADERBOARD_CAPACITY = 50
 
-# 64-bit account ids are client-side and stable per savedata -- and DERIVED:
-# `Tiger192(name)[:8]` (§33b), which `account_id_for()` computes for any name.
-# This table only matters for an ADDRESS key, i.e. under the bisect switches
-# that put identity back on the source address; a name never consults it.
-# Since §65 nothing is learned from what a connection reads, see account_seen().
 KNOWN_ACCOUNTS: dict[str, int] = {
-    "player1": 0x975367efa4bbebed,            # console 1
-    "testuser": 0xbb4dc191b75e31fc,         # console 2
-    "127.0.0.1": 0x975367efa4bbebed,        # legacy: by source address
+    "player1": 0x975367efa4bbebed,
+    "testuser": 0xbb4dc191b75e31fc,
+    "127.0.0.1": 0x975367efa4bbebed,
     "10.42.0.2": 0xbb4dc191b75e31fc,
 }
-_SEEN_ACCOUNTS: dict[str, int] = {}         # ident key -> the id that console reads first
-# Bisect: the pre-§65 identity, learned from the first Stats op 4 (in memory
-# only; the store is no longer written either way). `ownertest.py --revert`.
+_SEEN_ACCOUNTS: dict[str, int] = {}
 LEARN_ACCOUNT_ID = os.environ.get("WOW2_LEARN_ACCOUNT_ID") == "1"
 
 
 def account_seen(ident_key: str, entity_id: int, name: str) -> None:
-    """Note the first 64-bit account a connection asks about, as a DIAGNOSTIC.
-
-    For an account NAME this decides nothing (§65). It used to: the first
-    entity a console read in `Stats op 4` was recorded as that connection's
-    account -- in memory and in `accounts.json` -- and `account_for()` served
-    it ahead of the derivation. A retail console always reads itself first, so
-    the two agreed on every rig console ever seen; anything else could name
-    another account in its first read and be filed as that account for every
-    identity-keyed op afterwards, across restarts. The derivation is what the
-    client itself uses (the login handle is the same eight bytes), so a
-    disagreement is not evidence about the derivation, it is a connection
-    saying something untrue, and all it gets is a `!!!!` line.
-
-    An ADDRESS key exists only under the bisect switches that put identity back
-    on the source address (`WOW2_RIG_IDENTITY`, `WOW2_LSG_NO_KEY_CHECK`); those
-    keep the learned reading, in memory only, because an address derives
-    nothing.
-    """
+    """Note the first 64-bit account a connection asks about, as a DIAGNOSTIC."""
     if not entity_id or ident_key in _SEEN_ACCOUNTS:
         return
     _SEEN_ACCOUNTS[ident_key] = entity_id
@@ -938,42 +559,17 @@ def account_seen(ident_key: str, entity_id: int, name: str) -> None:
         log(f"  (!! {ident_key} reads 0x{entity_id:016x} first, but KNOWN_ACCOUNTS "
             f"says 0x{KNOWN_ACCOUNTS[ident_key]:016x} -- using the live one)")
     log(f"  account: {ident_key} ({name}) = 0x{entity_id:016x} [by address]")
-    # A brand-new account has no board-5 row. Nothing in the game decides a
-    # starting rating -- the client reads its own from us -- so the server
-    # decides, and it decides by SERVING `stats.starting_rating` on a miss
-    # (statsdb.get). This used to write a row of 1000 here instead, which put
-    # every account that had ever signed in onto the ranked leaderboard whether
-    # or not it had played a ranked match. See T12 / §57.
 
 
 def account_id_for(username: str) -> int:
-    """The client's 64-bit account id, DERIVED from the name.
-
-    It is `Tiger192(username)[:8]` read as a little-endian u64 -- the same eight
-    bytes the login request carries as its handle. Confirmed on `player1`,
-    `testuser` and on `player1b`, an account created from scratch on a real PSP.
-
-    This was an opaque value for a long time. The id lives in the console's
-    savedata, the server only ever saw it echoed back in a `Stats op 4`, and
-    `account_seen()` was built to learn it from the first such read. That works
-    on a rig where the two accounts are hard-coded, and it is visibly wrong on a
-    fresh deployment: a new console's FIRST sign-in runs storage, friends, teams,
-    messaging and profile RPCs before any Stats op ever arrives, so every one of
-    them was answered for account `0x0000000000000000`.
-    """
+    """The client's 64-bit account id, DERIVED from the name."""
     return int.from_bytes(tiger192(username.encode())[:8], "little")
 
 
 def account_for(ident_key: str) -> int:
-    """The 64-bit account id behind an ident key (account name, or an address).
-
-    A NAME is derived and nothing else -- see `account_seen()` for why the
-    live reading and the store's `account_id` no longer come first. An address
-    (bisect switches only) resolves through what its console read first, then
-    the legacy table.
-    """
+    """The 64-bit account id behind an ident key (account name, or an address)."""
     if ident_key and not ident_key.replace(".", "").isdigit() and not LEARN_ACCOUNT_ID:
-        return account_id_for(ident_key)          # it is an account name
+        return account_id_for(ident_key)
     if ident_key in _SEEN_ACCOUNTS:
         return _SEEN_ACCOUNTS[ident_key]
     if ident_key and not ident_key.replace(".", "").isdigit():
@@ -992,8 +588,7 @@ def stats_get(board_id: int, entity_id: int, default_name: str = "") -> tuple[in
 
 def stats_put(board_id: int, entity_id: int, score: int,
               name: str = "", extra: list | None = None) -> None:
-    """Record one uploaded score. Rank is derived on read; the number written back
-    into the file is only there to make it readable (statsdb.put)."""
+    """Record one uploaded score; rank is derived on read (statsdb.put)."""
     if NO_STATS_STORE:
         log("  (stats store disabled by WOW2_NO_STATS_STORE)")
         return
@@ -1012,7 +607,8 @@ def stats_put(board_id: int, entity_id: int, score: int,
 def read_typed_tail(r) -> list:
     """Every remaining typed field of a request, walked blind. Used for the game's
     own RankData blob after the score: it is mask-gated, so its length varies with
-    what the match produced, and no fixed parse would survive."""
+    what the match produced, and no fixed parse would survive.
+    """
     out = []
     while True:
         try:
@@ -1024,31 +620,20 @@ def read_typed_tail(r) -> list:
 
 def stats_write_upload(dec: dict, who: tuple[str, int] | None = None,
                        peer_ip: str = ""):
-    """bdStats op 1 -- writeStats. Returns (0, None) on purpose.
-
-    The client reads NOTHING after the opID for this op (dispatch arm 0x08c2538c),
-    so rows served here are dead bytes. Everything this handler does is store.
-    """
+    """bdStats op 1 -- writeStats. Returns (0, None) on purpose."""
     name = (who or (rigconfig.USERNAME, 0))[0]
     try:
         r = lsg_request_params(dec)
-        r.u8()                              # leaderboard type/flags, always 0
-        r.u8()                              # tStatsEditor ctor flag, always 0
+        r.u8()
+        r.u8()
         board_id = r.i32()
-        entity = r.u64()                    # always 0 = "the signed-in account"
+        entity = r.u64()
         score = r.i64()
         extra = read_typed_tail(r)
     except Exception as e:
         log(f"  (stats op1 decode failed: {e})")
         return 0, None
 
-    # Boards 29..32 are the CLAN boards: creating a clan fires four uploads, one
-    # per second, exactly like a match start fires five. The client sends
-    # entityID = 0 there too, but "the signed-in account" is the wrong owner --
-    # the row belongs to the player's TEAM, and attributing it to the player puts
-    # a clan score on a personal board. (The four uploads that follow a create
-    # are sent BEFORE the create reply lands, so on the very first one the client
-    # genuinely has no team yet and there is nothing to attribute it to.)
     if board_id in statsdb.CLAN_BOARDS and not entity:
         tid, trec = team_of(account_for(peer_ip))
         if tid:
@@ -1074,18 +659,6 @@ def stats_write_upload(dec: dict, who: tuple[str, int] | None = None,
     if not entity:
         log("  (!! no account id for this console -- upload not stored)")
         return 0, None
-    # A write to the rating board during a ranked session is one of two things,
-    # told apart by DIRECTION (Phase 24):
-    #   score <  served   the client PAYING ITS STAKE at the start of the match.
-    #                     `served - written` is the wager the lobby displayed.
-    #   score >  served   the client PAYING THE POT OUT at the end of a finished
-    #                     match. The winner re-uploads boards 2..5 each raised by
-    #                     the whole pot, and the loser re-uploads nothing. So this
-    #                     write identifies the WINNER and settles the pot; paying
-    #                     it again here (or refunding on session delete) would
-    #                     create rating out of nothing, which is exactly what
-    #                     happened on 2026-09-11 before this branch existed.
-    # WOW2_NO_CLIENT_PAYOUT=1 goes back to treating every write as a stake.
     if board_id == statsdb.RATING_BOARD:
         sid = ranked_session_id()
         if sid:
@@ -1101,20 +674,8 @@ def stats_write_upload(dec: dict, who: tuple[str, int] | None = None,
 
 
 def emit_rows(rows: list, total: int, board_id: int = 0):
-    """Writer callback for a bdLeaderBoardResult: [u32 totalEntries] then the rows.
-
-    0x08ce6080 returns the success flag of that FIRST read, so the u32 is
-    mandatory even when no rows follow -- a reply without it fails the whole
-    bdStats task, which is what ended the Phase 11 sign-in chain.
-
-    BOARD 1 CARRIES THREE MORE COLUMNS and this server dropped them for
-    twenty-seven phases -- see `_board1_tail`. WOW2_NO_STATS_ROW_TAIL=1 goes
-    back to the four-field row; WOW2_STATS_ROW_TAIL_A=<int> forces the first
-    i64 to a sentinel, which is how the round trip was proved.
-    """
+    """Writer callback for a bdLeaderBoardResult: [u32 totalEntries] then the rows."""
     tail = board_id == 1 and os.environ.get("WOW2_NO_STATS_ROW_TAIL") != "1"
-    # A SENTINEL the console cannot have locally is the only way to tell
-    # "adopted" from "it already had that bit" -- the Phase 33d technique.
     sentinel = os.environ.get("WOW2_STATS_ROW_TAIL_A")
 
     def emit(w):
@@ -1135,32 +696,8 @@ def emit_rows(rows: list, total: int, board_id: int = 0):
 
 
 def _board1_tail(entity: int) -> tuple[int, int]:
-    """The two i64s this account last uploaded on board 1 (Phase 48).
-
-    BOARD 1 IS THE ONLY BOARD WHOSE ROW IS MORE THAN FOUR FIELDS. After the
-    ordinary `[u64 entity][i64 score][u64 rank][str name]` it carries
-    `[i32 0][i64 A][i64 B]`, and A|B is a **128-bit field, one bit per game,
-    indexed by the board-1 score**: the bit goes ON when a match starts and OFF
-    when it ends, so what stays set is the games this console STARTED AND DID
-    NOT FINISH. 2 x i64 is 128 slots for a window of 100, which is what
-    Team17's own forum describes -- the `100%` beside a name is the share of
-    the last 100 games started that the player finished.
-
-    Measured across every upload in `capture/stats-uploads.jsonl`: score 13
-    sets bit 13, score 20 sets bit 20, and a console that quit its 12th match
-    carried bit 12 forward through matches 13, 14 and 15.
-
-    **The client ADOPTS what we serve and ORs its new game in.** Proved with a
-    sentinel neither console could hold locally: served `A = 0x20` (game 5, a
-    game neither had ever played), started one match, and both uploaded
-    `{5, 21}` and `{5, 18}` respectively. So this is a real round trip and the
-    server was breaking it -- it has stored these columns since Phase 20 and
-    never served one back, which reset every console's completion history to
-    whatever survived locally, at every sign-in.
-
-    The store already keeps the tail beside the row (`statsdb.put(...,
-    extra=)`), so this is a read, not a reconstruction.
-    """
+    """The two i64s this account last uploaded on board 1: its completion history
+    (netrecon §48)."""
     tail = statsdb.tail(1, entity)
     if isinstance(tail, list):
         vals = [v for _t, v in tail]
@@ -1174,17 +711,12 @@ def _board1_tail(entity: int) -> tuple[int, int]:
 
 def stats_read_results(dec: dict, who: tuple[str, int] | None = None,
                        peer_ip: str = ""):
-    """bdStats op 4 -- readStatsByEntityIDs. One row per requested entity.
-
-    Request (0x08c24fe4): [typed u8 0][typed i32 boardID][typed u32 count]
-    [typed u64 entityID x count]. tStatsEditor always asks for 1; tStatsViewer
-    can ask for up to 50 (its array runs obj+0x40..obj+0x1d0).
-    """
+    """bdStats op 4 -- readStatsByEntityIDs. One row per requested entity."""
     entities = []
     board_id = 0
     try:
         r = lsg_request_params(dec)
-        r.u8()                              # leaderboard type/flags, always 0
+        r.u8()
         board_id = r.i32()
         for _ in range(r.u32()):
             entities.append(r.u64())
@@ -1209,21 +741,12 @@ def stats_read_results(dec: dict, who: tuple[str, int] | None = None,
 
 def stats_pivot_results(dec: dict, who: tuple[str, int] | None = None,
                         peer_ip: str = ""):
-    """bdStats op 5 -- readStatsByPivot. A page of a board, anchored two ways.
-
-    Request (0x08c25138): [typed u8 0][typed i32 boardID][typed u64 pivotEntity]
-    [typed u64 startRank][typed i64 numRows]. The two anchors are mutually
-    exclusive by construction (0x089aac44 picks the call site on startRank != 0):
-    factory 0x089aa2a4 is "by entity" (startRank 0, centre on the player) and
-    0x089aa1c8 is "by rank" (pivot 0). The screen's View setting is exactly this:
-    "Own rank" sends the account and startRank 0, the other mode sends pivot 0 and
-    startRank 1.
-    """
+    """bdStats op 5 -- readStatsByPivot. A page of a board, anchored two ways."""
     board_id = pivot = start_rank = 0
     count = 1
     try:
         r = lsg_request_params(dec)
-        r.u8()                              # leaderboard type/flags, always 0
+        r.u8()
         board_id = r.i32()
         pivot = r.u64()
         start_rank = r.u64()
@@ -1234,13 +757,13 @@ def stats_pivot_results(dec: dict, who: tuple[str, int] | None = None,
     default = (who or (rigconfig.USERNAME, 0))[0]
     total = statsdb.count(board_id)
     want = max(1, min(int(count), LEADERBOARD_CAPACITY))
-    if start_rank:                          # "start at rank N"
+    if start_rank:
         rows = statsdb.page_by_rank(board_id, start_rank, want, default)
-    elif pivot:                             # centre the page on that player
+    elif pivot:
         rows = statsdb.page_around(board_id, pivot, want, default)
     else:
         rows = statsdb.top(board_id, want, default)
-    if not rows and pivot:                  # nothing stored: still answer with a row
+    if not rows and pivot:
         score, rank, name = stats_get(board_id, pivot, default)
         rows = [(pivot, score, rank, name)]
 
@@ -1252,67 +775,25 @@ def stats_pivot_results(dec: dict, who: tuple[str, int] | None = None,
 
 
 # --------------------------------------------------------------- sessions (svc 5)
-# Hosting a game is service 5, the bdMatchMaking one. Confirmed live:
-#   op 1  create session   <- "Start lobby" -> "Create a game lobby?" -> cross
-#   op 3  delete session   <- "Leave lobby"
-# The create request (200B) is, in order:
-#   [u8 0][blob 25B bdCommonAddr][blob 8B][blob 16B][i32 x9][str hostName]
-#   [i32 0][i32 maxPlayers][i32][i32][i32][i64 x3][i64 0x3ffffffff][str hostName]
-#   [i32 100]
-# Of the nine i32s the first is the FREE slots, the second the PLAYERS in the
-# session and the fifth the free slots again; the host re-sends the whole info
-# as op 2 after every join and leave (Phase 62: 3/1/3 at create, 2/2/2, 1/3/1,
-# 0/4/0 as three consoles joined, 1/3/1 when one left), and the browser draws
-# the replayed row as `N/4`. The trailing i32 (98 here, 100 on the first
-# capture) is the percentage column beside the host's name.
-# The 25-byte addr is BD_COMMON_ADDR_SERIALIZED_SIZE (bdMatchMakingInfo.cpp
-# complains by that name if it ever gets another length) and carries BOTH of the
-# host's endpoints: [u32 ip][u16 port] for the public one at +0 and the private
-# one at +18. Both were 192.0.2.72:3075 / 127.0.0.1:3075 -- port 3075 is the
-# UDP socket PPSSPP has bound the whole time (`ss -uanp`), i.e. the peer-to-peer
-# channel joiners are meant to use. The two opaque blobs hold game-side structs
-# (they contain live 0x08d4xxxx pointers), so they are stored verbatim.
-#
-# The reply is a bdSessionCreateResult (deserializer 0x08c1bd9c):
-#   [blob <= 8B session id -> result+0x08][blob <= 16B -> result+0x10]
-# and numResults==0 is a legal, silent "no session" -- the deserializer returns
-# its pre-set success flag without reading anything. That is why the lobby opened
-# before this existed; the cost only showed up on the way out, where the delete
-# (op 3) sent back an all-zero session id.
 SESSION_ID_BYTES = 8
-BD_COMMON_ADDR_SIZE = 25       # BD_COMMON_ADDR_SERIALIZED_SIZE
-SESSION_SECRET_BYTES = 16      # bdSecurityKey; the id above is bdSecurityID
+BD_COMMON_ADDR_SIZE = 25
+SESSION_SECRET_BYTES = 16
 
-# Bisect switch: advertise the host's original (uninitialised) key bytes in the
-# search reply, i.e. the behaviour that made the peer handshake stall on the
-# joiner's first MAC'd message.
 NO_KEY_REWRITE = os.environ.get("WOW2_NO_KEY_REWRITE") == "1"
 
 SESSIONS: dict[int, dict] = {}
-_next_session_id = [0x5701]        # arbitrary; just has to fit in 8 bytes
-SEARCH_PAGE_MAX = 50               # rows per search reply; the browser asks for 25
+_next_session_id = [0x5701]
+SEARCH_PAGE_MAX = 50    # the browser asks for 25
 
 
 def sessions_create_result(dec: dict, peer_ip: str = "", host_key: str = ""):
-    """Result block for Sessions op 1. Returns (num_results, writer-callback).
-
-    The request's fields after the op id are [u8 flags] followed by the host's
-    bdMatchMakingInfo. We walk them generically (bd.read_fields) and keep the
-    whole list: the search reply hands that same list back verbatim, so the
-    server never has to model fields it has not reversed -- and the two blobs
-    that carry game-side structs survive untouched.
-
-    `host_key` is WHO created it (the ident key: the account name once the
-    connection is bound). `sessions_update`, `sessions_delete` and
-    `sessions_host_gone` all match on it since §65; `host_ip` stays what it
-    always was, WHERE the host is, for the address rewrite in the search reply.
-    """
+    """Result block for Sessions op 1. Returns (num_results, writer-callback)."""
     rec: dict = {"info": [], "name": "", "max_players": 0, "addr": b"",
                  "host_ip": peer_ip, "host": host_key or peer_ip}
     try:
         r = lsg_request_params(dec)
         fields = bd.read_fields(r)
-        rec["info"] = fields[1:]            # drop [u8 flags]; the info starts at the addr
+        rec["info"] = fields[1:]
         vals = [v for _t, v in fields]
         rec["addr"] = next((v for v in vals if isinstance(v, bytes)
                              and len(v) == BD_COMMON_ADDR_SIZE), b"")
@@ -1321,20 +802,9 @@ def sessions_create_result(dec: dict, peer_ip: str = "", host_key: str = ""):
         ints = [v for t, v in fields if t == bd.BD_SINT32]
         rec["max_players"] = ints[10] if len(ints) > 10 else 0
         rec["players"] = ints[1] if len(ints) > 1 else 0
-        # ints[6] is field [11] of the request and is the Host Setup "Play mode"
-        # row: 1 = Play for points, 0 = Play for fun. Diffing a ranked create
-        # against an unranked one, it is the ONLY settings field that moves --
-        # and it decides whether the ranked boards get written at match start
-        # (bdStats op 1 touches boards 2..5 only for a points match; board 1,
-        # the games-played counter, is written either way).
         rec["points"] = ints[6] if len(ints) > 6 else 0
     except Exception as e:
         log(f"  (session create decode failed: {e})")
-    # ONE SESSION PER HOST (§66 prep). A console holds one lobby at a time and
-    # deletes it before making another; the server used to keep whatever a
-    # connection created, so a peer that was not a console could fill the
-    # browser. A new create from the same host replaces its previous session,
-    # which is also what a console that crashed mid-lobby and came back needs.
     for old_sid, old_rec in [(k, v) for k, v in SESSIONS.items()
                              if v.get("host") == rec["host"]]:
         SESSIONS.pop(old_sid, None)
@@ -1355,9 +825,6 @@ def sessions_create_result(dec: dict, peer_ip: str = "", host_key: str = ""):
         w.blob(secret)
 
     addr = rec["addr"]
-    # Both endpoints, always, because which of the two the console fills with
-    # OUR discovery answer and which with its own local interface is the single
-    # fact the relay turns on -- and the log said only the first one for months.
     where = (f"{'.'.join(str(b) for b in addr[0:4])}:"
              f"{int.from_bytes(addr[4:6], 'little')}" if len(addr) >= 6 else "?")
     if len(addr) >= 24:
@@ -1375,34 +842,13 @@ def sessions_create_result(dec: dict, peer_ip: str = "", host_key: str = ""):
 
 
 def ranked_session_id() -> int:
-    """The live ranked session a stake belongs to -- the newest `mode=POINTS` one.
-
-    A stake arrives as a board-5 write ~1 s after `Sessions op 2`, and the write
-    carries nothing that names a session, so it has to be attributed. On this rig
-    that is unambiguous: matchmaking has one ranked lobby at a time. With more,
-    the newest wins, which is the one that just started.
-    """
+    """The live ranked session a stake belongs to -- the newest `mode=POINTS` one."""
     ranked = [sid for sid, rec in SESSIONS.items() if rec.get("points")]
     return max(ranked) if ranked else 0
 
 
 def host_addr_for(host_ip: str, joiner_ip: str) -> str:
-    """The host console's address *as the joiner can actually reach it*.
-
-    The address in the create request is the one the host discovered for itself,
-    and on this rig that is never the one a joiner can use. Console 1 announces
-    192.0.2.72 (its LAN address) and 127.0.0.1 -- from inside a namespace the
-    first routes to the host but comes BACK from 10.42.0.1, because the reply's
-    source address is chosen by the route to 10.42.0.x, and the second is the
-    joiner's own empty loopback. A peer that filters on the address it dialled
-    sees the reply as coming from a stranger.
-
-    So translate: if the host reached us over loopback but the joiner did not,
-    the joiner must use the bridge address, which is the same host and picks
-    itself as the reply source. Every other pairing (both on the bridge, both on
-    loopback, host namespaced and joiner on the host) is already symmetric, so
-    the host's own peer address stands.
-    """
+    """The host console's address *as the joiner can actually reach it*."""
     if not host_ip or not joiner_ip:
         return host_ip
     if host_ip.startswith("127.") and not joiner_ip.startswith("127."):
@@ -1411,18 +857,7 @@ def host_addr_for(host_ip: str, joiner_ip: str) -> str:
 
 
 def addr_with_host_ip(addr: bytes, ip: str) -> bytes:
-    """bdCommonAddr with both endpoints repointed at `ip`.
-
-    25 bytes, confirmed against a live create request:
-        [0:4]   public IP, network order      c0 a8 b2 48 = 192.0.2.72
-        [4:6]   public port, LITTLE endian    03 0c       = 3075
-        [6:18]  opaque
-        [18:22] private IP, network order     7f 00 00 01 = 127.0.0.1
-        [22:24] private port, little endian   03 0c       = 3075
-        [24]    address count/type            02
-    Both endpoints get the same address: whichever one the peer picks is then
-    reachable, so we never have to model how it chooses.
-    """
+    """bdCommonAddr with both endpoints repointed at `ip`."""
     if len(addr) < 24:
         return addr
     try:
@@ -1436,18 +871,7 @@ def addr_with_host_ip(addr: bytes, ip: str) -> bytes:
 
 
 def addr_with_endpoint(addr: bytes, ip: str, port: int) -> bytes:
-    """bdCommonAddr with BOTH endpoints set to one ip:port -- the relay form.
-
-    `addr_with_host_ip()` moves the addresses and leaves the ports, which is
-    right when the console really is listening on 3075 somewhere reachable. A
-    relay mailbox is a different port, so the port has to move too.
-
-    Both endpoints get the same value for the reason Phase 17 gives: the joiner
-    fires at BOTH announced endpoints, and leaving the private one alone would
-    leave it firing at an address that is either unreachable or -- worse, on the
-    rig -- its own loopback, which is how a console once completed a session
-    handshake with itself.
-    """
+    """bdCommonAddr with BOTH endpoints set to one ip:port -- the relay form."""
     if len(addr) < 25:
         return addr
     try:
@@ -1463,20 +887,7 @@ def addr_with_endpoint(addr: bytes, ip: str, port: int) -> bytes:
 
 
 def relay_endpoint_for_host(rec: dict, joiner_ip: str = ""):
-    """Where to tell a joiner the host is, when the relay is carrying the match.
-
-    The answer is normally already in the host's own create request: the console
-    publishes whatever the discovery reply said its address was, and with the
-    relay on that is its mailbox. So this mostly CONFIRMS rather than decides --
-    and when the confirmation fails it says so, because a host advertising an
-    address that is not one of ours means the relay cannot carry this session and
-    the join is about to fail for a reason that would otherwise be invisible.
-
-    Falls back to matching the host's source address, which is exact on the rig
-    (one console per address) and ambiguous only when two consoles share a public
-    address, i.e. sit behind the same NAT -- where they can reach each other
-    directly anyway.
-    """
+    """Where to tell a joiner the host is, when the relay is carrying the match."""
     if not natrelay.RELAY.enabled:
         return None
     advertised = None
@@ -1499,57 +910,17 @@ def relay_endpoint_for_host(rec: dict, joiner_ip: str = ""):
             f"mailbox (it advertised {advertised}); the joiner will be given an "
             f"address the relay does not serve")
         return None
-    # `server_address_for`, NOT `natrelay.server_addr_for`. They differ by the
-    # bridge correction, and using the raw one here made the server leak the
-    # JOINER'S TRANSPORT into the address it gave the host: a namespaced joiner
-    # was told it is `10.42.0.1:40002` by discovered_endpoint() -- which does
-    # apply the correction -- while its peer was told the host is at
-    # `127.0.0.1:40002`. The host then ignored an introduction naming a "B" it
-    # did not recognise, and the join died with nothing in the log to say why.
-    #
-    # Found by TESTPLAN N8 (mixed transports: one console on loopback, one in a
-    # namespace), and it is NOT rig-only -- a multi-homed deployment without
-    # `nat.public_address` set reaches the same disagreement. The rule is the
-    # one discovered_endpoint() already states: the address has to be ours AND
-    # reachable by the console's FUTURE PEER, not by the console itself.
     return server_address_for(joiner_ip or rec.get("host_ip", "")), c.mailbox.port
 
 
 def info_with_session_id(rec: dict, joiner_ip: str = ""):
-    """The host's bdMatchMakingInfo with OUR session id and a reachable address.
-
-    Three fields cannot be replayed verbatim, and they are told apart by length:
-    8 = bdSecurityID, 16 = bdSecurityKey, 25 = bdCommonAddr.
-
-    The 8-byte blob is the session/security ID. The host cannot know it at create
-    time and does not clear it either -- a live create carried
-    `10 04 e9 08 34 14 d4 08`, i.e. uninitialised stack holding 0x08d4xxxx game
-    pointers -- so whatever is there is meaningless. Advertising it unchanged
-    made choosing the row die on "This session is no longer available." before
-    the joiner sent a single packet, and that failure never reaches the server,
-    because resolving the id happens client-side first. The id the create reply
-    assigned goes here instead (the client hands the same id back on delete,
-    which is how it was confirmed).
-
-    **The 16-byte blob is the security KEY and has exactly the same problem.**
-    A live create carried `02 00 00 00 0c 04 bd 08 28 14 d4 08 04 00 00 00` --
-    more uninitialised stack. The create reply assigns the real one
-    (`blob(id) + blob(secret)`), so the HOST has it; replaying the garbage here
-    left the JOINER keyed differently, and that is a silent failure much later:
-    the two complete a 8/30/169/106-byte handshake and then the joiner's 32-byte
-    message -- which ends in a 16-byte MAC -- is received by the host and
-    dropped without a word, four retries, until the join times out.
-
-    The 25-byte blob is the bdCommonAddr -- see host_addr_for() for why the
-    host's own idea of its address is unusable from a namespace.
-    Set WOW2_NO_ADDR_REWRITE=1 to advertise the host's original bytes.
-    """
+    """The host's bdMatchMakingInfo with OUR session id and a reachable address."""
     want_ip = ""
     if os.environ.get("WOW2_NO_ADDR_REWRITE") != "1":
         want_ip = host_addr_for(rec.get("host_ip", ""), joiner_ip)
     relay_to = relay_endpoint_for_host(rec, joiner_ip)
     if relay_to:
-        want_ip = ""      # the mailbox rewrite below replaces it entirely
+        want_ip = ""
 
     out, patched, keyed, moved = [], False, False, ""
     for t, v in rec.get("info", []):
@@ -1587,35 +958,16 @@ def info_with_session_id(rec: dict, joiner_ip: str = ""):
 
 
 def sessions_search_results(dec: dict, joiner_ip: str = ""):
-    """Sessions op 5 -- the game browser's search. One result per live session.
-
-    Each result is the host's own bdMatchMakingInfo replayed field for field.
-    The client's deserializer (0x08c1b3f0) opens with a blob of at most 25 bytes,
-    which is exactly the bdCommonAddr the create request led with, so a
-    round-tripped info is the right shape by construction.
-
-    The request's filters are all 0x7fffffff ("Any") straight off the Define Game
-    Search screen; nothing is filtered yet -- every live session is returned and
-    the client applies its own view.
-    """
+    """Sessions op 5 -- the game browser's search. One result per live session."""
     try:
         r = lsg_request_params(dec)
         filters = [v for t, v in bd.read_fields(r) if t == bd.BD_SINT32]
     except Exception as e:
         log(f"  (session search decode failed: {e})")
         filters = []
-    # THE PAGE. The request opens `[i32 1][i32 25][i32 0]` on every capture
-    # (44 of 44): flags, then the number of results the browser wants, then
-    # the index to start at -- bdMatchMaking's findSessions(numResults,
-    # startIndex). The server used to return every live session regardless,
-    # and at ~184 bytes a row the reply outgrows the client's 64 KB receive
-    # buffer at roughly 350 open lobbies, which would break the browser for
-    # everyone at once. Honoured now, clamped to SEARCH_PAGE_MAX either way.
     want = filters[1] if len(filters) > 1 and 0 < filters[1] <= SEARCH_PAGE_MAX \
         else SEARCH_PAGE_MAX
     start = filters[2] if len(filters) > 2 and filters[2] > 0 else 0
-    # Lobbies with a free seat first, newest first within each group, so the
-    # page a full browser shows is the one worth showing.
     live = sorted(SESSIONS.values(),
                   key=lambda rec: (bool(rec.get("max_players")) and
                                    rec.get("players", 0) >= rec.get("max_players", 0),
@@ -1633,25 +985,10 @@ def sessions_search_results(dec: dict, joiner_ip: str = ""):
 
 
 def sessions_get_result(dec: dict, peer_ip: str = ""):
-    """Sessions op 4 -- fetch ONE session by id. Cold until Phase 25.
-
-    The UI that fires it was the missing piece: it is **opening a match invite**
-    in `View messages`. The client takes the session id out of the invite
-    message (push type 5 carries it) and asks the server for the session behind
-    it; answering the old bare `err=0, 0 results` puts
-    "Couldn't fetch match details." on screen, which is precisely what a
-    0-result reply means here.
-
-        request  [u8 0][blob 8B session id]     (wire-identical to op 3)
-        reply    one bdMatchMakingInfo, the same row the op-5 search returns
-
-    Phase 23 had already read the request shape off the builder offline and
-    filed it as "wire-identical to op 3, unknown UI"; the shape was right and
-    only the UI was missing.
-    """
+    """Sessions op 4: fetch one session by id (a match invite opened in View messages)."""
     try:
         r = lsg_request_params(dec)
-        r.u8()                              # the [u8 0] lead-in, constant on every RPC
+        r.u8()
         blob = r.blob()
     except Exception as e:
         log(f"  (session get decode failed: {e})")
@@ -1672,34 +1009,7 @@ def sessions_get_result(dec: dict, peer_ip: str = ""):
 
 
 def sessions_host_gone(host_key: str) -> None:
-    """The LSG connection bound to `host_key` dropped. Drop what it was hosting.
-
-    Phase 23. HOST MIGRATION IS REAL IN THIS GAME BUT IT IS ENTIRELY
-    PEER-TO-PEER: the surviving consoles elect a new host between themselves and
-    never tell us (the whole bdPeer/bdSession closure contains no call to
-    bdRemoteTaskManager::startTask, and neither does WiFiGame's resync path).
-    So the server cannot follow a migration -- but it CAN stop lying about one.
-
-    Without this, a host that crashes, pulls the network, or is killed leaves its
-    session advertised forever, pointing at an address and a security key that
-    now belong to nobody. A joiner picking that row gets no answer from the host
-    and lands on "This session is no longer available." after a timeout. An empty
-    game browser is the honest answer, and it is also the recoverable one: if the
-    match survived on 3+ consoles, the new host can advertise it again.
-
-    A clean "Leave lobby" already sends `Sessions op 3`; this only catches the
-    ungraceful exits. WOW2_KEEP_SESSIONS=1 (the one-console game-browser trick)
-    and WOW2_NO_HOST_EXPIRY=1 both switch it off.
-
-    Matched on the session's `host` -- the account -- and called only for the
-    connection that IS that account's LSG connection (§65). It used to match on
-    `host_ip` and run for every TCP close, so any other connection from the
-    same address going away took the host's session with it: a second console
-    behind the same router signing in (its auth connection closes after the
-    reply), or a `lsgauth.py --as` run from the host's machine. Two consoles
-    in one household is the ordinary deployment, and on the rig every console
-    has its own address, which is why it never showed.
-    """
+    """The LSG connection bound to `host_key` dropped. Drop what it was hosting."""
     if not host_key or os.environ.get("WOW2_NO_HOST_EXPIRY") == "1":
         return
     if os.environ.get("WOW2_KEEP_SESSIONS") == "1":
@@ -1716,38 +1026,7 @@ def sessions_host_gone(host_key: str) -> None:
 
 
 def sessions_update(dec: dict, peer_ip: str = "", host_key: str = ""):
-    """Sessions op 2: the host re-publishes its bdMatchMakingInfo. No results.
-
-    Op 2 carries the SAME payload as the op 1 create -- the 25-byte
-    bdCommonAddr, the session id we assigned, our 16-byte secret, the settings
-    ints, the host name -- with the leading `[u8]` set to 2 instead of 0, and
-    the session id filled in (op 1 has uninitialised stack garbage there,
-    because the host cannot know one yet).
-
-    Until now this fell through to the generic `err=0, 0 results` reply, which
-    the client accepts -- op 2 fires at every match start and has never needed
-    more. The reply is deliberately left exactly as it was; the only thing that
-    changes here is that the SERVER now believes it. That matters for one
-    reason: the address and the host name in this message are the ones that go
-    out in the next search reply, so a session whose host details have moved is
-    only advertised correctly if we take the update.
-
-    A move is also the server's only possible view of HOST MIGRATION. The
-    migration itself is peer-to-peer (bdSession promotes a peer with no help
-    from us), so if a promoted host ever re-advertises, it can only be through
-    this op -- and the log line below is what would prove it. Nothing has been
-    observed doing so yet; see netrecon Phase 23.
-
-    WOW2_NO_SESSION_UPDATE=1 goes back to ignoring it.
-
-    Only the session's HOST may update it (§65). Session ids are sequential
-    and every search reply hands them out, so without the check any bound
-    connection could point a listed game at its own address or flip it to
-    ranked. Measured before adding it: 85 updates and 56 deletes in every
-    session log on file, all from the creator -- a joiner never sends either.
-    A promoted host re-advertising after a migration would be refused here
-    too; none has ever been seen (§23), and the log line says what it would be.
-    """
+    """Sessions op 2: the host re-publishes its bdMatchMakingInfo. No results."""
     if os.environ.get("WOW2_NO_SESSION_UPDATE") == "1":
         return 0, None
     try:
@@ -1777,7 +1056,7 @@ def sessions_update(dec: dict, peer_ip: str = "", host_key: str = ""):
     ints = [v for t, v in fields if t == bd.BD_SINT32]
     was_addr, was_ip, was_name = rec.get("addr"), rec.get("host_ip"), rec.get("name")
 
-    rec["info"] = fields[1:]                 # what the search reply hands back
+    rec["info"] = fields[1:]
     if addr:
         rec["addr"] = addr
     if names:
@@ -1785,7 +1064,7 @@ def sessions_update(dec: dict, peer_ip: str = "", host_key: str = ""):
     if len(ints) > 10:
         rec["max_players"] = ints[10]
     if len(ints) > 1:
-        rec["players"] = ints[1]        # the roster count, see the layout note
+        rec["players"] = ints[1]
     if len(ints) > 6:
         rec["points"] = ints[6]
     if peer_ip:
@@ -1808,24 +1087,17 @@ def sessions_update(dec: dict, peer_ip: str = "", host_key: str = ""):
 
 
 def session_owned_by(rec: dict, key: str) -> bool:
-    """Is `key` (an ident key) the host of this session record?
-
-    Records made before §65 carry no `host`; those fall back to the address,
-    which is what the old code matched on. `WOW2_NO_SESSION_OWNER=1` puts the
-    pre-§65 behaviour back for a bisect: anybody may update or delete.
-    """
+    """Is `key` (an ident key) the host of this session record?"""
     if os.environ.get("WOW2_NO_SESSION_OWNER") == "1":
         return True
     return key == (rec.get("host") or rec.get("host_ip"))
 
 
 def sessions_delete(dec: dict, host_key: str = ""):
-    """Sessions op 3: drop the session the client names. No results expected.
-
-    Host only (§65), same reason as `sessions_update`."""
+    """Sessions op 3: drop the session the client names. No results expected."""
     try:
         r = lsg_request_params(dec)
-        r.u8()                              # flags
+        r.u8()
         sid = int.from_bytes(r.blob(), "little")
     except Exception as e:
         log(f"  (session delete decode failed: {e})")
@@ -1835,9 +1107,6 @@ def sessions_delete(dec: dict, host_key: str = ""):
         log(f"  session delete: id=0x{sid:x} is hosted by {rec.get('host')!r}, "
             f"and this connection is {host_key!r} -- REFUSED")
         return 0, None
-    # WOW2_KEEP_SESSIONS keeps the record after the host leaves. With one console
-    # on the rig that is the only way to exercise the game browser: host a lobby,
-    # leave it, then Find Game and the session is still there to be listed.
     if os.environ.get("WOW2_KEEP_SESSIONS") == "1" and sid in SESSIONS:
         log(f"  session delete: id=0x{sid:x} -- WOW2_KEEP_SESSIONS, left listed")
         return 0, None
@@ -1852,166 +1121,26 @@ def sessions_delete(dec: dict, host_key: str = ""):
 
 
 # ----------------------------------------------------- server -> client PUSH
-#
-# PHASE 22 -- LsgServicePushMessage (message type 2), the channel that delivers
-# "buddy invite received" and every other unsolicited event.
-#
-# The dispatcher arm is 0x08c17f10 (it logs BD_LOBBY_SERVICE_PUSH_MESSAGE) and it
-# parses NOTHING itself: it fetches the lobby service's message store and hands
-# the whole reader to 0x08c1cec0. That function reads ONE typed u32 -- the
-# message TYPE ID -- looks it up in a factory registered with 27 classes, news
-# the class, and lets the class deserialize the rest of the same bit stream. So a
-# push is:
-#
-#   [u32 0xDEADBEEF][u8 2]  then bit mode:  [tc bit][typed u32 typeID][class fields]
-#
-# There is no length, no blob wrapper and no service byte. The type id IS the
-# game-level event: `msg->[8]` is stored from it (the store at 0x08c29930) and
-# net::tBuddy's 35-entry jump table (0x08d36be8) indexes `[8] - 1`:
-#
-#   1 buddy invite received      5 received match invite        9  now on-line
-#   2 buddy invite accepted      6 ...match invite accept      10  now off-line
-#   3 buddy invite rejected      7 ...match invite reject      34  proposal cancelled
-#   4 buddy revoked
-#
-# Types 2,3,4,6,7,9,10,11,12 share one class (deserialize 0x08c23acc) whose
-# fields are the first six below; type 1 adds a u16 length and a blob.
-#
-#   +0x10 u64    message id
-#   +0x18 u64    DEDUP KEY -- the store (0x08c1d290) drops a message whose +0x18
-#                matches one already held, unless it is 0. The UI passes this
-#                back as the handle when the invite is answered, so make it
-#                unique and non-zero.
-#   +0x20 u32    timestamp (inferred)
-#   +0x24 bool   read/ack flag (inferred)
-#   +0x28 u64    SENDER's account id -- 0x0898f4d0 looks the buddy up by it
-#   +0x30 str    SENDER's name, NUL-terminated, 64-byte buffer
-#   +0x70 u16    payload length   (type 1 only; 0 short-circuits the blob)
-#
-# Every field is readTypeChecked(tag) + readBits chained on the previous
-# success, so the ORDER IS MANDATORY and a wrong tag silently truncates the rest
-# -- the store still appends the object, so a mis-encoded push shows up as an
-# invite from account 0 with an empty name rather than as an error.
-# THE BUDDY-LIST BUDGET, and it is SHARED between op 5 and op 19.
-#
-# Bisected (TESTPLAN F18-bisect, 5 supporting trials at the edge). The panel
-# holds **49 rows and dies on the 50th**, and the bound is on ROWS, not bytes:
-# 48 rows of 22-character names (1609 B) survives where 50 rows of 11-character
-# names (1137 B) does not. The failure splits in two, which the original F18
-# could not see because it never pressed circle on a long list:
-#
-#     50-56 rows   the panel DRAWS PERFECTLY and the circle that LEAVES it
-#                  crashes (RA 088c1b08, four byte-identical reproductions).
-#                  Rendering is not survival.
-#     >= 64 rows   the panel never draws at all (RA 088ec5b4 / 08aee61c)
-#     >= 256 rows  the SIGN-IN SWEEP itself dies, one op after the big reply
-#
-# And the 49 is shared: 45 buddies alone is fine, 45 buddies plus 8 pending
-# proposals -- 53 combined -- crashes with the same signature, because both
-# lists render into the same panel. So a per-LIST cap is the wrong shape; the
-# first version of this was 64 per list, i.e. 128 combined, wrong twice over.
-#
-# 40 combined against a measured 49 leaves 18% margin, and this is heap
-# corruption: the 49 edge was found with no clan, an empty mailbox and no match
-# in the same heap, so the margin is doing real work.
-#
-# `WOW2_FRIEND_LIMIT=0` turns the cap off to reproduce the crash on purpose.
-FRIEND_LIST_BUDGET = 40         # op 5 + op 19 together
-FRIEND_BLOCK_LIMIT = 40         # op 7 draws its own panel; same order, untested
+FRIEND_LIST_BUDGET = 40
+FRIEND_BLOCK_LIMIT = 40
 
 PUSH_BUDDY_INVITE = 1
 PUSH_BUDDY_ACCEPTED = 2
 PUSH_BUDDY_REJECTED = 3
 PUSH_BUDDY_REVOKED = 4
 PUSH_MATCH_INVITE = 5
-# The four ids that share the 0x100-byte class whose team id sits at +0xb8. The
-# clan message handlers read that offset, so the clan traffic is in here.
-# THE MESSAGE TYPE IDS ARE READ OFF THE CLIENT'S OWN DISPATCHER (Phase 38), not
-# guessed. `UserProfileMessageListScreen` turns a bd message into a UI row in
-# two hops, and both are jump tables:
-#
-#   0x0898c368  a2 = msg->type ; switch (a2 - 1) over 39 entries  -> a family
-#               handler:  1-10,34,35 buddy/match   13-28,37,39 CLAN
-#   0x0898f578  the buddy/match family's own switch (table 0x08d386a0)
-#   0x08990564  the CLAN family's own switch        (table 0x08d38728, type-13)
-#
-# and each arm constructs `UserProfileMessage(kind)` at 0x089808cc, whose kind
-# is what the detail screen switches on to decide which options to draw.
-#
-# The table VALIDATES ITSELF: types 1-4 come out Binvite/Baccept/Breject/Brevoke
-# and 5-7 come out Minvite/Maccept/Mreject, which are exactly the four buddy ids
-# and the match-invite id this server has been using successfully for phases.
-#
-#   13 Cinvite   14 Caccept   15 Creject   16 Cleft     17 Cadmin
-#   18 Ckicked   26 Cdisband  28 Cowner    39 Cordinary
-#
-# So the four ids Phases 25-33 spent months on -- 17, 18, 28, 39 -- are
-# MEMBERSHIP NOTIFICATIONS ("you are now an admin of X"), which is precisely
-# what Phase 33e deduced from their behaviour: resolve the clan, fetch its
-# members, delete the message. The reading was right and the id was never in
-# the set being guessed.
 PUSH_CLAN_INVITE = 13
-# The whole clan family, because the first switch routes all of these to the
-# handler that reads the two name fields at +0x30 and +0x78 -- i.e. they all use
-# base B's layout, not base A's.
 CLAN_PUSH_TYPES = tuple(range(13, 29)) + (37, 39)
-# ...of which these carry the 0x100-byte class's extra (u64, str64) tail. The
-# rest stop after base B at 0xb8. Derived, not guessed: of the 27 clan arms
-# exactly these four touch `+0xb8`, and they are precisely the four ids Phases
-# 25-33 were trying -- which is why the ten-field layout kept the connection
-# alive for them and dropped it for a ten-field type 13.
 CLAN_TAIL_TYPES = (17, 18, 28, 39)
-# ...and these carry a u16 payload length instead. Both lists are read off the
-# CLASS REGISTRY, not guessed: `0x08c1fffc` registers 44 message types, each
-# with a 4-byte factory whose vtable+0x14 allocates the real class, and the
-# malloc size names the layout --
-#
-#   0x70  base A                              2,3,4,6,7,9,10,11,12,34,35,36
-#   0x78  base A + u16 payload                1 (buddy invite), 8, 40
-#   0x80  base A + blob8 + u16 payload        5 (match invite)
-#   0xb8  base B  = A + [u64][str64]          14,15,16,20,21,24..27,37,38,41..44
-#   0xc0  base B + u16 payload                13 (CLAN INVITE), 22, 23
-#   0x100 base B + [u64][str64]               17,18,28,39
-#
-# Getting this wrong is not subtle and not visible: a row that over- or
-# under-reads makes the client drop the LSG connection ~450 ms after the reply,
-# with nothing on screen but "Connection Lost". A ten-field type 13 did it, and
-# so did an eight-field one.
 CLAN_BLOB_TYPES = (13, 22, 23)
-# `write_push_body()`'s clan arm is TEN fields, because base B (0x08c23190) and
-# base A (0x08c23acc) both open by calling the same super-base 0x08c299cc, which
-# Phase 25 never noticed -- all three of Phase 25's attempts were short of that,
-# which is consistent with all three dropping the LSG connection ~450 ms after
-# the inbox reply.
-#
-# 0 = DO NOT PUSH. Override per deployment with `meta.invite_push_type` in the
-# store. If a console cannot sign in after a change here, clear that account's
-# rows in the `messages` table -- the message is re-sent from the mailbox at
-# EVERY sign-in, so a bad one bricks that account until it is deleted.
 CLAN_INVITE_PUSH_DEFAULT = PUSH_CLAN_INVITE
 PUSH_MATCH_ACCEPTED = 6
 PUSH_MATCH_REJECTED = 7
 PUSH_NOW_ONLINE = 9
 PUSH_NOW_OFFLINE = 10
 PUSH_PROPOSAL_CANCELLED = 34
-# A7, §55. "%ACCOUNT% has signed in elsewhere." -- a string the client has always
-# shipped (`Net.Err.AccEls`) for a message this server had never sent. The type
-# id is read off the image, not guessed:
-#
-#   the key string "Net.Err.AccEls" is at 0x08d41570 and has exactly ONE xref,
-#   0x08a42e88, which draws the dialog when the byte at 0x08d8d868 is set --
-#   and clears it, so it is one-shot. That byte has exactly one writer,
-#   0x0898c428, inside a handler whose own (stubbed-out) log line reads
-#   "the account has been signed in elsewhere\n" at 0x08d38428. The handler is
-#   entry 28 of the 39-entry jump table at 0x08d38600, and the dispatcher above
-#   it (0x0898c354) indexes that table with `type - 1`.
-#
-# 28 + 1 = 29, and 29 is outside CLAN_PUSH_TYPES, so it is a plain base-A body.
-# The client reads NO argument out of it: the %ACCOUNT% it prints comes from its
-# own name in a global (0x08d904f4), not from the wire.
 PUSH_SIGNED_IN_ELSEWHERE = 29
 
-# peer ip -> the live LSG connection, so a push can be routed to an account.
 LSG_CONNS: dict[str, "AuthConnection"] = {}
 _push_ids = [1]
 
@@ -2019,137 +1148,34 @@ _push_ids = [1]
 def write_push_body(w, type_id: int, msg_id: int, sender: int, sender_name: str,
                     session_id: bytes = b"", clan_name: str = "",
                     target: int = 0, target_name: str = ""):
-    """The class-selected body of one lobby message.
-
-    THE SAME BYTES serve two transports: an LsgServicePushMessage (type 2) and a
-    row of a bdMessaging op-1 reply. Both land in 0x08c1cec0, which reads the
-    leading u32, asks the message factory for that class and lets it deserialize
-    the rest -- so the mailbox and the live push are one format, and that is why
-    a pushed buddy invite shows up under `View messages`.
-
-    PHASE 26 -- THERE ARE NOT TWO UNRELATED BASES; THERE IS ONE, AND BOTH
-    "bases" DERIVE FROM IT. Phase 25 read `0x08c23190` starting at its first
-    field read and concluded a clan message carries "no id, no dedup, no
-    timestamp, no read flag". It does. Its FIRST instruction group is a call
-    to a super-base at `0x08c299cc` (the call is at 0x08c231d8), and base A
-    calls the SAME super-base (at 0x08c23b0c) -- and `0x08c299cc` is exactly
-    those four fields:
-
-        tag 0xA  64 bits -> +0x10   msgId          (0x08c299f8 / 0x08c29a10)
-        tag 0xA  64 bits -> +0x18   dedup          (0x08c29a50 / 0x08c29a68)
-        tag 8    32 bits -> +0x20   timestamp      (0x08c29ab0 / 0x08c29ac8)
-        tag 1     1 bit  -> +0x24   read flag      (0x08c29b08 / 0x08c29b24)
-
-    So the three layers stack, and the malloc sizes prove it -- base A's class
-    is 0x70 bytes and ends at 0x70; type 5's is 0x80 and adds three fields from
-    0x70; the clan class is 0x100 and its last field is a 64-byte string at
-    0xc0. Nothing is left over anywhere:
-
-        super   0x08c299cc  [u64 ->0x10][u64 ->0x18][u32 ->0x20][bool ->0x24]
-        base A  0x08c23acc  + [u64 ->0x28 sender][str64 ->0x30 sender name]
-        base B  0x08c23190  + [u64 ->0x70][str64 ->0x78]
-        clan    0x08c23884  + [u64 ->0xb8 teamId][str64 ->0xc0]
-
-    which makes a clan message TEN fields, not four and not six. Phase 25's
-    three failures were attempt 1 = wrong class, attempt 2 = base B's six
-    fields with the clan tail missing, attempt 3 = the clan's six tail fields
-    with the super-base's four missing. Every one of them was short.
-
-    A string on the wire is `tag 0x10` then raw bytes read EIGHT BITS AT A TIME
-    until a NUL (0x08c239a8..0x08c239e4); there is no length prefix, the buffer
-    is 64 bytes and byte 0x3f is forced to NUL, so 63 characters is the limit.
-
-    THE FULL LAYOUT, all of it now proven (Phase 33c sentinels, then Phase 41
-    from the class ctor 0x08c237d0 and deserializer 0x08c23884):
-
-        +0x10 u64 msgId    +0x18 u64 dedup   +0x20 u32 ts   +0x24 bool read
-        +0x28 u64 SENDER   +0x30 char[64] sender name
-        +0x70 u64 teamId   +0x78 char[64] clan name
-        +0xb8 u64 SUBJECT GAMER   +0xc0 char[64] subject name   (0x100 class only)
-
-    +0xc0 IS NEVER READ by anything, but it must still be on the wire or the
-    parse under-reads and the connection dies.
-
-    THERE ARE THREE DISPATCHERS, and the one that changes membership is not the
-    one you find first:
-
-        0x08990564  the UI switch (type-13). Builds inbox items. Sends NO RPC
-                    and never marks anything stale -- enumerated every jal.
-        0x089be770  net::tClan::onMessage (vtable +0x2c), switch(type-17).
-                    Picks the SUBJECT: types 17/18/28/39 use +0xb8, EVERY OTHER
-                    TYPE USES +0x28, the sender. Null lookup -> silent drop.
-        0x089b4b9c  net::tGamer::onMessage (type-13) -- the actual mutation:
-                    14 -> rank 2 + flag 0x800   15/16/18/26 -> remove
-                    17 -> rank 3   28 -> rank 4   39 -> rank 2
-
-    So a notification without its subject has nothing to act on. `findMember`
-    is 0x089ba930 (walks clan->0x24 comparing node->0x20, a GAMER id); finding a
-    CLAN by id is the different function 0x089c0030. An earlier version of this
-    comment called both of them findTeam, which is what made +0xb8 look like a
-    team id.
-
-    AND NOTHING HERE CAN FORCE A REFRESH. `0x089b9674` sets flag bit 0x4,
-    "needs a server refresh", and the idle delegates poll that bit into
-    `Teams op 20` (0x089c0238) / `op 21` (0x089bab38). None of its 28 callers is
-    in a message handler -- only creating a clan node (0x089bfe78) or adding a
-    member (0x089ba738) marks stale. That is the whole reason a push can refresh
-    a clan the console does NOT hold (the preamble creates it) and can only
-    mutate one it does.
-    """
-    w.u32(type_id)                    # read by 0x08c1cec0 -> factory -> msg[8]
+    """The class-selected body of one lobby message."""
+    w.u32(type_id)
 
     # --- the super-base 0x08c299cc: EVERY message class begins with these ---
-    w.u64(msg_id)                     # +0x10  the id Messaging op 4 deletes by
-    w.u64(msg_id)                     # +0x18  dedup key: unique and non-zero
-    w.u32(0)                          # +0x20  timestamp
-    w.bool_(False)                    # +0x24  read/ack flag
+    w.u64(msg_id)                 # message id
+    w.u64(msg_id)                 # dedup key: the client drops a repeat, unless 0
+    w.u32(0)
+    w.bool_(False)
     # --- base A's own two fields 0x08c23acc, shared by base B at the same
-    #     offsets (0x08c23234 / 0x08c23294) ---
-    w.u64(sender)                     # +0x28  the sender's account
-    w.str_(sender_name, 63)           # +0x30  64-byte buffer including the NUL
+    w.u64(sender)
+    w.str_(sender_name, 63)
 
     if type_id in CLAN_PUSH_TYPES:
-        # base B's extra pair (0x08c23314 -> +0x70, 0x08c23374 -> +0x78): the
-        # CLAN this message is about, id then name. Proved with sentinels in
-        # Phase 33c -- a push whose +0x78 read "MIDDLE1" made the console fire
-        # `Teams op 1` for a clan called MIDDLE1, while +0xc0 was ignored.
-        # WOW2_PUSH_MIDNAME still replaces it for that kind of experiment.
         w.u64(int.from_bytes(bytes(session_id[:8]).ljust(8, b"\x00"), "little"))
         w.str_(os.environ.get("WOW2_PUSH_MIDNAME") or clan_name, 63)
         if type_id in CLAN_BLOB_TYPES:
-            # NINE fields. Base B plus a payload length, exactly the trailer
-            # type 1 uses -- `readTypeChecked(6)` then 16 bits into +0xb8 at
-            # 0x08c22f44, and `blez` at 0x08c22f98 means 0 ends the message.
             w.u16(0)
         elif type_id in CLAN_TAIL_TYPES:
-            # TEN. The 0x100-byte class's own tail
-            # (0x08c23920 -> +0xb8, 0x08c23980 -> +0xc0).
             w.u64(target)
             w.str_(os.environ.get("WOW2_PUSH_TAILNAME") or target_name
                    or clan_name, 63)
-        # ...and everything else in the family stops at base B: EIGHT fields.
         return
 
     if type_id == PUSH_BUDDY_INVITE:
-        w.u16(0)                      # +0x70  payload length; 0 = no blob
+        w.u16(0)
     elif type_id == PUSH_MATCH_INVITE:
-        # Type 5 has its OWN class -- 0x80 bytes, ctor 0x08c223e8, vtable
-        # 0x08dba520, deserialize 0x08c224b4 -- and it is the only one of the
-        # first twelve that carries a session id, which is exactly what a match
-        # invite needs:
-        #
-        #   <base A>
-        #   blob  capped at 8 bytes  -> +0x70   the SESSION ID
-        #   u16                      -> +0x78   payload length
-        #   blob  (only if +0x78 > 0)-> +0x7c   payload
-        #
-        # The cap is a hard-coded 8 compared at 0x08c22550: a longer blob
-        # takes the error path and the field is left unset. The trailing blob
-        # is skipped on a non-positive length at 0x08c22694, so u16 0 ends the
-        # message --
-        # the same trick type 1 uses.
         w.blob(bytes(session_id[:8]).ljust(8, b"\x00"))
-        w.u16(0)                      # +0x78  payload length; 0 = no blob
+        w.u16(0)
 
 
 def build_lsg_push_encrypted(type_id: int, sender: int, sender_name: str,
@@ -2161,7 +1187,7 @@ def build_lsg_push_encrypted(type_id: int, sender: int, sender_name: str,
     w = bd.BdWriter()
     w.bitmode = True
     w.type_checked = False
-    w.write_bits(b"\x01", 1)          # the type_checked bit, as in every reply
+    w.write_bits(b"\x01", 1)
     w.type_checked = True
     write_push_body(w, type_id, msg_id, sender, sender_name, session_id,
                     clan_name, target, target_name)
@@ -2187,8 +1213,6 @@ def push_to_account(entity: int, type_id: int, sender: int, sender_name: str,
         if account_for(ident_key) != entity or conn.t is None:
             continue
         try:
-            # The connection's OWN key -- session keys are per sign-in now, so a
-            # push encrypted with the old global constant would be noise to it.
             conn.t.write(build_lsg_push_encrypted(type_id, sender, sender_name,
                                                   conn.session_key
                                                   or rigconfig.SESSION_KEY, msg_id,
@@ -2207,34 +1231,11 @@ def push_to_account(entity: int, type_id: int, sender: int, sender_name: str,
     return False
 
 
-# A7. One account, two consoles: the second one wins and the first is signed out.
-# `WOW2_NO_EVICT=1` reverts to both connections living side by side.
 NO_EVICT = os.environ.get("WOW2_NO_EVICT") == "1"
 
 
 def evict_other_lsg(account: str, keep) -> int:
-    """Sign `account` out of every LSG connection except `keep`. How many went.
-
-    WHY IT IS CALLED FROM `bind_lsg` AND NOT FROM THE LOGIN HANDLER. The obvious
-    objection to eviction is that knowing a username would be enough to kick
-    anyone offline, and the obvious repair -- check the password first -- cannot
-    be done where the login request arrives: it carries no password proof and
-    never could (§53; `[u8 0x0a][tc bit][u32 iv_seed][u32 titleId][64 bits
-    handle]`, 180 of 180 captured logins). Authentication runs backwards here.
-
-    The check is one step later. The reply's ticket is encrypted under
-    `Tiger192(password)`; a client that cannot decrypt it draws `Net.Err.AccDen`
-    and never opens an LSG connection at all. So completing this bind with a
-    session key we issued is the first moment a client has DEMONSTRATED it read
-    the reply, and it is the only such moment the protocol has.
-
-    §54 is what makes that sentence true rather than decorative: before it, an
-    unrecognised key was degraded to the source address and a refused login's
-    key was registered anyway, so "completed the bind" meant nothing. What it
-    still does not cover is a peer that reads the opaque proof out of the reply
-    it was handed -- the proof goes out in clear, and that is in the client. See
-    ROADMAP §0 for where that goes next.
-    """
+    """Sign `account` out of every LSG connection except `keep`. How many went."""
     if NO_EVICT:
         return 0
     gone = 0
@@ -2242,17 +1243,11 @@ def evict_other_lsg(account: str, keep) -> int:
         if conn is keep or conn.account != account or conn.t is None:
             continue
         try:
-            # Type 29 sets a one-shot byte the next screen update turns into
-            # `Net.Err.AccEls`. Encrypted under the OLD connection's own session
-            # key -- keys are per sign-in, so the new one's is noise to it.
             conn.t.write(build_lsg_push_encrypted(
                 PUSH_SIGNED_IN_ELSEWHERE, account_for(account), account,
                 conn.session_key or rigconfig.SESSION_KEY, notify_id()))
         except Exception as e:
             log(f"  (!! could not tell {key} it had been signed out: {e})")
-        # Unregister BEFORE closing, so nothing routes a push into a socket that
-        # is on its way out; `connection_lost` guards with `is self` and will
-        # not touch the new owner of this key.
         if LSG_CONNS.get(key) is conn:
             del LSG_CONNS[key]
         conn.t.close()
@@ -2261,76 +1256,13 @@ def evict_other_lsg(account: str, keep) -> int:
             f"{PUSH_SIGNED_IN_ELSEWHERE} to the older connection ({conn.peer}) "
             f"and closed it")
     if gone:
-        # The evicted console's lobby dies with its connection (it is on the
-        # Main Menu now). Its `connection_lost` cannot expire the sessions
-        # itself, because the entry was unregistered above so that no push is
-        # routed into a closing socket -- and the new connection has created
-        # nothing yet, so everything filed under this account is the old one's.
         sessions_host_gone(account)
     return gone
 
 
 # ------------------------------------------------------- buddies and clans
-#
-# PHASE 22 -- service 9 (Friends) and service 3 (Teams), read off the client.
-#
-# Both were answered with the generic `err=0, 0 results` from Phase 11 onward,
-# which every no-result op accepts and every LIST op does not. The user's report
-# ("I can send buddy invites but there is no way to accept them", "making a clan
-# does nothing") is exactly what that produces, and the binary says why.
-#
-# THE RPC MAP came out of `bdRemoteTaskManager::startTask` (0x08c2486c): all 45
-# call sites pass the service and the op as immediate arguments, so walking
-# them lists every RPC this title can send. The FRIENDS REPLY READER is at
-# 0x08c18cb8: it reads [u32 err][u8 opID], then indexes a 15-entry table at
-# 0x08d6a208 with opID-5, and only FIVE arms read anything -- ops 5, 7, 16, 17
-# and 19 land on 0x08c18dac, which reads [u32 numResults] and then that many
-# rows; every other op lands on the bare exit at 0x08c18e8c. So op 1 (send an
-# invite), op 6 and op 13 want nothing back, and the three no-argument ops the
-# client fires at sign-in are the three lists.
-#
-# WHICH LIST IS WHICH comes from the game layer's own log lines, which sit in
-# the same functions as the calls:
-#
-#   net::tBuddyList  "downloading friends"           0x0897a0fc -> op 5  @0x0897a3cc
-#                    "downloading friend proposals"  0x0897a4ac -> op 19 @0x0897a77c
-#   net::tEnemyList  "downloading block list"        0x0897f3b4 -> op 7  @0x0897f684
-#
-# ROW LAYOUTS: three container classes sit immediately after that reply reader,
-# each a vtable whose slot 2 is a row deserializer (the same shape as the
-# leaderboard row's 0x08c25770):
-#
-#   0x08c1904c   [u64 id][str name][u8  status]     vtable 0x08dba238
-#   0x08c19494   [u64 id][str name][bool flag]      vtable 0x08dba258
-#   0x08c198dc   [u64 id][str name]                 vtable 0x08dba278
-#
-# The mapping below (friends carry a status, a proposal carries a direction, a
-# blocked player carries neither) is an inference from that shape, not something
-# the binary states; WOW2_FRIEND_ROWS=a|b|c rotates it if a screen comes up
-# empty. Everything else here is read straight off the wire or the disassembly.
-#
-# CLANS are simpler and completely pinned. `bdCreateTeamResult::deserialize`
-# (0x08c27ddc) asserts "Only expecting 1 or 0 results." and, given one, reads a
-# single typed u64 into the object -- the new team's id. Returning zero results
-# leaves the client with no id at all, and the proof of that is on the wire: the
-# three clan attempts in session-20260911-002831.log are each followed by FOUR
-# `bdStats op 1` uploads, one per second, to boards 29..32 -- the clan boards --
-# every one of them carrying `entityID = 0`, because the client had no team to
-# name. Hand back an id and those uploads carry it.
-TEAM_ID_BASE = 0x00C1A0_0000_0000        # "clan" ids, obviously ours in a capture
+TEAM_ID_BASE = 0x00C1A0_0000_0000
 FRIEND_NAME_MAX = 64
-# Row shape per list op, overridable while bisecting:
-#   WOW2_FRIEND_ROWS="5=u8,7=none,19=none"
-# `none` = [u64 id][str name] (deserializer 0x08c198dc)
-# `u8`   = ...[u8  status]    (0x08c1904c)
-# `bool` = ...[bool flag]     (0x08c19494)
-# Getting it wrong is LOUD: the client drops the whole LSG connection about
-# 300 ms after the bad reply and the console shows "Connection Lost".
-# CONFIRMED, not guessed: each list's row shape is fixed by which container the
-# GAME-side reply handler constructs -- friends 0x08c19364 -> 0x08c19494
-# [u64][str][bool], proposals 0x08c197ac -> 0x08c198dc [u64][str], block list
-# 0x08c18f1c -> 0x08c1904c [u64][str][u8]. Get one wrong and the client drops the
-# LSG connection ~330 ms after the reply ("Connection Lost").
 FRIEND_ROW_DEFAULT = "5=bool,7=u8,19=none"
 FRIEND_ROWS = {}
 for _part in os.environ.get("WOW2_FRIEND_ROWS", FRIEND_ROW_DEFAULT).split(","):
@@ -2339,12 +1271,6 @@ for _part in os.environ.get("WOW2_FRIEND_ROWS", FRIEND_ROW_DEFAULT).split(","):
         FRIEND_ROWS[int(_o)] = _k.strip()
 
 
-# Stores that failed to PARSE. A missing file is fine and means "empty"; a file
-# that exists and does not parse is a damaged database, and the old code could not
-# tell the two apart -- it caught ValueError and returned {}. That is the quiet
-# way to lose everything: read {} -> serve an empty board -> write {} back, and
-# the data is gone with no error anywhere. Refusing to WRITE a store we could not
-# READ is what makes that unrecoverable path impossible.
 _UNREADABLE: dict[str, str] = {}
 
 
@@ -2361,8 +1287,6 @@ def _jload(path: Path, default: dict) -> dict:
         d = json.loads(raw)
     except ValueError as e:
         if str(path) not in _UNREADABLE:
-            # Keep the damaged bytes. Whatever is wrong, the file is the only
-            # copy of that data and the next _jsave must not land on top of it.
             keep = path.with_suffix(path.suffix + f".corrupt-{ts_file()}")
             try:
                 path.replace(keep)
@@ -2383,23 +1307,13 @@ def _jload(path: Path, default: dict) -> dict:
 
 
 def _jsave(path: Path, data: dict) -> None:
-    """Write a JSON store ATOMICALLY, or not at all.
-
-    `path.write_text()` truncates first, so a crash mid-write leaves a short file
-    that `_jload` then reads as corrupt. Write a temp file in the SAME directory
-    (rename is only atomic within a filesystem) and `os.replace` it over the top,
-    which is atomic on POSIX: a reader sees either the whole old file or the whole
-    new one, never a partial.
-    """
+    """Write a JSON store ATOMICALLY, or not at all."""
     if str(path) in _UNREADABLE:
         log(f"  (!! refusing to write {path.name}: it failed to load this run "
             f"({_UNREADABLE[str(path)]}) and overwriting it would destroy data)")
         return
     tmp = path.with_suffix(path.suffix + f".tmp-{os.getpid()}")
     try:
-        # The data directory used to be made at import; since the session log
-        # opens lazily (Phase 64) the first store write can be the first thing
-        # to need it -- `wow2-account set` on a fresh install.
         path.parent.mkdir(parents=True, exist_ok=True)
         tmp.write_text(json.dumps(data, indent=1, sort_keys=True))
         os.replace(tmp, path)
@@ -2411,54 +1325,11 @@ def _jsave(path: Path, data: dict) -> None:
             pass
 
 
-# ------------------------------------------------------------- profiles (svc 8)
-# `service 8` is the busiest thing the server did NOT answer until Phase 23: the
-# logs have 275 hits across ops 4/1/5/2, and op 4 alone is the second-busiest RPC
-# in every capture after `Stats op 4`. All five ops are `net::tProfile` task
-# methods, and a "kind" flag at this+0x20 (net::tPrivateProfile=1,
-# net::tPublicProfile=0, set from the constructor's fourth argument) picks
-# which one is sent:
-#
-#   op 1  create profile            (0x0898639c, logs "creating profile")
-#   op 2  READ a public profile     [u8 0][u64 entityId]
-#   op 3  read MY private profile   [u8 0]                     -- never fired
-#   op 4  WRITE a public profile    [u8 0][s64 x4][f64 x2][s64][str][s32]
-#   op 5  write my private profile  [u8 0][s32 99]             -- a stub payload
-#
-# Sign-in fires 1 -> 4 -> 5 -> 4, which is why the counts are so lopsided.
-#
-# ONLY op 2 READS RESULTS. The service's reply reader (0x08c24194) takes
-# [u32 err] then a [u8 opId] which it reads and DISCARDS, and hands the container
-# a hard-coded count of 1 (the immediate at 0x08c242a4) -- so, like Teams op 1
-# and Storage op 5, there is NO [u32 numResults] in the stream and exactly one row
-# follows. But the three call sites differ in whether a container exists at all:
-# 0x08986bec (op 1) and 0x089889a0 (ops 4/5) pass a NULL container, so no row is ever
-# read and the bare `err=0, 0 results` stub was already correct for them. Only
-# 0x08987aa4 -- the download poll behind "Download profile for %GAMER%?" -- passes
-# a real container. So the blank View-profile screen is op 2, alone.
-#
-# The op 2 row is what op 4 uploads with the entity id in front:
-#   [u64 entityId][s64][s64][s64][s64][f64][f64][s64][str][s32]
-# The nine payload fields have no recovered meaning -- every one was zero in the
-# captures and only the str is obviously displayable -- so this does not model
-# them. It stores what the console uploaded and hands the same typed fields back,
-# which is the one answer guaranteed to be the shape the client expects.
 # --------------------------------------------------------- account credentials
-# The `accounts` table of the SQLite store (tools/store.py; `capture/
-# accounts.json` before §66 step 3, imported once at the first start). One
-# row per name: the credential digest, the login handle, the small user id,
-# and when and from where the account was last seen.
-#
-# The stored value is Tiger192(password), which is exactly `account_key()` -- the
-# key the login proof is built with. So this store never holds a password, and a
-# server built on it never learns one.
 
 
 def stored_credential(username: str) -> bytes | None:
-    """The digest we hold for `username`, or None. An account EXISTS iff this is
-    not None -- a row with no pwhash is something an older server's
-    `account_seen()` noticed in passing (it stopped writing them in §65), not
-    something anybody created."""
+    """The digest we hold for `username`, or None."""
     row = store.db().execute("SELECT pwhash FROM accounts WHERE name = ?",
                              (username,)).fetchone()
     if row and row["pwhash"]:
@@ -2470,20 +1341,7 @@ def stored_credential(username: str) -> bytes | None:
 
 
 def note_account(username: str, password_hash: bytes, peer_ip: str) -> None:
-    """Record an account the client just created.
-
-    THIS FUNCTION DOES NOT DECIDE WHETHER THE NAME IS FREE -- the 0x00 handler
-    does, with `stored_credential()`, before calling here (§56). Deliberately
-    one decision in one place: a duplicate of it inside the store would be the
-    copy that goes stale, and the only way to reach here with an existing
-    credential is `create_mode = "success"`, which exists precisely to put the
-    takeover back for a control run.
-
-    The create-account request is unauthenticated by construction -- it is the
-    message that establishes the credential, so it cannot be checked against
-    one. That is why a duplicate has to be refused rather than verified.
-    Changing a password is `set_account_password()`, from the 0x0f request.
-    """
+    """Record an account the client just created."""
     if os.environ.get("WOW2_NO_ACCOUNT_STORE") == "1":
         return
     with store.tx() as conn:
@@ -2491,8 +1349,6 @@ def note_account(username: str, password_hash: bytes, peer_ip: str) -> None:
                            (username,)).fetchone()
         old = old["pwhash"] if old else None
         if old and old != password_hash.hex():
-            # Only reachable under create_mode = "success". It is not a note, it is
-            # the takeover happening: whoever sent this request now owns the account.
             log(f"    (!!!! account {username!r}: password digest REPLACED by a "
                 f"create-account from {peer_ip} -- the previous owner can no longer "
                 f"sign in. Only create_mode = 'success' allows this.)")
@@ -2517,13 +1373,6 @@ def allocate_user_id(conn, username: str) -> int:
     """A stable small id per account. The rig's own consoles keep the ids
     IDENTITIES gives them (1..8) so nothing about the eight-console rig changes;
     anyone else is numbered from 100 up, which cannot collide.
-
-    One function for both ways an account gets a credential. The operator's
-    `wow2-account set` used to leave `user_id` at 0 for a name outside
-    IDENTITIES, and a 0 is filled in at login from the SOURCE ADDRESS -- so two
-    players behind one router, both migrated by hand, shared a user_id and were
-    one player to the matchmaker (Phase 64). An account that already has an id
-    keeps it (the upsert's COALESCE); this only supplies one for a row without.
     """
     have = conn.execute("SELECT user_id FROM accounts WHERE name = ?", (username,)).fetchone()
     if have and have["user_id"]:
@@ -2536,12 +1385,7 @@ def allocate_user_id(conn, username: str) -> int:
 
 
 def set_account_password(username: str, password_hash: bytes, peer_ip: str = "") -> None:
-    """Commit a new credential for an account. The digest IS the credential.
-
-    The server never sees the password -- the client sends Tiger192(password),
-    which is exactly the key `build_login_reply` needs. So this store holds
-    digests and the operator learns nothing from reading it.
-    """
+    """Commit a new credential for an account. The digest IS the credential."""
     with store.tx() as conn:
         _write_credential(conn, username, password_hash, peer_ip)
 
@@ -2551,24 +1395,13 @@ def account_handle(username: str) -> bytes:
     return tiger192(username.encode())[:8]
 
 
-# The rig's configured IDENTITIES give us NAMES, and a name is all you need to
-# compute its handle -- so console 1..8 are resolvable by account from the very
-# first login with no store at all. Eight hashes, once, at import.
 _CONFIG_HANDLES: dict[bytes, dict] = {
     account_handle(name): {"name": name, "user_id": uid, "pwhash": None, "src": "config"}
     for _ip, (name, uid) in IDENTITIES.items()}
 
 
 def account_by_handle(handle: bytes) -> dict | None:
-    """{name, user_id, pwhash, src} for a login handle, or None.
-
-    The store first, through the unique index on `accounts.handle` -- one
-    lookup, however many accounts there are. This used to be `handle_index()`,
-    which parsed the whole JSON store and computed Tiger192 for every name in
-    it on EVERY login: 10,000 accounts cost five seconds per sign-in
-    (netrecon §66b), which is what put the login at the top of the capacity
-    measurements once the leaderboards had moved.
-    """
+    """{name, user_id, pwhash, src} for a login handle, or None."""
     row = store.db().execute(
         "SELECT name, user_id, pwhash FROM accounts WHERE handle = ?",
         (handle.hex(),)).fetchone()
@@ -2587,35 +1420,14 @@ def account_by_handle(handle: bytes) -> dict | None:
             "src": "store" if not cfg else "config+store"}
 
 
-# Session keys we have issued, per account. The client relays the key back to the
-# LSG inside its opaque proof, which is how the LSG connection learns it -- but a
-# relayed value is client-supplied, so it is only honoured if it is one we
-# actually issued to that account.
 ISSUED_SESSION_KEYS: dict[str, set[bytes]] = {}
 
 
 def new_session_key(username: str, register: bool = True) -> bytes:
-    """A fresh random 24-byte LSG session key for this sign-in.
-
-    Was `rigconfig.SESSION_KEY` -- the SAME key for every client, forever. With
-    one shared key any client that signs in can decrypt any other's lobby
-    traffic, which is not a subtle weakness. `WOW2_FIXED_SESSION_KEY=1` restores
-    the old behaviour for a bisect; several rig tools assume the constant.
-
-    `register=False` issues a key and does NOT record it, which is what a
-    REFUSED login gets. This mattered more than it looks (§54): the login reply
-    carries the key twice -- inside the 3DES ticket, and again in the opaque
-    proof, which goes out **in clear**. A refusal garbles the ticket and leaves
-    the opaque proof perfectly readable, so registering the key meant every
-    refusal still handed out a working LSG credential. The refusal was a
-    statement about the ticket, not about the account.
-    """
+    """A fresh random 24-byte LSG session key for this sign-in."""
     if os.environ.get("WOW2_FIXED_SESSION_KEY") == "1":
         key = rigconfig.SESSION_KEY
     else:
-        # Reject a key whose halves repeat: EDE degenerates to single DES, which
-        # is exactly the weakness BD_BOOTSTRAP_KEY documents. 1 in 2^64, but it
-        # costs nothing to exclude and the failure would be silent.
         while True:
             key = secrets.token_bytes(24)
             if key[0:8] != key[8:16] and key[8:16] != key[16:24]:
@@ -2629,51 +1441,14 @@ def session_key_is_ours(username: str, key: bytes) -> bool:
     return key in ISSUED_SESSION_KEYS.get(username, ())
 
 
-# §54, and it is one decision with three doors. An LSG connection that cannot
-# show a session key we issued used to be DEGRADED to identity-by-source-address
-# rather than refused, which is the one place that model survived -- and it is a
-# hole, not a fallback, since the credential it is failing to present is the only
-# thing between a username and that username's lobby. A refused login registered
-# its key anyway, so the refusal garbled the ticket and left the clear copy of
-# the same key working. And the connect could simply be skipped, because an
-# unencrypted RPC needs no key to build.
-#
-# All three are closed: no key we issued, no lobby. `WOW2_LSG_NO_KEY_CHECK=1`
-# puts all three back at once, which is what `tools/lsgauth.py --revert` runs as
-# its negative control -- a fix nobody has watched fail is not evidence.
 LSG_NO_KEY_CHECK = os.environ.get("WOW2_LSG_NO_KEY_CHECK") == "1"
 
-# §60 -- the clear proof carries a HANDLE, and the ticket key gates the lobby.
-# The login reply carries the session key twice: inside the 3DES ticket, which
-# only the password opens, and inside the opaque proof, which goes out in
-# clear and is what the client relays at the LSG connect. §54 made the relayed
-# copy the credential, which meant the copy the password protects was the one
-# nobody needed. §60 measured which copy the CLIENT encrypts its RPCs with:
-# console 1 signed in with a random handle H in the clear proof and the real
-# key K only in the ticket, and every one of its 16 encrypted RPCs read under
-# K and none under H. So the clear copy can be an opaque handle: H -> K is
-# looked up at the connect, the connect reply and every task reply go out
-# under K, and a connection is only fully bound once its first RPC decrypts
-# under K -- which nothing can produce without having opened the ticket. The
-# password gates the lobby, and a relayed or replayed clear proof is worth
-# nothing on its own. Real consoles never send an UNENCRYPTED service RPC
-# (3461 encrypted against 0 across the 2026-09-13/15 logs), so those are
-# refused too. `WOW2_NO_PROOF_HANDLE=1` reverts to the §54 reply, for a bisect.
 PROOF_HANDLE = os.environ.get("WOW2_NO_PROOF_HANDLE") != "1"
-PROOF_HANDLES: dict[bytes, tuple[str, bytes]] = {}   # H -> (account, K)
+PROOF_HANDLES: dict[bytes, tuple[str, bytes]] = {}
 
 
 def lsg_message_readable(dec: dict, strict: bool = False) -> bool:
-    """Did the decrypt produce a message that parses -- i.e. was the key right?
-
-    A wrong 3DES key yields random bytes. The service id must be one of the
-    ten, the typed op must read, and the client pads the plaintext to the block
-    with the low byte of the SEED (measured: seed 1 -> `01 01 01`, seed 2 ->
-    `02 02 02`, seed 4 -> `04 04 04`; 169 of 169 logged plaintexts end in the
-    seed byte or 0), so the last byte says which message the padding belongs
-    to. `strict` -- used for the message that COMPLETES a bind -- also walks
-    every typed field and requires what follows the last one to be padding.
-    """
+    """Did the decrypt produce a message that parses -- i.e. was the key right?"""
     if dec["service"] not in LSG_SERVICE_NAMES or dec["op"] is None or dec["op"] > 63:
         return False
     plain = dec["plain"]
@@ -2682,7 +1457,7 @@ def lsg_message_readable(dec: dict, strict: bool = False) -> bool:
         return False
     if not strict:
         return True
-    body = plain[4:]                              # after the u32 hmac slot
+    body = plain[4:]
     try:
         r = bd.BdReader(body[1:])
         r.bitmode = True
@@ -2696,25 +1471,21 @@ def lsg_message_readable(dec: dict, strict: bool = False) -> bool:
 
 
 NO_PROFILES = os.environ.get("WOW2_NO_PROFILES") == "1"
-# Phase 44. The one BdErrorCode this server sends on purpose. 800 is not a
-# failure: it is the CREATE op's other success, and the client's own error->string
-# mapper names it (0x0898a2cc -> 0x08d37f98 "BD_PROFILE_ALREADY_EXISTS").
 BD_PROFILE_ALREADY_EXISTS = 800
-# The rest of the client's BdErrorCode table, read out of the same mapper
-# (0x0898a1e0; §65). Only the ones a handler here answers with are named; the
-# client resolves each to its name for its own log and fails the task.
-BD_EXCEPTION_IN_DB = 102            # a store the server could not write
-BD_NOT_AN_ADMIN_OR_OWNER = 311      # clan verbs, 300..313 in this build
+BD_EXCEPTION_IN_DB = 102
+BD_NOT_AN_ADMIN_OR_OWNER = 311
 BD_MEMBER_NO_PROPOSAL = 300
-BD_NO_FILE = 1000                   # storage, 1000..1002
+BD_NO_FILE = 1000
 BD_PERMISSION_DENIED = 1001
 BD_FILESIZE_LIMIT_EXCEEDED = 1002
+
+# ------------------------------------------------------------- profiles (svc 8)
+
 NO_PROFILE_EXISTS = os.environ.get("WOW2_NO_PROFILE_EXISTS") == "1"
 
 
 def profile_get(entity_hex: str, kind: str = "public") -> dict | None:
-    """One stored profile as the JSON kept it: {name, at, fields}. The rows
-    are the `profiles` table (§66 step 6; `capture/profile-db.json` before)."""
+    """One stored profile, {name, at, fields}, from the `profiles` table."""
     r = store.db().execute("SELECT name, at, fields FROM profiles WHERE entity = ? "
                            "AND kind = ?", (entity_hex, kind)).fetchone()
     if r is None:
@@ -2760,60 +1531,19 @@ def _write_field(w, t: int, v) -> bool:
     return True
 
 
-# What to serve for an account that has never uploaded one: the right SHAPE with
-# nothing in it, so the screen draws instead of staying blank. Nine fields, in
-# the order tPublicProfile::serialize (0x089894c8) writes them.
 PROFILE_EMPTY = [[bd.BD_SINT64, 0], [bd.BD_SINT64, 0], [bd.BD_SINT64, 0],
                  [bd.BD_SINT64, 0], [bd.BD_F64, 0.0], [bd.BD_F64, 0.0],
                  [bd.BD_SINT64, 0], [bd.BD_STR, ""], [bd.BD_SINT32, 0]]
 
 
 def profile_upload(dec: dict, who=None, peer_ip: str = "", create: bool = False):
-    """Profile op 4 (upload) and op 1 (create) -- both write the PUBLIC profile.
-
-    The two requests are the same nine fields because they serialise the same
-    OBJECT, not because one is a private copy of the other. Ops 1/4/5 share one
-    builder that writes `[u8 0]` and then calls a VIRTUAL serialiser on the
-    record delegate (vtable+0x14 -> ... -> the task's own vtable+0x3c), so the
-    body is whatever the concrete class emits:
-
-        net::tPublicProfile::serialize   0x089894c8   the nine fields
-        net::tPrivateProfile::serialize  0x08985a60   one i32, hard-coded 99
-
-    Which class is running is `this->0x20`, the private flag: the public ctor
-    (0x08989b0c) passes 0 for it and the private one (0x08985b18) passes 1.
-    The public path then chooses CREATE (op 1) or DOWNLOAD (op 2), and the
-    private path UPLOAD (op 5) or DOWNLOAD (op 3).
-
-    So op 1 is a CREATE, and it runs before the object is populated -- every
-    capture of it is all zeros while the op 4 a second later carries the real
-    longitude and latitude. Storing it unconditionally would blank a good
-    profile, so `create=True` only fills a record that does not exist yet.
-
-    The reply carries no ROWS either way: ops 1/4/5 collect results with a NULL
-    container (passed at 0x08986bec / 0x089889a0). But op 1's ERROR CODE is
-    load-bearing, and answering 0 to every create is what kept the whole
-    download half of the profile machine dark (Phase 44). At 0x089870c8 the
-    client reads the finished task's error code back through the lazy getter
-    at 0x08c172b0, compares it with 0x320 = 800, stores the outcome as a byte
-    at this+0x24, and branches on it: equal to 800 means DOWNLOAD, anything
-    else means UPLOAD --
-
-    and 800 is `BD_PROFILE_ALREADY_EXISTS`, which the client's own error->string
-    mapper names at 0x0898a2cc. So it is not a status to imitate, it is the
-    ordinary answer to "create this" when the thing is already there. A first
-    sign-in creates and uploads; every one after that downloads."""
-    # account_for() FIRST: `who` is the identity the server ISSUES (1, 2, ...),
-    # while every store on this rig is keyed by the CLIENT's 64-bit account id
-    # (0x975367efa4bbebed and friends). Getting that precedence backwards files
-    # the profile under an id the client will never ask for, and the download
-    # silently serves the empty placeholder forever.
+    """Profile op 4 (upload) and op 1 (create) -- both write the PUBLIC profile."""
     entity = account_for(peer_ip) or (who[1] if who else 0)
     if NO_PROFILES or not entity:
         return 0, None
     try:
         r = lsg_request_params(dec)
-        r.u8()                              # leading flags byte
+        r.u8()
         fields = bd.read_fields(r)
     except Exception as e:
         log(f"  (profile upload decode failed: {e})")
@@ -2830,11 +1560,6 @@ def profile_upload(dec: dict, who=None, peer_ip: str = "", create: bool = False)
             f"answering BD_PROFILE_ALREADY_EXISTS (800), so the client DOWNLOADS "
             f"it instead of uploading over it")
         return 0, None, BD_PROFILE_ALREADY_EXISTS
-    # Tripwire, not a guard (Phase 44). Once op 1 answers 800 the client
-    # DOWNLOADS its profile instead of uploading, so a later op 4 should carry
-    # back what we served. If it ever carries all zeros over a populated record,
-    # our op-2 row is wrong and the profile is about to be blanked -- say so
-    # rather than let the store quietly lose longitude and latitude.
     if (old and any(v for _t, v in
                     [(f[0], f[1]) for f in old.get("fields", [])])
             and not any(v for _t, v in fields)):
@@ -2849,19 +1574,10 @@ def profile_upload(dec: dict, who=None, peer_ip: str = "", create: bool = False)
 
 
 def profile_op5(dec: dict, who=None, peer_ip: str = ""):
-    """Profile op 5 -- upload the PRIVATE profile, and there is nothing in it.
-
-    `net::tPrivateProfile` is 0x28 bytes and carries no record fields at all;
-    its serialiser (0x08985a60) writes one `i32` whose value is an immediate:
-    99, hard-coded, read from no object field. So the
-    99 is not a count or a limit or a version, and there is nothing here to
-    store. The reply is the bare one ops 1/4/5 all take (null result container).
-
-    Kept as a handler purely so the value is recorded and a 99 that ever becomes
-    something else is visible rather than silently ignored."""
+    """Profile op 5 -- upload the PRIVATE profile, and there is nothing in it."""
     try:
         r = lsg_request_params(dec)
-        r.u8()                          # the [u8 0] lead-in, constant on every RPC
+        r.u8()
         fields = bd.read_fields(r)
     except Exception as e:
         log(f"  (profile op5 decode failed: {e})")
@@ -2874,40 +1590,13 @@ def profile_op5(dec: dict, who=None, peer_ip: str = ""):
 
 
 def profile_read_private(dec: dict, who=None, peer_ip: str = ""):
-    """Profile op 3 -- download MY private profile. It takes NO parameters.
-
-    COLD: never fired once, on any console, in any capture. Served anyway
-    because its whole shape is known from the client's own code and costs
-    nothing, so if the gate below ever opens the answer is already there.
-
-    The request is the `[u8 0]` lead-in and nothing else (0x08c23f88 reads
-    nothing but its own object). The reply deserialiser is
-    `net::tPrivateProfile`'s, at vtable+0x44 =
-    0x08985ab0, and it reads `[u64][i32]` and **discards both** before returning
-    0 -- there is no private record to carry, the same way op 5 has nothing to
-    upload.
-
-    WHY IT NEVER FIRED, and it was our doing. The profile step machine picks
-    download-vs-upload from `this->0x24`, zero from the base ctor (0x08985f04)
-    and written in exactly one place -- the op-1 reply handler, which sets it to
-    `(taskError != 800)` and branches on it at once (0x089870c8..0x089870d8).
-    The private step then copies that flag off the public profile (0x0898d380),
-    which is why ONE error code decides both.
-
-    800 is `BD_PROFILE_ALREADY_EXISTS`. This server answered every create with
-    err=0 ("made you a new one"), so every console took the UPLOAD branch on
-    both profiles -- exactly what the request census showed, ops 1/4/5 at every
-    sign-in and 2/3 never. `profile_upload()` answers 800 once a record exists.
-    """
+    """Profile op 3 -- download MY private profile. It takes NO parameters."""
     lsg_request_noargs(dec, "profile op3")
     entity = account_for(peer_ip) or (who[1] if who else 0)
     log(f"  profile op3 (read private) for 0x{entity:016x} -- the client"
         f" discards both fields, so this is a formality")
 
     def emit(w):
-        # NO count: the same single-result arm op 2 uses. Both fields are read
-        # and thrown away by 0x08985ab0, so the values cannot matter -- but 0 is
-        # this client's "no id yet" sentinel elsewhere, so do not send one.
         w.u64(entity)
         w.i32(99)
     return None, emit
@@ -2919,7 +1608,7 @@ def profile_read_public(dec: dict, who=None, peer_ip: str = ""):
         return 0, None
     try:
         r = lsg_request_params(dec)
-        r.u8()                              # leading flags byte
+        r.u8()
         target = r.u64()
     except Exception as e:
         log(f"  (profile read decode failed: {e})")
@@ -2928,17 +1617,12 @@ def profile_read_public(dec: dict, who=None, peer_ip: str = ""):
     fields = rec["fields"] if rec else [list(f) for f in PROFILE_EMPTY]
     name = (rec or {}).get("name") or name_of(target)
     if not rec:
-        # Nothing stored: at least put the player's name in the one displayable
-        # field, so the screen has something on it rather than nothing.
         for f in fields:
             if f[0] == bd.BD_STR:
                 f[1] = name
                 break
 
     def emit(w):
-        # NO count here: service 8's reply arm hands the deserializer a hard-coded
-        # 1 (0x08c242a4), so a [u32 numResults] would land where the row's first
-        # field belongs -- the same trap as Teams op 1 and Storage op 5.
         w.u64(target)
         for t, v in fields:
             if not _write_field(w, int(t), v):
@@ -2949,12 +1633,6 @@ def profile_read_public(dec: dict, who=None, peer_ip: str = ""):
         f"{len(fields)} fields")
     return None, emit
 
-
-# The social store: the `names`, `friends`, `friend_invites`, `blocks` and
-# `messages` tables of the SQLite store (§66 step 4; `capture/friends-db.json`
-# before that, imported once at the first start). Entities are the 16-hex-digit
-# strings the JSON used, so a row reads the same in `sqlite3` as it did in the
-# file. Every handler's writes go inside one `store.tx()`.
 
 def _hx(entity) -> str:
     return entity if isinstance(entity, str) else f"{int(entity):016x}"
@@ -2968,13 +1646,7 @@ def name_of(entity) -> str:
 
 
 def blocked_by(entity: int) -> set:
-    """The accounts `entity` has blocked (Friends op 6 flag=1) -- Phase 28.
-
-    The CLIENT does not enforce a block: a blocked gamer's buddy invite still
-    arrives, still renders under View messages (with a red no-entry icon beside
-    it) and still offers Accept. So if a block is to mean anything it has to be
-    enforced here, which is presumably what the real backend did.
-    """
+    """The accounts `entity` has blocked (Friends op 6 flag=1)."""
     return {r["who_e"] for r in store.db().execute(
         "SELECT who_e FROM blocks WHERE by_e = ?", (_hx(entity),))}
 
@@ -2995,32 +1667,7 @@ def _count(table: str) -> int:
 
 
 def invite_blocked(target: int, sender: int, what: str) -> bool:
-    """Has `target` blocked `sender`? Then drop the invite and say nothing -- F19.
-
-    THE THREE UNSOLICITED PUSHES, and only those: a buddy invite (Friends
-    op 1), a match invite (op 8) and a clan invite (Teams op 6). It deliberately
-    does NOT cover the replies -- accept, decline, revoke, cancel -- which are
-    answers to something the recipient started. Blocking somebody after
-    inviting them must not swallow their decline.
-
-    The client does not enforce a block in this direction at all: a blocked
-    gamer's invite arrives, renders under `View messages` with a red no-entry
-    icon beside it, and still offers Accept. So a block only means anything if
-    it is enforced here.
-
-    THE SENDER IS TOLD NOTHING and the reply is the ordinary `err=0`. Note that
-    silence is NOT forced by the text table, the way `ROADMAP.md` had it: the
-    game ships `Net.Err.Binvite` ("Unable to send buddy invite to %GAMER%") and
-    the `Minvite`/`Cinvite` pair beside it, so a refusal is renderable. It is
-    still the wrong answer. Every other invite succeeds, so one that fails is
-    an enumeration oracle for exactly the fact a block exists to hide -- and
-    with no reason in the string, it would be indistinguishable from a broken
-    server anyway.
-
-    `WOW2_NO_BLOCK_GUARD=1` reverts all three. `WOW2_NO_FRIENDS_FIX=1` still
-    reverts the buddy one on its own, because that guard is part of Phase 28's
-    op remap and its bisect predates this one.
-    """
+    """Has `target` blocked `sender`? Then drop the invite and say nothing -- F19."""
     if os.environ.get("WOW2_NO_BLOCK_GUARD") == "1":
         return False
     if f"{sender:016x}" not in blocked_by(target):
@@ -3055,9 +1702,9 @@ def friends_write_row(w, entity: int, name: str, kind: str) -> None:
     w.u64(entity)
     w.str_(name or f"{entity:x}"[:8], FRIEND_NAME_MAX)
     if kind == "u8":
-        w.u8(1)                       # 1 = on-line (net::tBuddy's "now on-line")
+        w.u8(1)
     elif kind == "bool":
-        w.bool_(True)                 # a 1-BIT field, tag + 1 bit
+        w.bool_(True)
 
 
 def friends_list_result(op: int, dec: dict, who=None, peer_ip: str = ""):
@@ -3085,30 +1732,6 @@ def friends_list_result(op: int, dec: dict, who=None, peer_ip: str = ""):
                 for r in conn.execute(
                     "SELECT b.who_e, n.name FROM blocks b LEFT JOIN names n "
                     "ON n.entity = b.who_e WHERE b.by_e = ? ORDER BY b.seq", (mine,))]
-    # CAP THE LIST, because the client does not and it does not survive a long
-    # one. Measured (TESTPLAN F18): 32 rows fine; **128 rows sign in and then
-    # crash on opening the Buddy list** (`CPU Jump to 00000007`, RA
-    # 0x08aee61c); **401 rows crash the sign-in itself** (`CPU Jump to
-    # da9abc20`, RA 0x089b997c), dying right after `teams op24` where
-    # `friends op19` should follow. Both are the same signature -- a C++ object
-    # whose vtable pointer is garbage, reached through a `jalr` two
-    # instructions after the vtable load -- so it is heap corruption, not a bad
-    # index, and there is nothing the client can be told that will make it
-    # cope.
-    #
-    # Storage op 7/8 are windowed by the REQUEST (`start`, `count`, hard-coded
-    # immediates at their call sites). These three have no window to honour:
-    # `Friends op 5` is `lsg_request_noargs`. So the cap has to be ours, and it
-    # has to be silent to the client and loud in the log.
-    #
-    # 64 is deliberately conservative -- between the 32 that works and the 128
-    # that does not. THE REAL LIMIT HAS NOT BEEN BISECTED; 48/64/96 is the next
-    # experiment, and each point costs a PPSSPP relaunch because the crash
-    # takes the emulator with it. `WOW2_FRIEND_LIMIT=0` turns the cap off to
-    # reproduce the crash on purpose.
-    # Spend the shared budget BUDDIES FIRST: an op-19 proposal is transient and
-    # can be re-sent, a dropped buddy just looks like the list is wrong. op 7
-    # draws a different panel and gets its own allowance.
     env = os.environ.get("WOW2_FRIEND_LIMIT")
     budget = int(env) if env is not None else FRIEND_LIST_BUDGET
     dropped = 0
@@ -3117,7 +1740,7 @@ def friends_list_result(op: int, dec: dict, who=None, peer_ip: str = ""):
             limit = FRIEND_BLOCK_LIMIT if env is None else budget
         elif op == 5:
             limit = budget
-        else:                                   # op 19, whatever op 5 left
+        else:
             limit = max(0, budget - len(friends_of(me)))
         if len(rows) > limit:
             dropped = len(rows) - limit
@@ -3132,16 +1755,11 @@ def friends_list_result(op: int, dec: dict, who=None, peer_ip: str = ""):
             f"LEAVES the panel, so rendering is not survival. There is no window "
             f"field to ask for less. WOW2_FRIEND_LIMIT=0 disables the cap.")
 
-    # Two counts, like bdStats: the reply reader's arm (0x08c18dac) reads
-    # [u32 numResults] out of the TaskReply envelope, and then the result
-    # CONTAINER reads its own [u32 totalEntries] before the rows -- the same
-    # shape as bdLeaderBoardResult (0x08ce5d98), whose missing header was what
-    # ended the Phase 11 sign-in chain. WOW2_FRIEND_NO_TOTAL=1 drops it.
     def emit(w):
         if os.environ.get("WOW2_FRIEND_TOTAL") == "1":
-            w.u32(len(rows))          # a totalEntries header -- see the note above
+            w.u32(len(rows))
         if os.environ.get("WOW2_FRIEND_COUNT_ONLY") == "1":
-            return                    # bisect: announce N, send no rows at all
+            return
         for entity, rname in rows:
             friends_write_row(w, entity, rname, kind)
     return len(rows), emit
@@ -3153,7 +1771,7 @@ def friends_add(dec: dict, who=None, peer_ip: str = ""):
     name = (who or (rigconfig.USERNAME, 0))[0]
     try:
         r = lsg_request_params(dec)
-        r.u8()                                       # always 0
+        r.u8()
         target = r.u64()
     except Exception as e:
         log(f"  (friends op1 decode failed: {e})")
@@ -3161,12 +1779,6 @@ def friends_add(dec: dict, who=None, peer_ip: str = ""):
     friends_note_name(me, name)
     mine, theirs = f"{me:016x}", f"{target:016x}"
     if target == me:
-        # F12. `Add buddy by name` with your own name is refused by nobody: the
-        # client sends it, renders the success ack, files the row and offers
-        # Accept -- and accepting creates a self-buddy that cannot be removed,
-        # because the gamer menu for yourself has neither Remove nor Block. The
-        # id is derived on the console from the name with no lookup RPC, so the
-        # server is the only place this can be stopped.
         log(f"  friends op1 (INVITE): {name} 0x{mine} invited ITSELF -- REFUSED "
             f"(a self-buddy has no verb that can undo it)")
         return 0, None
@@ -3176,8 +1788,6 @@ def friends_add(dec: dict, who=None, peer_ip: str = ""):
     if invite_pending(mine, theirs):
         log(f"  friends op1 (INVITE): {name} -> 0x{target:016x} (already pending)")
         return 0, None
-    # PHASE 28, extended to the other two invites in F19: honour the target's
-    # block list. See invite_blocked() for what it covers and why it is silent.
     if (os.environ.get("WOW2_NO_FRIENDS_FIX") != "1"
             and invite_blocked(target, me, "friends op1 (INVITE)")):
         return 0, None
@@ -3188,49 +1798,18 @@ def friends_add(dec: dict, who=None, peer_ip: str = ""):
     log(f"  friends op1 (INVITE): {name} 0x{me:016x} -> 0x{target:016x}"
         f" ({name_of(theirs) or 'unknown account'}) -- "
         f"{_count('friend_invites')} proposal(s) pending")
-    # Friends op 19 turned out to be the SENDER's own list ("Cancel buddy
-    # invite"). The TARGET's copy is a lobby MESSAGE: it shows up under
-    # `View messages` as "Buddy invite from <name>", and cross on it offers
-    # Accept / Decline. File it, then deliver it live if they are signed in.
     mid = message_add(target, PUSH_BUDDY_INVITE, me, name)
     push_to_account(target, PUSH_BUDDY_INVITE, me, name, mid)
     return 0, None
 
 
 def friends_match_invite(dec: dict, who=None, peer_ip: str = ""):
-    """Friends op 8 -- invite a buddy INTO THE LOBBY YOU ARE HOSTING.
-
-    PHASE 25. This was a cold gap until the UI that fires it was found, and the
-    UI is not where anyone looked: the row only exists **while you are hosting**.
-    Host a game, press `start` in the lobby to open the online menu, pick a buddy
-    off the Buddy list, and the gamer menu grows an invite row. From the
-    Infrastructure menu, with no lobby open, that row is simply absent -- which
-    is why five phases of walking the online menu never produced this opcode.
-
-    Request, decoded off the wire with `bddump.py --log --svc 9 --op 8`:
-
-        [u8 op=8][u8 0][u64 target][blob 8B session id]
-
-    -- and note that `lsg_request_params()` has ALREADY eaten the op id, so the
-    handler reads three fields, not four. Reading the op again costs you the
-    whole message: the blob runs off the end and the decode fails with
-    "want 1 at 35, have 0", which looks like a truncated request and is not.
-
-    The blob is the id the server assigned in the `Sessions op 1` create reply,
-    little-endian (`01 57 00 ..` for session 0x5701), so the client is handing
-    back exactly what we gave the host -- it is not inventing one.
-
-    Nothing reads results (bare `err=0, 0 results` is correct). The DELIVERY is
-    the whole job, and it is the same two-transport channel as a buddy invite:
-    file a message for the target and push it live. The push type is 5,
-    "received match invite" (net::tBuddy's table at 0x08d36be8), whose class
-    carries the session id -- see write_push_body().
-    """
+    """Friends op 8 -- invite a buddy INTO THE LOBBY YOU ARE HOSTING."""
     me = account_for(peer_ip)
     name = (who or (rigconfig.USERNAME, 0))[0]
     try:
         r = lsg_request_params(dec)
-        r.u8()                                       # always 0
+        r.u8()
         target = r.u64()
         session_id = r.blob()
     except Exception as e:
@@ -3252,26 +1831,12 @@ def friends_match_invite(dec: dict, who=None, peer_ip: str = ""):
 
 
 def friends_match_decline(dec: dict, who=None, peer_ip: str = ""):
-    """Friends op 10 -- `[u8 0][u64 inviter]`. DECLINE a match invite.
-
-    PHASE 28, the last cold Friends opcode. Measured at 16:38:11 on console 8:
-    View messages -> open "Match invite from player7" (which fires
-    `Sessions op 4`) -> **Decline match invite** -> confirm. The id is the
-    INVITER's, and `Messaging op 4` follows 33 ms later to delete the message --
-    the same two-message shape as `op 9` (accept) in Phase 25.
-
-    Nothing reads results; the bare `err=0, 0 results` was accepted live and the
-    console printed "Declined match invite." The whole job is telling the
-    inviter, and `net::tBuddy`'s table names the push: type 7, "received match
-    invite reject", whose string is `%GAMER% has declined your match invite`.
-    A rejection is transient -- it is not filed in the mailbox, because a match
-    that has since ended must not raise it at the next sign-in.
-    """
+    """Friends op 10 -- `[u8 0][u64 inviter]`. DECLINE a match invite."""
     me = account_for(peer_ip)
     name = (who or (rigconfig.USERNAME, 0))[0]
     try:
         r = lsg_request_params(dec)
-        r.u8()                              # the [u8 0] lead-in, constant on every RPC
+        r.u8()
         inviter = r.u64()
     except Exception as e:
         log(f"  (friends op10 decode failed: {e})")
@@ -3286,27 +1851,12 @@ def friends_match_decline(dec: dict, who=None, peer_ip: str = ""):
 
 
 def friends_match_accept(dec: dict, who=None, peer_ip: str = ""):
-    """Friends op 9 -- `[u8 0][u64 inviter]`. ACCEPT a match invite.
-
-    The mirror of op 10, and it had no dispatch branch at all: the request fell
-    through to the bare reply, which is the RIGHT reply -- the client goes
-    straight on to an ordinary peer join and needs nothing back -- but meant the
-    two fields were never read. `blindspots.py` is the reason that matters:
-    `UNREAD 0` is a preflight invariant precisely so that "we do not read this"
-    is a decision somebody made, not a branch nobody wrote. Reading and
-    discarding is a different statement from not reading.
-
-    The push is the other half. Op 10 tells the inviter its invite was declined
-    (type 7); nothing told it the invite was ACCEPTED, so the inviter's screen
-    learned it only when the peer turned up. Type 6 sits unused right beside the
-    7, and `PUSH_MATCH_ACCEPTED` is what it is for. It is a NOTIFICATION -- so
-    `notify_id()`, pushed and not filed, exactly as op 10 does.
-    """
+    """Friends op 9 -- `[u8 0][u64 inviter]`. ACCEPT a match invite."""
     me = account_for(peer_ip)
     name = (who or (rigconfig.USERNAME, 0))[0]
     try:
         r = lsg_request_params(dec)
-        r.u8()                              # the [u8 0] lead-in, constant on every RPC
+        r.u8()
         inviter = r.u64()
     except Exception as e:
         log(f"  (friends op9 decode failed: {e})")
@@ -3321,38 +1871,12 @@ def friends_match_accept(dec: dict, who=None, peer_ip: str = ""):
 
 
 def friends_block(dec: dict, who=None, peer_ip: str = ""):
-    """Friends op 6 -- `[u8 0][u64 entity][u8 flag]`. BLOCK (1) / UNBLOCK (0).
-
-    PHASE 28, measured on consoles 7 and 8. This op used to be served as
-    "accept (1) / reject (0) a buddy proposal", which was a guess from Phase 22
-    and is wrong. It is `net::tEnemy` Create/Revoke -- the gamer menu's
-    **Block gamer** row and the blocked gamer menu's **Unblock player** row:
-
-        16:10:31  op 6 flag=1  -> "player8 has been blocked."
-        16:15:38  op 6 flag=0  -> "player8 has been unblocked."
-
-    The old reading was not merely idle: on 2026-09-11 an *unblock* landed while
-    an unrelated buddy proposal from that same gamer was pending, and the
-    handler deleted the proposal and pushed type 3 to the other console, which
-    duly displayed "player7 declined your buddy invite". A wrong op map is a
-    live bug, not a documentation error.
-
-    Blocking a gamer you have a relationship with is TWO messages, one second
-    apart, and the second one depends on what the relationship was:
-
-        buddy            op 6 flag=1  then  op 4   (revoke the buddy)
-        outgoing invite  op 6 flag=1  then  op 13  (cancel the proposal)
-
-    -- so op 6 itself only ever moves the block list. Nothing reads results
-    (the reply reader's table at 0x08d6a208 is indexed by opID-5, so op 4 is
-    below the table and ops 6/13 land on the bare exit at 0x08c18e8c); the
-    generic `err=0, 0 results` is correct and was accepted live on both.
-    """
+    """Friends op 6 -- `[u8 0][u64 entity][u8 flag]`. BLOCK (1) / UNBLOCK (0)."""
     me = account_for(peer_ip)
     name = (who or (rigconfig.USERNAME, 0))[0]
     try:
         r = lsg_request_params(dec)
-        r.u8()                              # the [u8 0] lead-in, constant on every RPC
+        r.u8()
         target = r.u64()
         flag = r.u8()
     except Exception as e:
@@ -3413,30 +1937,12 @@ def _drop_pair(conn, a: str, b: str) -> int:
 
 
 def friends_revoke(dec: dict, who=None, peer_ip: str = ""):
-    """Friends op 4 -- `[u8 0][u64 entity]`. REVOKE: the relationship, from my side.
-
-    PHASE 28. Cold since Phase 23 and filed in `gapmap.py` as "cancel outgoing
-    proposal? (inferred)", which is wrong -- cancelling is op 13. Op 4 is the
-    one verb behind THREE on-screen actions, all of which mean "there is
-    nothing between us, and I am the one saying so":
-
-        gamer menu -> Remove buddy                      16:26:10
-        View messages -> Decline buddy invite           16:23:36  (+ Messaging op 4)
-        gamer menu -> Block gamer, when they were a buddy  16:10:32
-
-    The id is the OTHER account in every case (the buddy, or the inviter). It
-    matches `net::tBuddy`'s message id 4, "buddy revoked". Reads no results.
-
-    Note this is the only Friends verb the client fires with an id it MANGLES:
-    the row served as 0x00000000cafe0009 came back as 0x906c63bc6158f5fc, the
-    same corruption Phase 26 saw in `Teams op 6`. Real console ids round-trip
-    exactly, so the id here is trustworthy for real accounts only.
-    """
+    """Friends op 4 -- `[u8 0][u64 entity]`. REVOKE: the relationship, from my side."""
     me = account_for(peer_ip)
     name = (who or (rigconfig.USERNAME, 0))[0]
     try:
         r = lsg_request_params(dec)
-        r.u8()                              # the [u8 0] lead-in, constant on every RPC
+        r.u8()
         target = r.u64()
     except Exception as e:
         log(f"  (friends op4 decode failed: {e})")
@@ -3447,9 +1953,6 @@ def friends_revoke(dec: dict, who=None, peer_ip: str = ""):
         incoming = invite_pending(theirs, mine)
         was_buddy = _drop_pair(conn, mine, theirs) > 0
         _drop_invites_between(conn, mine, theirs)
-        # Declining leaves the invite MESSAGE behind unless we drop it too. The
-        # client sends its own `Messaging op 4` for the copy it can see, so this
-        # only matters for a target that was offline when the invite was filed.
         conn.execute("DELETE FROM messages WHERE to_e = ? AND from_e = ? AND type = ?",
                      (mine, theirs, PUSH_BUDDY_INVITE))
     what = "DECLINED the invite from" if incoming else (
@@ -3457,13 +1960,6 @@ def friends_revoke(dec: dict, who=None, peer_ip: str = ""):
     log(f"  friends op4 (REVOKE): {name} {what} 0x{target:016x} "
         f"({name_of(theirs) or 'unknown account'}) -- "
         f"{_count('friends')} buddy pair(s), {_count('friend_invites')} proposal(s)")
-    # Tell the other side. "A decline is worth keeping in their mailbox because
-    # they may be offline" was the reasoning here, and it is wrong: type 3 is a
-    # NOTIFICATION, the client deletes it when it handles it, and a filed one is
-    # re-delivered AND APPLIED at every sign-in -- which is §49.16's empty Buddy
-    # list. Wanting the sender to see it while offline does not make it a
-    # mailbox item; it makes it a message the client cannot file, and the honest
-    # answer is that it is lost. Same bug as friends_answer() had.
     if incoming:
         push_to_account(target, PUSH_BUDDY_REJECTED, me, name, notify_id())
     elif was_buddy:
@@ -3472,22 +1968,12 @@ def friends_revoke(dec: dict, who=None, peer_ip: str = ""):
 
 
 def friends_remove(dec: dict, who=None, peer_ip: str = ""):
-    """Friends op 13 -- `[u8 0][u64 entity]`. CANCEL MY OUTGOING PROPOSAL.
-
-    PHASE 28 pins what this is. It is the gamer menu's **Cancel buddy invite**
-    row -- the row that replaces "Send buddy invite" for as long as a proposal
-    of yours is outstanding, and the row `Friends op 19` exists to restore
-    across a sign-in. Measured at 16:20:13 (cancel from the menu) and again at
-    16:28:45, one second after an `op 6` block of a gamer with a proposal
-    pending. It is NOT the buddy-removal verb: that is op 4.
-
-    Reads no results.
-    """
+    """Friends op 13 -- `[u8 0][u64 entity]`. CANCEL MY OUTGOING PROPOSAL."""
     me = account_for(peer_ip)
     name = (who or (rigconfig.USERNAME, 0))[0]
     try:
         r = lsg_request_params(dec)
-        r.u8()                              # the [u8 0] lead-in, constant on every RPC
+        r.u8()
         target = r.u64()
     except Exception as e:
         log(f"  (friends op13 decode failed: {e})")
@@ -3500,13 +1986,8 @@ def friends_remove(dec: dict, who=None, peer_ip: str = ""):
             _drop_pair(conn, mine, theirs)
             outgoing = _drop_invites_between(conn, mine, theirs)
         else:
-            # Only the proposal I sent -- op 13 never means "drop a buddy" (op 4 does),
-            # and dropping one here would silently delete a friendship on a console
-            # that only cancelled an invite.
             outgoing = conn.execute("DELETE FROM friend_invites WHERE from_e = ? AND to_e = ?",
                                     (mine, theirs)).rowcount
-            # Withdraw the copy sitting in their mailbox, so a cancelled invite does
-            # not reappear at their next sign-in.
             conn.execute("DELETE FROM messages WHERE to_e = ? AND from_e = ? AND type = ?",
                          (theirs, mine, PUSH_BUDDY_INVITE))
     log(f"  friends op13 (CANCEL INVITE): {name} 0x{me:016x} -> 0x{target:016x} "
@@ -3522,34 +2003,20 @@ def friends_remove(dec: dict, who=None, peer_ip: str = ""):
 def _next_msg(conn) -> int:
     """Take the next message id. Inside the caller's transaction, so two
     handlers cannot draw the same number; `meta.next_msg` is the counter the
-    JSON store kept, and it serves notifications too (see notify_id)."""
+    JSON store kept, and it serves notifications too (see notify_id).
+    """
     mid = int(store.meta_get(conn, "next_msg", "1"))
     store.meta_set(conn, "next_msg", str(mid + 1))
     return mid
 
 
-# The only message types the client FILES. Everything else deletes itself when
-# it is handled, so filing it re-delivers it at every sign-in for ever -- and a
-# filed notification is not merely re-delivered, it is APPLIED: three stale rows
-# (3, 3, 2) drew an empty Buddy list while the server log said in the same
-# second that it had served the row. See §49.16, and P0.14 / F17.
-MAILBOX_TYPES = (1, 5, 13)          # buddy invite, match invite, clan invite
+MAILBOX_TYPES = (1, 5, 13)    # the only types the client files; a filed notification is re-applied at every sign-in
 
 
 def message_add(to_entity: int, type_id: int, sender: int, sender_name: str,
                 session_id: bytes = b"", clan_name: str = "") -> int:
-    """Store one lobby message for an account. Returns its id.
-
-    The mailbox is what makes an invite survive: a live push is delivered once,
-    but `bdMessaging op 1` is re-read at every sign-in, and both carry the same
-    bytes (write_push_body). Without this an invite sent while the target is
-    offline would vanish.
-    """
+    """Store one lobby message for an account. Returns its id."""
     if type_id not in MAILBOX_TYPES:
-        # Refuse, loudly. Two call sites filed types 2 and 3 and it took until
-        # the test suite recreated §49.16 from ten minutes of ordinary buddy
-        # traffic to notice. A push with notify_id() is what a notification
-        # wants; nothing should be able to file one again by accident.
         log(f"  !!!! refusing to FILE a type-{type_id} message to "
             f"0x{to_entity:016x}: only {MAILBOX_TYPES} are mailbox items, and a "
             f"filed notification is re-delivered AND APPLIED at every sign-in "
@@ -3565,44 +2032,19 @@ def message_add(to_entity: int, type_id: int, sender: int, sender_name: str,
 
 
 def notify_id() -> int:
-    """An id for a push that is NOT filed. Unique, non-zero, nothing stored.
-
-    PHASE 45 -- `write_push_body` puts this value in BOTH `+0x10` (the id
-    `Messaging op 4` deletes by) and `+0x18`, which the super-base calls the
-    DEDUP key, and five Friends pushes were passing 0 for both. Two of them in
-    one session are therefore the same message as far as the client's identity
-    fields are concerned.
-
-    `clan_notify` had already solved this for its six notifications: take the
-    mailbox counter, store nothing. A `Messaging op 4` for such an id finds
-    nothing and says so, which is the correct outcome and not a leak -- the
-    client deletes what it has consumed either way, and the six clan types have
-    been measured working like that since Phase 40.
-
-    The alternative -- a separate counter -- would let a notification id collide
-    with a REAL mailbox id, and then one `Messaging op 4` would delete somebody's
-    stored invite. That is the whole reason this shares `next_msg`.
-    """
+    """An id for a push that is NOT filed. Unique, non-zero, nothing stored."""
     with store.tx() as conn:
         return _next_msg(conn)
 
 
-# The six clan NOTIFICATIONS, from the client's own message dispatcher
-# (0x08990564, `type - 13`). These are not mailbox items and must never be
-# filed: a notification DELETES ITSELF when it is handled (the console resolves
-# the clan, re-reads the roster, then fires `Messaging op 4`), which is exactly
-# the difference between the two kinds -- "a message that survives being read is
-# a mailbox item; one that deletes itself is a notification". Filing one would
-# re-deliver it at every sign-in forever, and a message the client cannot make
-# sense of is how an account gets bricked.
-CLAN_MSG_CACCEPT = 14          # the INVITER's copy: the invite was accepted
-CLAN_MSG_CREJECT = 15          # the INVITER's copy: the invite was declined
-CLAN_MSG_CLEFT = 16            # "%GAMER% has left the clan"
-CLAN_MSG_CADMIN = 17           # "You are now a clan %CLAN% administrator"
-CLAN_MSG_CKICKED = 18          # "You have been kicked from the clan %CLAN%"
-CLAN_MSG_CDISBAND = 26         # "The clan %CLAN% has been disbanded"
-CLAN_MSG_COWNER = 28           # "You are now the clan %CLAN% owner"
-CLAN_MSG_CORDINARY = 39        # "You are no longer a clan %CLAN% administrator"
+CLAN_MSG_CACCEPT = 14
+CLAN_MSG_CREJECT = 15
+CLAN_MSG_CLEFT = 16
+CLAN_MSG_CADMIN = 17
+CLAN_MSG_CKICKED = 18
+CLAN_MSG_CDISBAND = 26
+CLAN_MSG_COWNER = 28
+CLAN_MSG_CORDINARY = 39
 
 
 def account_name(entity: int) -> str:
@@ -3616,31 +2058,7 @@ def account_name(entity: int) -> str:
 def clan_notify(to_entity: int, type_id: int, tid: int, clan_name: str,
                 actor: int, actor_name: str,
                 target: int = 0, target_name: str = "") -> None:
-    """Tell one account that something happened to its clan. Push only.
-
-    This is the half of every clan verb that the REQUEST does not do. Without
-    it a promoted member keeps a stale roster and its own gamer menu goes on
-    offering the verbs an ordinary member should not have, until it signs in
-    again -- the client has no polling anywhere in the clan surface.
-
-    **Name the gamer the notification is ABOUT in `target`.** Type 14 proved the
-    mechanism: a clan push is not only a prompt to re-read, the client can apply
-    it to its cached member list directly -- pushing 14 to the inviter made the
-    new member appear in `View clan` with no `Teams op 21` and no re-sign-in.
-    The corollary is that a notification whose subject is missing has nothing to
-    apply, which is the most likely reason `Ckicked` did nothing: the tail was
-    left empty, so it said "remove account 0".
-
-    The id is taken from the mailbox counter but nothing is stored, so a
-    `Messaging op 4` for it finds nothing and says so. That is the correct
-    outcome, not a leak: the client deletes what it has consumed either way.
-
-    `WOW2_NO_CLAN_NOTIFY=1` turns all of these off. Worth having because the
-    tail layout is only proven for the 0x100-byte class (types 17/18/28/39,
-    Phase 32); 16 and 26 fall to the plain eight-field base B on the strength of
-    the registry's malloc sizes alone, and a wrong shape drops the receiver's
-    LSG connection. Nothing is persisted, so a re-login is the whole recovery.
-    """
+    """Tell one account that something happened to its clan. Push only."""
     if os.environ.get("WOW2_NO_CLAN_NOTIFY") == "1":
         log(f"  (clan notify type {type_id} suppressed by WOW2_NO_CLAN_NOTIFY)")
         return
@@ -3657,7 +2075,8 @@ def clan_notify(to_entity: int, type_id: int, tid: int, clan_name: str,
 
 def messages_for(entity: int, start: int = 0, count: int | None = None) -> list:
     """This account's mailbox rows, oldest first, in the shape the JSON kept:
-    {id, to, type, from, from_name, session, clan, at}."""
+    {id, to, type, from, from_name, session, clan, at}.
+    """
     sql = "SELECT * FROM messages WHERE to_e = ? ORDER BY id"
     args: list = [f"{entity:016x}"]
     if count is not None:
@@ -3670,24 +2089,15 @@ def messages_for(entity: int, start: int = 0, count: int | None = None) -> list:
 
 
 def messages_result(dec: dict, who=None, peer_ip: str = ""):
-    """bdMessaging op 1 -- download the inbox.
-
-    Request  [u8 0][u32 start][u32 count][bool][bool]   (the client sends 0, 25)
-    Reply    [u32 numResults] then one write_push_body per message.
-    The reply reader is 0x08c1ca90; ops 1/2/5 read a count, op 4 reads nothing.
-    """
+    """bdMessaging op 1 -- download the inbox."""
     me = account_for(peer_ip)
     name = (who or (rigconfig.USERNAME, 0))[0]
     start, count = 0, 25
     try:
         r = lsg_request_params(dec)
-        r.u8()                              # the [u8 0] lead-in, constant on every RPC
+        r.u8()
         start = r.u32()
         count = r.u32()
-        # Two trailing bools, both hard-coded FALSE at this RPC's single call
-        # site (the two zero arguments at 0x0898d7dc / 0x0898d7e4), so they
-        # cannot vary and what they select is unknown. Tripwire, not a
-        # feature: if either is ever true, that is new information.
         flags = [v for t, v in bd.read_fields(r) if t == bd.BD_BOOL]
         if any(flags):
             log(f"  *** messaging op1 flags are not both false: {flags}")
@@ -3699,9 +2109,6 @@ def messages_result(dec: dict, who=None, peer_ip: str = ""):
            if rows else ""))
 
     def emit(w):
-        # NO count here: build_lsg_taskreply_encrypted already wrote the
-        # [u32 numResults] this arm reads. Writing it again would put the rows
-        # one field late -- the mistake that cost Phase 22 five sign-ins.
         for m in rows:
             to_hex = m.get("to", "0")
             write_push_body(w, int(m["type"]), int(m["id"]),
@@ -3718,7 +2125,7 @@ def messages_delete(dec: dict, who=None, peer_ip: str = ""):
     me = account_for(peer_ip)
     try:
         r = lsg_request_params(dec)
-        r.u8()                              # the [u8 0] lead-in, constant on every RPC
+        r.u8()
         mid = r.u64()
     except Exception as e:
         log(f"  (messaging op4 decode failed: {e})")
@@ -3732,19 +2139,12 @@ def messages_delete(dec: dict, who=None, peer_ip: str = ""):
 
 
 def friends_answer(dec: dict, accept: bool, who=None, peer_ip: str = ""):
-    """Friends op 2 (accept) / op 3 (decline) -- both take the SENDER's id.
-
-    Measured on the wire: pressing 'Accept buddy invite' in the message inbox
-    sends `service 9 op 2` carrying the inviter's account id, immediately
-    followed by `Messaging op 4` to delete the message. Neither reads results.
-    (An earlier reading had op 6 as accept/reject; op 6 takes (u64, u8) and is
-    something else -- it fires from the gamer menu, not from an invite.)
-    """
+    """Friends op 2 (accept) / op 3 (decline) -- both take the SENDER's id."""
     me = account_for(peer_ip)
     name = (who or (rigconfig.USERNAME, 0))[0]
     try:
         r = lsg_request_params(dec)
-        r.u8()                              # the [u8 0] lead-in, constant on every RPC
+        r.u8()
         sender = r.u64()
     except Exception as e:
         log(f"  (friends op{2 if accept else 3} decode failed: {e})")
@@ -3758,21 +2158,6 @@ def friends_answer(dec: dict, accept: bool, who=None, peer_ip: str = ""):
     log(f"  friends op{2 if accept else 3}: {name} {verb} the invite from "
         f"0x{sender:016x} ({_count('friends')} buddy pair(s))")
     kind = PUSH_BUDDY_ACCEPTED if accept else PUSH_BUDDY_REJECTED
-    # PUSH, DO NOT FILE. Types 2 and 3 are NOTIFICATIONS -- the client deletes
-    # them when it handles them -- and the rule is the one in CLAUDE.md: "a
-    # message that survives being read is a mailbox item; one that deletes
-    # itself is a notification. Filing one re-delivers it at every sign-in
-    # forever."
-    #
-    # This called `message_add()` and filed them, which is how §49.16's empty
-    # Buddy list is reached from ORDINARY USE rather than from hand-seeded data:
-    # a filed type 3 is not merely re-delivered, it is APPLIED, so the console
-    # takes "no longer your buddy" and undoes the list the server has just sent
-    # it in the same second. Testing wave 4 recreated the exact poisoned mailbox
-    # (types 3, 3, 2) in ten minutes of normal buddy traffic.
-    #
-    # `friends_respond_legacy()` had it right all along -- `notify_id()`, push
-    # only, nothing stored -- and the two paths simply disagreed.
     push_to_account(sender, kind, me, name, notify_id())
     return 0, None
 
@@ -3781,13 +2166,6 @@ TEAM_RANK_MEMBER = 0
 TEAM_RANK_ADMIN = 1
 TEAM_RANK_OWNER = 2
 
-
-# Clans live in the `teams`, `team_members` and `team_proposals` tables (§66
-# step 5; `capture/teams-db.json` before that). A handler works on the same
-# record shape the JSON held -- {name, owner, members, proposals, created,
-# ranks} -- assembled by `team_get()` and written back whole by `team_put()`
-# inside one transaction; a clan has a few dozen rows at most, so the record
-# is cheap and every rule written against the dict still holds.
 
 def team_get(key: str) -> dict | None:
     """One clan's record by id (16 hex digits), or None."""
@@ -3839,7 +2217,7 @@ def team_delete(key: str) -> None:
 
 def clan_invite_push_type() -> int:
     """The lobby-message type a clan invite is delivered as; `meta.invite_push_type`
-    (the JSON's top-level key) overrides the default, as it did before."""
+    overrides the default."""
     v = store.meta_get(store.db(), "invite_push_type")
     return int(v) if v is not None else CLAN_INVITE_PUSH_DEFAULT
 
@@ -3855,7 +2233,8 @@ def team_of(entity: int) -> tuple[int, dict] | tuple[int, None]:
 
 def proposals_to(entity: int) -> list[tuple[str, str, str, str]]:
     """(team id, clan name, inviter, inviter's name) for every clan invite
-    addressed to `entity`, oldest first."""
+    addressed to `entity`, oldest first.
+    """
     return [(r["team"], r["cname"] or "", r["from_e"],
              r["from_name"] or name_of(r["from_e"]))
             for r in store.db().execute(
@@ -3865,23 +2244,7 @@ def proposals_to(entity: int) -> list[tuple[str, str, str, str]]:
 
 
 def clan_invite_backfill(me: int, name: str) -> None:
-    """Put a mailbox row behind any clan invite that has none, at sign-in.
-
-    `Teams op 20` -- "which clans am I in" -- is the FIRST clan RPC of every
-    sign-in and it arrives about two seconds before `bdMessaging op 1`, so a
-    message filed here is delivered by this same sign-in's inbox read. Measured:
-    op 20 at 04:19:38.2, op 1 at 04:19:40.5.
-
-    THIS USED TO PUSH, AND IT SHOULD NOT. Before Phase 38 the clan invite had no
-    working message type, so a proposal could only sit in `proposals` where the
-    invited console never looked -- and the workaround was to fire a live push
-    12 s after sign-in, timed to miss the RPC chain. Now that type 13 works,
-    `teams_invite()` files a mailbox row when the invite is made and the inbox
-    delivers it whether the target was online or not. All that is left for this
-    to do is repair a store written before that, and pushing as WELL as filing
-    puts the invite in the inbox TWICE -- which is exactly what the first live
-    test showed on screen.
-    """
+    """Put a mailbox row behind any clan invite that has none, at sign-in."""
     if os.environ.get("WOW2_NO_CLAN_BACKFILL") == "1":
         return
     mine = f"{me:016x}"
@@ -3900,16 +2263,7 @@ def clan_invite_backfill(me: int, name: str) -> None:
 
 
 def teams_memberships_result(dec: dict, who=None, peer_ip: str = ""):
-    """Teams op 20 -- "the teams I belong to". Fires at EVERY sign-in.
-
-    Answering it with nothing is why a clan did not survive a sign-in: the
-    console created `wormstest`, the server stored it, and the next sign-in put
-    the Clans screen back to `Create new clan` with `View clan` greyed out.
-    net::tClanList logs "downloading memberships" / "memberships downloaded"
-    around this call (0x089c032c / 0x089c10ec).
-
-    Reply: [u32 numResults] then rows [u64 teamID][str name][u8] (0x08c279a4).
-    """
+    """Teams op 20 -- "the teams I belong to". Fires at EVERY sign-in."""
     lsg_request_noargs(dec, "teams op20")
     me = account_for(peer_ip)
     name = (who or (rigconfig.USERNAME, 0))[0]
@@ -3923,41 +2277,15 @@ def teams_memberships_result(dec: dict, who=None, peer_ip: str = ""):
     clan_invite_backfill(me, name)
 
     def emit(w):
-        # NO count here: build_lsg_taskreply_encrypted already wrote the
-        # [u32 numResults] this arm reads. Writing it again would put the rows
-        # one field late -- the mistake that cost Phase 22 five sign-ins.
         for tid, tname, owner in rows:
             w.u64(tid)
-            w.str_(tname, 63)         # 64-byte buffer, forced NUL at +0x3f
+            w.str_(tname, 63)
             w.u8(owner)
     return len(rows), emit
 
 
 def team_rank(rec: dict, member: str) -> int:
-    """The `u8` that trails a `Teams op 21` member row -- the member's ROLE.
-
-    PHASE 25, UNRESOLVED. The game's own strings prove three roles exist
-    ("Promote %GAMER% to administrator", "Demote %GAMER% to member", plus the
-    owner, who is the only one who can "Transfer ownership"), so this byte is
-    almost certainly 0 = member / 1 = administrator / 2 = owner. It had been
-    hard-coded to 0 since Phase 22, which would make even the clan's owner look
-    like a plain member to the client.
-
-    That matters because **`Send clan invite` does not appear anywhere**, and the
-    four contexts that could have hidden it are already ruled out: the row is
-    absent from the gamer menu whether the console is in a lobby or at the
-    Infrastructure menu, and whether the gamer was picked off the Buddy list or
-    the Gamer list -- with `Teams op 20` and `op 21` both confirming, in the same
-    sign-in, that this account owns `wormstest`. A role byte of 0 is the last
-    server-controlled thing left that the client could be reading as "you are
-    not an administrator, so you may not invite".
-
-    It is read from the team record so the value can be changed without touching
-    code -- the record is read per request. The client caches the roster,
-    though, so a change still needs a fresh sign-in to be seen:
-
-        UPDATE team_members SET rank = 2 WHERE entity = '<hex>';   in wow2.sqlite3
-    """
+    """The `u8` that trails a `Teams op 21` member row -- the member's ROLE."""
     ranks = rec.get("ranks") or {}
     if member in ranks:
         return int(ranks[member]) & 0xFF
@@ -3965,13 +2293,7 @@ def team_rank(rec: dict, member: str) -> int:
 
 
 def clan_admin_or_owner(rec: dict, actor: int) -> bool:
-    """May `actor` administer this clan -- invite, cancel an invite, remove?
-
-    Member AND rank: `team_rank()` answers 0 for anybody it does not know, so
-    the membership test is what keeps a non-member out. `WOW2_NO_CLAN_ADMIN_
-    CHECK=1` puts the pre-§65 invite path back (op 6 and op 25 checked only
-    that the clan existed); op 4's check predates it and is not switched.
-    """
+    """May `actor` administer this clan -- invite, cancel an invite, remove?"""
     if os.environ.get("WOW2_NO_CLAN_ADMIN_CHECK") == "1":
         return True
     mine = f"{actor:016x}"
@@ -3982,7 +2304,7 @@ def teams_members_result(dec: dict, who=None, peer_ip: str = ""):
     """Teams op 21 -- the members of one team. Row [u64][str][bool][u8] (0x08c2804c)."""
     try:
         r = lsg_request_params(dec)
-        r.u8()                              # the [u8 0] lead-in, constant on every RPC
+        r.u8()
         tid = r.u64()
     except Exception as e:
         log(f"  (teams op21 decode failed: {e})")
@@ -3997,9 +2319,6 @@ def teams_members_result(dec: dict, who=None, peer_ip: str = ""):
         f"{len(rows)} member(s)")
 
     def emit(w):
-        # NO count here: build_lsg_taskreply_encrypted already wrote the
-        # [u32 numResults] this arm reads. Writing it again would put the rows
-        # one field late -- the mistake that cost Phase 22 five sign-ins.
         for eid, mname, owner, rank in rows:
             w.u64(eid)
             w.str_(mname, 63)
@@ -4009,24 +2328,12 @@ def teams_members_result(dec: dict, who=None, peer_ip: str = ""):
 
 
 def teams_invite(dec: dict, who=None, peer_ip: str = ""):
-    """Teams op 6 -- SEND A CLAN INVITE. Cold until Phase 25.
-
-        request   [u8 0][u64 teamId][u64 target account]
-        reply     err=0, 0 results
-
-    Finding the UI took a server fix, not a menu walk: `Send clan invite` is a
-    row of the **gamer menu**, and it is hidden unless the client believes you
-    are a clan administrator. It reads that from the trailing `u8` of the
-    `Teams op 21` member row -- the ROLE -- which this server hard-coded to 0
-    from Phase 22 until Phase 25, so even the clan's owner looked like a plain
-    member. See team_rank(). With the owner's role served as 2 the row appears
-    immediately, from the Infrastructure menu, with no other change.
-    """
+    """Teams op 6: send a clan invite (administrator or owner)."""
     me = account_for(peer_ip)
     name = (who or (rigconfig.USERNAME, 0))[0]
     try:
         r = lsg_request_params(dec)
-        r.u8()                              # the [u8 0] lead-in, constant on every RPC
+        r.u8()
         tid = r.u64()
         target = r.u64()
     except Exception as e:
@@ -4039,10 +2346,6 @@ def teams_invite(dec: dict, who=None, peer_ip: str = ""):
         log(f"  teams op6 (CLAN INVITE): no such clan 0x{key} -- ignored")
         return 0, None
     if not clan_admin_or_owner(rec, me):
-        # §65. The client hides `Send clan invite` from anyone below
-        # administrator, and until now that was the only thing that did: the
-        # server checked that the clan existed and filed the proposal for
-        # whoever asked. Same gate as op 4 (remove) and op 25 (cancel).
         log(f"  teams op6 (CLAN INVITE): {name} 0x{me:016x} is not an "
             f"administrator of {rec.get('name')!r} -- REFUSED")
         return 0, None
@@ -4050,9 +2353,6 @@ def teams_invite(dec: dict, who=None, peer_ip: str = ""):
         log(f"  teams op6 (CLAN INVITE): 0x{theirs} is already in "
             f"{rec.get('name')!r}")
         return 0, None
-    # F19. Drop the WHOLE invite, not just its delivery: a proposal left on the
-    # clan record with no mailbox row beside it is the half-state that §49.13
-    # and §49.17 were both about.
     if invite_blocked(target, me, "teams op6 (CLAN INVITE)"):
         return 0, None
     props = rec.setdefault("proposals", [])
@@ -4063,12 +2363,6 @@ def teams_invite(dec: dict, who=None, peer_ip: str = ""):
     log(f"  teams op6 (CLAN INVITE): {name} invites 0x{theirs} "
         f"({name_of(theirs) or 'unknown account'}) to "
         f"{rec.get('name')!r} 0x{key} -- {len(props)} proposal(s) outstanding")
-    # `Teams op 24` is NOT the delivery path: it only fires for a console that
-    # already belongs to a clan (measured -- the invited, clanless console never
-    # sent it), so it is "proposals concerning MY clan", not "invitations to me".
-    # The invited console must therefore be told the same way a buddy or match
-    # invite tells it: a lobby message. The game has the inbox string
-    # `Clan %CLAN% invite from %GAMER%` to render it.
     ptype = clan_invite_push_type()
     if not ptype:
         log("  (clan invite filed but NOT delivered: the lobby-message layout "
@@ -4085,21 +2379,7 @@ def teams_invite(dec: dict, who=None, peer_ip: str = ""):
 
 
 def clan_invite_mail_drop(tid: int, ptype: int, recipients=None) -> int:
-    """Withdraw the mailbox rows `teams_invite` filed for clan `tid`.
-
-    An invite is TWO pieces of state -- a proposal on the clan record and a
-    lobby message in the invitee's mailbox -- and the mailbox is re-read at
-    every sign-in. Removing only the proposal leaves an invite that can still be
-    opened and accepted, which was the whole of the `Teams op 25` bug (§49.13)
-    and, until §49.17, the whole of the disband one: `del d["teams"][key]` takes
-    the proposals with it and leaves the messages pointing at a clan that no
-    longer exists. That residue was found in the wild -- a type-13 row for a
-    clan disbanded three phases earlier, still offering *Accept clan invite*.
-
-    Matched on (recipient, type, team id) rather than on the recipient alone, so
-    withdrawing one clan's invite cannot take a buddy invite or a second clan's
-    with it. `recipients` limits it further; None means every outstanding one.
-    """
+    """Withdraw the mailbox rows `teams_invite` filed for clan `tid`."""
     blob = tid.to_bytes(8, "little").hex()
     want = None if recipients is None else sorted({r for r in recipients})
     with store.tx() as conn:
@@ -4114,36 +2394,13 @@ def clan_invite_mail_drop(tid: int, ptype: int, recipients=None) -> int:
 
 
 def teams_cancel_invite(dec: dict, who=None, peer_ip: str = ""):
-    """Teams op 25 -- CANCEL a clan invite you sent. Unimplemented until 49.12.
-
-        request   [u8 0][u64 gamerId][u64 teamId]    <- the gamer FIRST
-        reply     err=0, 0 results
-
-    **The pair is the other way round from every other clan verb** -- ops 3, 4,
-    5, 26 and 27 all read (teamId, gamerId) and this one reads (gamerId,
-    teamId). Read off the builder in Phase 22 and confirmed by the request
-    census, which is also what found the hole: op 25 had no arm at all, fell
-    through to the generic bare `err=0`, and the client is satisfied by that --
-    the gamer-menu row flips back from *Cancel clan invite* to *Send clan
-    invite* whether or not the server did anything. So the screen is NOT the
-    oracle here; `capture/teams-db.json` and the invitee's next sign-in are.
-
-    Two things have to be undone, and forgetting the second one leaves the bug
-    in place with the symptom moved: the proposal on the clan record, AND the
-    mailbox row `teams_invite` filed. The inbox is re-read at every sign-in, so
-    an invite left there can still be ACCEPTED after being cancelled.
-
-    No notification is sent, and that is faithful rather than lazy: the clan
-    message family has no "your invite was cancelled" type. The client ships
-    Cinvite/Caccept/Creject/Cadmin/Cordinary/Cowner/Cleft/Ckicked/Cdisband and
-    nothing else, so an invitee already looking at the inbox keeps seeing the
-    row until they sign in again. Accepting it then finds no proposal.
-    """
+    """Teams op 25: cancel a clan invite you sent. The pair is (gamerId, teamId),
+    the reverse of every other clan verb."""
     me, name = _teams_actor(peer_ip, who)
     try:
         r = lsg_request_params(dec)
-        r.u8()                              # the [u8 0] lead-in, constant on every RPC
-        target = r.u64()                    # gamer FIRST -- see the docstring
+        r.u8()
+        target = r.u64()
         tid = r.u64()
     except Exception as e:
         log(f"  (teams op25 decode failed: {e})")
@@ -4161,9 +2418,6 @@ def teams_cancel_invite(dec: dict, who=None, peer_ip: str = ""):
     had = any(p.get("to") == theirs for p in props)
     rec["proposals"] = [p for p in props if p.get("to") != theirs]
     team_put(key, rec)
-    # Withdraw the invite from the invitee's mailbox too. Matched on all three
-    # of (to, type, team) rather than just the recipient, so cancelling one clan
-    # invite cannot take a buddy invite or a second clan's invite with it.
     ptype = clan_invite_push_type()
     pulled = clan_invite_mail_drop(tid, ptype, [theirs])
     log(f"  teams op25 (CANCEL CLAN INVITE): {name} 0x{mine} withdraws the "
@@ -4177,24 +2431,13 @@ def teams_cancel_invite(dec: dict, who=None, peer_ip: str = ""):
 
 
 def teams_answer_invite(accept: bool, dec: dict, who=None, peer_ip: str = ""):
-    """Teams op 8 (accept) / op 7 (decline) -- answer a clan invitation.
-
-    `[u8 0][u64 teamId][u64 inviter]`, the same shape as `op 6` and the same
-    convention as `Friends op 2`: the request names the OTHER party, not itself.
-    Measured on the wire the moment `Accept clan invite` was finally reachable
-    (Phase 38) -- op 8 fires, then `Messaging op 4` deletes the invite, exactly
-    as a buddy accept does.
-
-    Neither reads results: Teams op 7 and 8 are both on the dispatcher's
-    "reads nothing" arm (`0x08c29874`), so the bare `err=0, 0 results` is
-    correct and the work here is purely the server's own bookkeeping.
-    """
+    """Teams op 8 (accept) / op 7 (decline) -- answer a clan invitation."""
     me = account_for(peer_ip)
     name = (who or (rigconfig.USERNAME, 0))[0]
     verb = "ACCEPT" if accept else "DECLINE"
     try:
         r = lsg_request_params(dec)
-        r.u8()                              # the [u8 0] lead-in, constant on every RPC
+        r.u8()
         tid = r.u64()
         inviter = r.u64()
     except Exception as e:
@@ -4211,16 +2454,6 @@ def teams_answer_invite(accept: bool, dec: dict, who=None, peer_ip: str = ""):
     prop = next((p for p in props if p.get("to") == mine), None)
     had = prop is not None
     if accept and not had:
-        # C14. Phase 49.13 fixed the MAILBOX half of a cancelled invite -- the
-        # row is withdrawn from the invitee's inbox -- but the server would
-        # still JOIN anyone who asked, because `had` was computed and then only
-        # used to decorate the log line. The proposal is the authority: an
-        # invite that has been cancelled, or was never sent, must not admit.
-        #
-        # The mailbox cleanup alone is not a gate. It cleans up the prompt, and
-        # a console that already holds the row (the inbox is read once at
-        # sign-in and never re-read) still has the button -- to say nothing of a
-        # client that is not ours. This is the half that makes it true.
         log(f"  teams op8 (ACCEPT CLAN INVITE): {name} 0x{mine} has NO proposal "
             f"on file for {rec.get('name')!r} 0x{key} -- REFUSED "
             f"(cancelled, already answered, or never sent)")
@@ -4229,11 +2462,6 @@ def teams_answer_invite(accept: bool, dec: dict, who=None, peer_ip: str = ""):
     if accept and mine not in rec.setdefault("members", []):
         rec["members"].append(mine)
     team_put(key, rec)
-    # The client deletes the mailbox row it OPENED (Messaging op 4 follows).
-    # An invite cancelled and re-sent while the invitee was online leaves it
-    # holding two rows for one clan, and the one it did not open stayed filed
-    # -- a phantom invite at the next sign-in that C14 then refuses. An
-    # answered invite has no mailbox row left to keep (§66, seen on the rig).
     pulled = clan_invite_mail_drop(tid, clan_invite_push_type(), [mine])
     log(f"  teams op{8 if accept else 7} ({verb} CLAN INVITE): {name} "
         f"0x{mine} {'joins' if accept else 'declines'} {rec.get('name')!r} "
@@ -4242,17 +2470,6 @@ def teams_answer_invite(accept: bool, dec: dict, who=None, peer_ip: str = ""):
         + f") -- {len(rec['members'])} member(s), "
         f"{len(rec['proposals'])} proposal(s) left"
         + (f", {pulled} mailbox row(s) withdrawn" if pulled else ""))
-    # TELL THE INVITER. Without this their roster is stale until they sign in
-    # again: `Teams op 21` fires at sign-in and nothing else re-reads it, so the
-    # console that sent the invite goes on showing a clan of one. Types 14 and
-    # 15 sit unused right beside the 13 this server already pushes, and 14
-    # `Caccept` / 15 `Creject` is what they are for.
-    #
-    # The recipient is the proposal's `from`, not the request's `inviter`
-    # field (§65): the request names whoever the client says invited it, and
-    # the proposal is the record of who did. With no proposal on file there is
-    # nobody to tell -- a decline of an invite that was never sent would
-    # otherwise deliver a Creject to any account the request cared to name.
     try:
         by = int(prop.get("from") or "0", 16) if prop else 0
     except ValueError:
@@ -4266,15 +2483,9 @@ def teams_answer_invite(accept: bool, dec: dict, who=None, peer_ip: str = ""):
 
 
 def _teams_req_pair(dec: dict, op: int):
-    """The shape every clan-administration request shares: `[u8 0][u64][u64]`.
-
-    Decoded from the request builders in Phase 40 -- ops 3, 4, 5, 26 and 27 all
-    call the same three-field builder, and the two u64s are always (teamId,
-    gamerId) IN THAT ORDER. `op 25` is the exception in the family and reads the
-    pair the OTHER way round; it has no handler, which is why nothing noticed.
-    """
+    """The shape every clan-administration request shares: `[u8 0][u64][u64]`."""
     r = lsg_request_params(dec)
-    r.u8()                              # the [u8 0] lead-in, constant on every RPC
+    r.u8()
     return r.u64(), r.u64()
 
 
@@ -4283,22 +2494,7 @@ def _teams_actor(peer_ip: str, who):
 
 
 def teams_set_rank(promote: bool, dec: dict, who=None, peer_ip: str = ""):
-    """Teams op 3 (promote to administrator) / op 26 (demote to member).
-
-    `[u8 0][u64 teamId][u64 gamerId]`. Both are OWNER-only in the client: the
-    rows are conditional adds, so an ordinary member is not shown a greyed
-    button, the verb simply is not on the menu (`0x08a06444` promote,
-    `0x08a06e4c` demote).
-
-    The rank is written into the team record's `ranks` map, which is exactly
-    what `team_rank()` already reads -- so the whole of promote/demote is one
-    number in the store, and the client picks it up at its next `Teams op 21`.
-
-    **Demote cannot be reached until promote works**, and that is not a UI
-    quirk: the demote row is gated on the target's rank being ADMINISTRATOR,
-    and until Phase 40 this server only ever served 0 or 2. So the two verbs had
-    to be built together or neither could be tested.
-    """
+    """Teams op 3 (promote to administrator) / op 26 (demote to member)."""
     op = 3 if promote else 26
     verb = "PROMOTE" if promote else "DEMOTE"
     me, name = _teams_actor(peer_ip, who)
@@ -4333,13 +2529,7 @@ def teams_set_rank(promote: bool, dec: dict, who=None, peer_ip: str = ""):
 
 
 def teams_remove_member(dec: dict, who=None, peer_ip: str = ""):
-    """Teams op 4 -- remove a member from the clan ("Remove from clan").
-
-    `[u8 0][u64 teamId][u64 gamerId]`, ADMIN or OWNER. Its launcher
-    (`0x089ae364`) is shared with cancel-invite and branches on a per-gamer
-    relationship flag (0x800): a real member gets op 4, a pending invitee gets
-    op 25 from the same button.
-    """
+    """Teams op 4 -- remove a member from the clan ("Remove from clan")."""
     me, name = _teams_actor(peer_ip, who)
     try:
         tid, target = _teams_req_pair(dec, 4)
@@ -4377,26 +2567,7 @@ def _team_drop(rec: dict, member: str) -> bool:
 
 
 def teams_leave(dec: dict, who=None, peer_ip: str = ""):
-    """Teams op 5 -- leave the clan, DISBAND it, or remove a member. All three.
-
-    `[u8 0][u64 teamId][u64 gamerId]`, and the three meanings are told apart by
-    the caller's role and by whether the gamer id is zero:
-
-        target == 0, caller is not the owner   -> the caller leaves
-        target == 0, caller IS the owner       -> DISBAND the whole clan
-        target != 0                            -> remove that member
-
-    **There is no separate disband opcode, and there is no disband menu row.**
-    Ten `%CLAN%` verbs map to nine wire verbs. For the owner, `Leave clan`
-    becomes the disband chain: it asks "Transfer ownership of clan X?" first,
-    and pressing CIRCLE there -- declining the transfer -- is the step FORWARD
-    to "Disband clan X?". The two launchers (`0x089ba4c4` no-gamer and
-    `0x089ba65c` selected-gamer) put identical bytes on the wire for leave and
-    disband, both with target 0, so the server cannot tell them apart from the
-    request and must decide from the caller's role. That is not a guess: the
-    no-gamer launcher loads its target from a static pair at `0x08d39b98`, which
-    is zero.
-    """
+    """Teams op 5 -- leave the clan, DISBAND it, or remove a member. All three."""
     me, name = _teams_actor(peer_ip, who)
     try:
         tid, target = _teams_req_pair(dec, 5)
@@ -4427,10 +2598,6 @@ def teams_leave(dec: dict, who=None, peer_ip: str = ""):
         members = [m for m in rec.get("members", []) if m != mine]
         invited = [p.get("to") for p in rec.get("proposals", []) if p.get("to")]
         team_delete(key)
-        # The proposals died with the record; their MAILBOX rows did not, and
-        # the inbox is re-read at every sign-in. Without this the invitee is
-        # still offered `Accept clan invite` for a clan that no longer exists
-        # (§49.17) -- the same defect `Teams op 25` had, one screen along.
         pulled = clan_invite_mail_drop(tid, clan_invite_push_type(), invited)
         log(f"  teams op5 (DISBAND CLAN): {name} 0x{mine} disbands {cname!r} "
             f"0x{key} -- {len(members)} other member(s) lose it, "
@@ -4451,18 +2618,7 @@ def teams_leave(dec: dict, who=None, peer_ip: str = ""):
 
 
 def teams_transfer_owner(dec: dict, who=None, peer_ip: str = ""):
-    """Teams op 27 -- hand the clan to another member ("Transfer ownership").
-
-    `[u8 0][u64 teamId][u64 gamerId]`, OWNER only -- the row is not added at all
-    otherwise (`0x089cda18` skips the whole add), so there is nothing greyed to
-    see. Picking the new owner is a second screen, `UserProfileClanOwnerSelect`,
-    whose list is `[empty]` in a one-member clan.
-
-    The OLD OWNER BECOMES AN ORDINARY MEMBER here. Nothing in the client says
-    what should happen to them -- `Net.Ack.SetOwner` only names the new owner --
-    so this is the server's choice, and it is the conservative one: no lingering
-    administrator rights that nobody granted.
-    """
+    """Teams op 27 -- hand the clan to another member ("Transfer ownership")."""
     me, name = _teams_actor(peer_ip, who)
     try:
         tid, target = _teams_req_pair(dec, 27)
@@ -4484,7 +2640,7 @@ def teams_transfer_owner(dec: dict, who=None, peer_ip: str = ""):
         return 0, None
     rec["owner"] = them
     ranks = rec.setdefault("ranks", {})
-    ranks.pop(them, None)                      # the owner's rank is implied
+    ranks.pop(them, None)
     ranks[mine] = TEAM_RANK_MEMBER
     team_put(key, rec)
     log(f"  teams op27 (TRANSFER OWNERSHIP): {name} 0x{mine} hands "
@@ -4496,25 +2652,11 @@ def teams_transfer_owner(dec: dict, who=None, peer_ip: str = ""):
 
 
 def teams_op10(dec: dict, who=None, peer_ip: str = ""):
-    """Teams op 10 -- `[u8 0][u64 gamerId]`, and NOT one of the ten clan verbs.
-
-    All ten are placed elsewhere, and this one carries no team id at all. Its
-    single trigger in the whole image is inside the BLOCK-A-GAMER chain
-    (`0x08a0f948`), one state after the same chain fires op 7 (decline clan
-    invite) on the same gamer -- so it is the second half of a clan cleanup
-    performed when you block someone. Two readings fit and the client cannot
-    separate them: withdraw my outstanding proposal to this gamer (the Teams
-    analogue of `Friends op 13`), or remove them from my clan without naming it.
-
-    Logged rather than acted on. A bare reply is right either way -- op 10 is on
-    the dispatcher's "reads nothing" arm -- and guessing wrong here would delete
-    a membership nobody asked to lose. To settle it: block a gamer you have
-    invited to your clan, and see which id arrives.
-    """
+    """Teams op 10 -- `[u8 0][u64 gamerId]`, and NOT one of the ten clan verbs."""
     me, name = _teams_actor(peer_ip, who)
     try:
         r = lsg_request_params(dec)
-        r.u8()                              # the [u8 0] lead-in, constant on every RPC
+        r.u8()
         target = r.u64()
     except Exception as e:
         log(f"  (teams op10 decode failed: {e})")
@@ -4532,13 +2674,6 @@ def teams_proposals_result(dec: dict, who=None, peer_ip: str = ""):
     """Teams op 24 -- clan invitations addressed to me. Row [u64][u64][str][str]
     (0x08c284b0), and it must carry the [u32 numResults] the arm at 0x08c29794
     reads.
-
-    Fires at every sign-in, so it is the clan equivalent of `Friends op 19` +
-    the mailbox: whatever `Teams op 6` filed shows up here next time the invited
-    console signs in. Whether the client ALSO expects a lobby push (there is a
-    `Clan %CLAN% invite from %GAMER%` inbox string) is not established -- the
-    clan message type ids are somewhere in the 8 / 11..33 block that
-    `net::tBuddy` stubs out, and no table for them has been found yet.
     """
     lsg_request_noargs(dec, "teams op24")
     me = account_for(peer_ip)
@@ -4549,7 +2684,7 @@ def teams_proposals_result(dec: dict, who=None, peer_ip: str = ""):
         + ("".join(f" -> {n!r} from {who_!r}" for _t, _f, n, who_ in rows)
            if rows else ""))
     if not rows:
-        return 0, None        # a bare numResults=0 is a legal empty answer
+        return 0, None
 
     def emit(w):
         for tid, inviter, tname, iname in rows:
@@ -4561,29 +2696,14 @@ def teams_proposals_result(dec: dict, who=None, peer_ip: str = ""):
 
 
 # ------------------------------------------------------------- downloads
-#
-# bdStorage ops 7 and 8 are the Downloads menu. Op 8 (list everything global)
-# and op 7 (list one account's files) both fire during sign-in and both read a
-# [u32 numResults]; the Downloads SCREEN itself makes no request at all, it just
-# draws what those two returned. Row layout (container method 0x08c2616c, the
-# per-row tail 0x08c268ac):
-#
-#   [u32 size][u64 fileID][u32 created][u32 modified][bool isPrivate]
-#   [bool ?][u64 ownerID][str filename]      filename <= 127 chars
-#
-# isPrivate is not a guess: net::tStorage prints "private:\%s" when it is set
-# and "public:\%s" when it is not (0x08d38ba4 / 0x08d38b98).
-#
-# The `storage` table lists what to serve (§66 step 6; `capture/storage-db.json`
-# before that); the bytes live in capture/storage/. Empty (the default) is a
-# legal, quiet answer.
 STORAGE_DIR = CAP / "storage"
-STORAGE_FIRST_ID = 0x5001          # ids the server allocates; hand-seeded rows sit below
+STORAGE_FIRST_ID = 0x5001
 
 
 def _storage_row(r) -> dict:
     """One `storage` row as the dict the handlers always used, NULLs omitted so
-    `f.get("created", 0)` and friends read as they did from the JSON."""
+    `f.get("created", 0)` and friends read as they did from the JSON.
+    """
     out = {"id": r["id"], "name": r["name"] or "", "private": bool(r["private"])}
     for k in ("owner", "file", "size", "created", "modified"):
         if r[k] is not None:
@@ -4599,7 +2719,8 @@ def storage_row(fid: int) -> dict | None:
 def storage_rows(owner: int | None, everyone: bool = False) -> list:
     """The rows one list op serves: op 8 the GLOBAL rows (no owner), op 7 the
     global rows plus `owner`'s. In id order, which is upload order for
-    anything the server allocated."""
+    anything the server allocated.
+    """
     conn = store.db()
     if everyone:
         cur = conn.execute("SELECT * FROM storage WHERE owner IS NULL OR owner = ? "
@@ -4610,60 +2731,22 @@ def storage_rows(owner: int | None, everyone: bool = False) -> list:
 
 
 def storage_list_result(op: int, dec: dict, who=None, peer_ip: str = ""):
-    """Storage op 7 (by owner) / op 8 (global). Both reply [u32 n] + n rows.
-
-    Phase 29: op 7 is "list the files owned by THIS ENTITY", and the entity is a
-    REQUEST PARAMETER, not the caller. bddump of every op 7 in
-    session-20260911-135207.log shows eight distinct ids in field [2], nine of
-    them 0x5ed7f893cb52b73e -- which is player3, fired by console 4 while
-    downloading player3's profile. (op 8, the global list, has no such field:
-    its request is [u8 op][u8 0][u32][u16] and stops there.)
-
-    Until now the server ignored that id and answered with `account_for(peer_ip)`
-    -- the CALLER's own files -- so every remote profile was told it owned
-    whatever the viewer owned. WOW2_NO_STORAGE_OWNER=1 restores the old
-    behaviour for a bisect.
-
-    NOT yet proven to change anything on screen: a remote profile's
-    `View shared landscapes` / `View shared schemes` rows stayed greyed even when
-    the op 7 reply carried valid `.sl1` / `.ss2` names (measured twice, Phase 29),
-    so something other than this list decides that. The fix is made because the
-    old answer was factually wrong, not because a screen was seen to change.
-    """
+    """Storage op 7 (by owner) / op 8 (global). Both reply [u32 n] + n rows."""
     me = account_for(peer_ip)
     owner = me
-    # Phase 42: BOTH ops end with a window and an optional name filter, and the
-    # server used to answer with everything it held regardless.
-    #
-    #   op 7  [u8 0][u64 owner][u32 start][u16 count][str filter?]
-    #   op 8  [u8 0]           [u32 start][u16 count][str filter?]
-    #
-    # `start` and `count` are hard-coded immediates at each op's single call
-    # site -- 256 at 0x089969f4 for op 8 and 128 at 0x08996b64 for op 7 -- so
-    # the client will
-    # never ask for more, and a reply carrying more hands rows to a list it did
-    # not size for. Harmless while no store holds ten files; not a thing to
-    # leave in for a real deployment.
     start, count, filt = 0, 0, ""
     try:
         r = lsg_request_params(dec)
-        r.u8()                          # the [u8 0] lead-in, constant on every RPC
+        r.u8()
         if op == 7:
             asked = r.u64()
             if os.environ.get("WOW2_NO_STORAGE_OWNER") != "1":
                 owner = asked or me
         start = r.u32()
         count = r.u16()
-        # The filter is NULL at both call sites (a zero argument) and has never
-        # arrived non-empty. Log it rather than drop it, so the first one that
-        # ever does is visible instead of silently ignored.
         filt = next((v for t, v in bd.read_fields(r) if t == bd.BD_STR and v), "")
     except Exception as e:
         log(f"  (storage op{op} request decode failed: {e}; serving unwindowed)")
-    # D7 used to be a warning here -- two rows with one file id, which op 5
-    # could only half reach and op 1's replace step deleted together. The
-    # store's primary key makes the second row impossible (§66), and the
-    # importer refuses a JSON file that has one rather than pick.
     files = storage_rows(owner, everyone=(op == 7))
     total = len(files)
     if count > 0:
@@ -4678,13 +2761,10 @@ def storage_list_result(op: int, dec: dict, who=None, peer_ip: str = ""):
         + (" -> " + ", ".join(f.get("name", "?") for f in files) if files else ""))
 
     def emit(w):
-        # NO count here: build_lsg_taskreply_encrypted already wrote the
-        # [u32 numResults] this arm reads. Writing it again would put the rows
-        # one field late -- the mistake that cost Phase 22 five sign-ins.
         for i, f in enumerate(files, start=1):
             body = storage_bytes(f)
-            w.u32(len(body))                                  # size
-            w.u64(_storage_id(f, i))                          # file id
+            w.u32(len(body))
+            w.u64(_storage_id(f, i))
             w.u32(int(f.get("created", 0)))
             w.u32(int(f.get("modified", 0)))
             w.bool_(bool(f.get("private")))
@@ -4695,8 +2775,7 @@ def storage_list_result(op: int, dec: dict, who=None, peer_ip: str = ""):
 
 
 def storage_bytes(f: dict) -> bytes:
-    """The file's bytes from storage/. (The Phase 26 seeds carried them inline
-    as `data`; the import wrote those out, so every row is a file now.)"""
+    """The file's bytes from storage/."""
     try:
         return (STORAGE_DIR / f.get("file", "")).read_bytes()
     except OSError:
@@ -4707,49 +2786,10 @@ def storage_get_result(dec: dict, who=None, peer_ip: str = ""):
     """Storage op 5 -- fetch one file's bytes. ONE row, and the arm at
     0x08c275bc calls the container with a hard-coded count of 1, so this reply
     must NOT carry a numResults field (same trap as Teams op 1).
-
-    THE ROW IS A FULL FILE RECORD AND THE BLOB IS ITS LAST FIELD (Phase 47).
-    This used to answer with the blob alone, which is why `View scoreboard
-    snapshots` fetched its file and still drew four `[empty]` rows for four
-    phases -- ROADMAP A13. Read off the client, three hops:
-
-      container  0x08c25c00   (vtable 0x08dba638+0x14, built at 0x089949f8)
-                 per result: read a u32, malloc 0xb8, construct with that u32
-      ctor       0x08c26530   `this->0xa8 = u32` and `this->0xb0 = malloc(u32)`
-                              -- so the LEADING u32 IS THE BUFFER CAPACITY
-      element    0x08c26610   base 0x08c268ac reads the eight ordinary file
-                              fields, then a MANDATORY blob (tag 0x13); with no
-                              blob the length register stays 0 and it returns
-                              false
-
-    and the capacity is load-bearing: the element reader loads the capacity
-    from this+0xa8, compares it with the blob length just read, and only when
-    capacity >= length stores the length and reads the bytes (0x8c26760);
-    otherwise it logs "Reading BLOB failed. Buffer too small" (the string at
-    0x08d6af10), skips the read and returns false.
-
-    though that guard is not the one that fired here. With no leading u32 the
-    container's very FIRST read fails on the TYPE, so it never even constructs
-    an element and the count stays 0 -- and the client says exactly that:
-
-        err [bdCore/bitBuffer] Expected: UInt32 , read: Blob  bdBitBuffer.cpp:526
-
-    twice, once per fetch, measured both ways with `tools/bdwarn.py`.
-
-    **The failure is SILENT on this side**: it is the game's own `bdStorage`
-    poll (0x089949c4) that calls the reply handler, not the LSG reply reader, so
-    a bad body here neither drops the connection nor logs anything -- the
-    download simply returns false and the node keeps its `[empty]` bit. The
-    rig's usual oracle (does the console stay connected?) cannot see this class
-    of bug at all; cf. `tools/blindspots.py` and `tools/bdwarn.py`.
-
-    The eight fields are exactly `storage_list_result`'s row, in the same order,
-    which is the independent check: that row has worked since Phase 27.
-    WOW2_STORAGE_BLOB_ONLY=1 restores the blob-only reply for a bisect.
     """
     try:
         r = lsg_request_params(dec)
-        r.u8()                              # the [u8 0] lead-in, constant on every RPC
+        r.u8()
         fid = r.u64()
     except Exception as e:
         log(f"  (storage op5 decode failed: {e})")
@@ -4763,7 +2803,7 @@ def storage_get_result(dec: dict, who=None, peer_ip: str = ""):
 
     def emit(w):
         if not blob_only:
-            w.u32(len(body))                # buffer capacity -- the ctor mallocs this
+            w.u32(len(body))
             w.u64(fid)
             w.u32(int(f.get("created", 0)) if f else 0)
             w.u32(int(f.get("modified", 0)) if f else 0)
@@ -4772,53 +2812,11 @@ def storage_get_result(dec: dict, who=None, peer_ip: str = ""):
             w.u64(_storage_owner(f) if f else 0)
             w.str_(f.get("name", "") if f else "", 127)
         w.blob(body)
-    # A MISS MUST STILL BE ONE ROW. The op-5 arm (0x08c275bc) calls its
-    # container with a hard-coded count of 1, so `0 results` leaves the
-    # deserializer reading a row that is not there: the container returns
-    # false and the client drops the whole LSG connection ~330 ms later
-    # ("Connection Lost"). An empty blob is the quiet answer -- and it stays
-    # safe with the capacity in front, because 0 skips the malloc and the
-    # `capacity < blobLen` guard is then `0 < 0`, which is false.
     return None, emit
 
 
-# bdStorage op 1 -- UPLOAD. First seen 2026-09-11 (Phase 27), fired by
-# `Upload flag` and by `View shared schemes` -> Upload on the User profile edit
-# screen:
-#
-#   [u8 0][bool published][str filename <=128][bool isPrivate][blob data]
-#
-# The reply is ONE typed u64 -- the file id the server assigns -- and NO
-# numResults field: the single-result arm (0x08c275bc) hard-codes a count of 1
-# at 0x08c275fc, the same trap as Teams op 1 and Storage op 5. The id must be
-# NON-ZERO; 0 is the client's "no id yet" sentinel, which is exactly the bug
-# that made the session id and the security key unusable in Phase 14-17.
-#
-# WHAT MAKES A FILE VISIBLE is the FILENAME, not the owner or any flag: each
-# screen applies a hard-coded extension whitelist (Downloads wants `.da0` /
-# `.flg`, shared landscapes `<7 chars>.sl<0-7>`, shared schemes
-# `<6 chars>.ss<0-7>`), and `private` must be false because the client prefixes
-# `public:\` and indexes the type letter at the fixed offset name+8.
 def _storage_owner(rec: dict) -> int:
-    """The account that owns one storage row, however the row spells it.
-
-    PHASE 45 -- this file kept TWO conventions for the same field and they met
-    here. `storage_list_result` filters with `f.get("owner") == f"{owner:016x}"`
-    and `storage_get_result` reads it with `int(..., 16)`, i.e. the 16-hex-digit
-    string every other store in this server uses for an account; but
-    `storage_upload_result` wrote a raw int and read it back with a DECIMAL
-    `int()`. Both bugs were invisible until something uploaded:
-
-      * a decimal parse of a hand-seeded row raises ValueError, the B6 dispatch
-        backstop drops the message, and the console sits on "Uploading
-        scoreboard snapshots..." forever with nothing in the log but the
-        exception -- which is how `Take snapshot` was found to be broken;
-      * and a row this function DID write was invisible to the very list meant
-        to show it, because an int never equals a hex string.
-
-    Hex is the convention. This accepts an int, a decimal string or a hex
-    string so old stores keep working.
-    """
+    """The account that owns one storage row, however the row spells it."""
     v = rec.get("owner")
     if v in (None, ""):
         return 0
@@ -4844,7 +2842,7 @@ def storage_upload_result(dec: dict, who=None, peer_ip: str = ""):
     me = account_for(peer_ip)
     try:
         r = lsg_request_params(dec)
-        r.u8()                              # the [u8 0] lead-in, constant on every RPC
+        r.u8()
         published = r.bool_()
         name = r.str_(128)
         private = r.bool_()
@@ -4858,8 +2856,6 @@ def storage_upload_result(dec: dict, who=None, peer_ip: str = ""):
                      "LIMIT 1", (name, mine)).fetchone()
     fid = int(r["id"]) if r else 0
     if not fid:
-        # The smallest free id at or above STORAGE_FIRST_ID, as before; the
-        # hand-seeded rig rows live below it and never collide.
         used = {int(x[0]) for x in conn.execute("SELECT id FROM storage WHERE id >= ?",
                                                  (STORAGE_FIRST_ID,))}
         fid = next(i for i in range(STORAGE_FIRST_ID, STORAGE_FIRST_ID + 65536)
@@ -4867,36 +2863,13 @@ def storage_upload_result(dec: dict, who=None, peer_ip: str = ""):
     blob_name = f"{fid:x}-{name}"
     try:
         STORAGE_DIR.mkdir(parents=True, exist_ok=True)
-        # Atomic, same reason as _jsave: a torn write would leave a half file
-        # that the client later downloads as a corrupt landscape or scheme.
         blob_tmp = STORAGE_DIR / f"{blob_name}.tmp-{os.getpid()}"
         blob_tmp.write_bytes(data)
         os.replace(blob_tmp, STORAGE_DIR / blob_name)
     except OSError as e:
-        # §65. This used to log and carry on: the row was filed and the id
-        # handed back, so the console held a file id whose bytes did not
-        # exist and its next `op 5` drew an empty download. A failed write is
-        # a failed upload -- no row, and the client's own code for it
-        # (`BD_EXCEPTION_IN_DB`, from the error->string mapper at
-        # 0x0898a1e0; `Net.Err.Upflag` is what a flag upload renders).
         log(f"  (!! storage op1 could not write {blob_name}: {e} -- the "
             f"upload FAILS and no row is filed)")
         return 0, None, BD_EXCEPTION_IN_DB
-    # The owner goes in as the 16-hex-digit string every other store uses --
-    # see _storage_owner(). An int here is invisible to storage_list_result.
-    # D4 -- STAMP THE ROW. `created` and `modified` are served as u32 by both
-    # list ops and by `op 5` (the file row the snapshot panel renders), and the
-    # upload request has no timestamp in it at all -- `[u8 0][bool published]
-    # [str filename][bool isPrivate][blob data]`, and blindspots reports UNREAD
-    # 0 for it -- so the server is the only thing that can supply one. It never
-    # did, `f.get("created", 0)` returned 0 for every uploaded file, and the
-    # snapshot panel drew the epoch beside a board saved a minute ago.
-    #
-    # It is the second failure mode in CLAUDE.md's table: a well-shaped field
-    # with a wrong VALUE. Nothing drops, nothing logs, the client just believes
-    # it. The hand-seeded rows carry 1189000000 and render "5 September 2007",
-    # which is why nobody noticed -- the only dated rows on the rig were dated
-    # by hand.
     now = int(time.time())
     with store.tx():
         conn.execute("INSERT INTO storage (id, name, owner, file, private, size, created, "
@@ -4915,21 +2888,11 @@ def storage_upload_result(dec: dict, who=None, peer_ip: str = ""):
 
 
 def storage_overwrite_result(dec: dict, who=None, peer_ip: str = ""):
-    """Storage op 2 -- replace a file's contents, by id.
-
-    `[u8 0][u64 fileId][blob data]`, read straight off the request builder at
-    `0x08c26e18` (ROADMAP A3): `tag 3` + a zero byte, `tag 0xa` + 64 bits, then
-    `tag 0x13` + `tag 8` length + the bytes.
-
-    READS NOTHING. The reply dispatcher (`0x08c27490`) sends only ops 1 and 5 to
-    the single-result arm and ops 7/8 to the row arm; 2, 3, 4 and 6 fall through
-    to the exit. So the bare `err=0, 0 results` is right, and unlike op 1 there
-    is no id to hand back.
-    """
+    """Storage op 2 -- replace a file's contents, by id."""
     me = account_for(peer_ip)
     try:
         r = lsg_request_params(dec)
-        r.u8()                              # the [u8 0] lead-in, constant on every RPC
+        r.u8()
         fid = r.u64()
         data = r.blob()
     except Exception as e:
@@ -4954,10 +2917,6 @@ def storage_overwrite_result(dec: dict, who=None, peer_ip: str = ""):
         log(f"  (storage op2 could not write {blob_name}: {e})")
         return 0, None
     was = int(rec.get("size", 0) or 0)
-    # D4, the other half. An overwrite replaces the bytes in place and keeps the
-    # id, so `created` is still true -- but `modified` must move, or a snapshot
-    # re-saved over an old slot renders the date it first had. Same silent
-    # class: a well-shaped field with a stale value.
     now = int(time.time())
     with store.tx() as conn:
         conn.execute("UPDATE storage SET size = ?, modified = ?, file = ?, "
@@ -4975,7 +2934,7 @@ def storage_delete_result(dec: dict, who=None, peer_ip: str = ""):
     me = account_for(peer_ip)
     try:
         r = lsg_request_params(dec)
-        r.u8()                              # the [u8 0] lead-in, constant on every RPC
+        r.u8()
         fid = r.u64()
     except Exception as e:
         log(f"  (storage op4 decode failed: {e})")
@@ -4992,44 +2951,23 @@ def storage_delete_result(dec: dict, who=None, peer_ip: str = ""):
     with store.tx() as conn:
         conn.execute("DELETE FROM storage WHERE id = ?", (fid,))
         left = conn.execute("SELECT COUNT(*) FROM storage").fetchone()[0]
-    # The blob is kept. A delete here removes the file from every listing, which
-    # is what the client asked for; leaving the bytes on disk costs nothing and
-    # has twice saved a landscape that was deleted from the wrong console.
     log(f"  storage op4 (DELETE): file 0x{fid:x} {rec.get('name')!r} removed by "
         f"0x{me:016x} ({left} file(s) left; the blob is kept on disk)")
     return 0, None
 
 
 def teams_create_result(dec: dict, who=None, peer_ip: str = ""):
-    """Teams op 1 -- create a clan. Returns exactly ONE result: [u64 teamID].
-
-    bdCreateTeamResult::deserialize (0x08c27ddc) reads one typed u64 and asserts
-    on anything but 0 or 1 results, so a clan needs an id and nothing else.
-    """
+    """Teams op 1 -- create a clan. Returns exactly ONE result: [u64 teamID]."""
     me = account_for(peer_ip)
     who_name = (who or (rigconfig.USERNAME, 0))[0]
     try:
         r = lsg_request_params(dec)
-        r.u8()                                       # always 0
+        r.u8()
         clan = r.str_(64)
     except Exception as e:
         log(f"  (teams op1 decode failed: {e})")
         return 0, None
     mine = f"{me:016x}"
-    # C20 -- A CLAN NAME IS NOT A KEY, and this used to treat it as one: a
-    # create whose name already existed JOINED that clan instead, so two clans
-    # could not share a name and `op 1` sometimes returned somebody else's id.
-    #
-    # The client settles it. It ships `Net.Err.ProfileUsed` ("The profile name
-    # %PROFILE% is already in use") for a taken PROFILE name and has **no
-    # equivalent for a clan** -- the only clan-name errors are
-    # `Net.Err.ClanFail` and `Net.Err.ClanName`, both about which characters are
-    # allowed. A service that refused a duplicate clan name would need a string
-    # to say so with, and there is none; `op 20`/`op 21` go by id throughout.
-    #
-    # The merge was a rig convenience from when joining a clan was hard. Invites
-    # work now (`op 6`/`op 8`), so it is just a lie. WOW2_CLAN_NAME_IS_KEY=1
-    # puts it back for a bisect.
     existing = ""
     conn = store.db()
     if os.environ.get("WOW2_CLAN_NAME_IS_KEY") == "1":
@@ -5063,7 +3001,7 @@ def teams_create_result(dec: dict, who=None, peer_ip: str = ""):
 
     def emit(w):
         w.u64(tid)
-    return None, emit          # None = no [u32 numResults]; see the reply builder
+    return None, emit
 
 
 def lsg_result_block(svc: int, op: int, dec: dict,
@@ -5071,16 +3009,9 @@ def lsg_result_block(svc: int, op: int, dec: dict,
                      peer_ip: str = "", ident_key: str = ""):
     """(num_results, writer-callback|None) for one service RPC. Services not listed
     here still take a bare error=0 / numResults=0 reply, which they accept.
-
-    TWO identity arguments, and the distinction matters. `ident_key` is WHO --
-    the account name once the connection has said who it is, falling back to the
-    source address. `peer_ip` is WHERE -- a real address, and only the Sessions
-    family wants it, because a session record stores its host's address and the
-    search reply rewrites it. Everything else was using the address as an
-    identity, which is why two consoles behind one router were one player.
     """
     if os.environ.get("WOW2_LSG_NORESULTS") == "1":
-        return 0, None                      # bisect: go back to Phase 11 behaviour
+        return 0, None
     if svc == LSG_SERVICE_STATS and op == 1:
         return stats_write_upload(dec, who, ident_key)
     if svc == LSG_SERVICE_STATS and op == 4:
@@ -5104,10 +3035,6 @@ def lsg_result_block(svc: int, op: int, dec: dict,
     if svc == LSG_SERVICE_FRIENDS and op == 2:
         return friends_answer(dec, True, who, ident_key)
     if svc == LSG_SERVICE_FRIENDS and op == 3:
-        # NEVER OBSERVED. Phase 22 paired it with op 2 as "decline", by symmetry.
-        # Phase 28 measured the decline and it is op 4, so op 3 is an unknown
-        # that no screen has ever fired. Left wired because the handler is
-        # harmless and a bare reply is right for it either way.
         return friends_answer(dec, False, who, ident_key)
     if svc == LSG_SERVICE_FRIENDS and op == 4:
         return friends_revoke(dec, who, ident_key)
@@ -5173,16 +3100,7 @@ def lsg_result_block(svc: int, op: int, dec: dict,
 
 
 def parse_auth_header(body: bytes):
-    """The two typed fields every auth request opens with: (iv_seed, titleId).
-
-    Auth request bodies are bd BIT STREAMS, exactly like LSG messages -- they were
-    read as raw hexdumps for a long time, which is why the title id looked like a
-    stray `ea 98 00` smeared across a byte boundary instead of a typed u32. The
-    shape is
-        [u8 msgType][1 bit type_checked=1][tag u32][u32 iv_seed][tag u32][u32 titleId]
-    and then whatever that message type appends. Verified against all 64 captured
-    auth bodies: field[1] is 0x131d in every one of them, both message types.
-    """
+    """The two typed fields every auth request opens with: (iv_seed, titleId)."""
     r = bd.BdReader(body)
     msg_type = r.u8()
     r.bitmode = True
@@ -5192,29 +3110,17 @@ def parse_auth_header(body: bytes):
 
 
 def auth_cbc_decrypt(ct: bytes, key24: bytes, iv: bytes) -> bytes:
-    """3DES-EDE-CBC as the CLIENT does it, degenerate keys and all.
-
-    pycryptodome refuses a DES3 key whose halves repeat, and both keys the auth
-    path actually uses are degenerate: the bootstrap key has K1 == K2, and the
-    rig's session key is one byte repeated. EDE with K1 == K2 is just E_K3, so
-    fall back to single DES on K3 rather than pretending the key is illegal.
-    """
+    """3DES-EDE-CBC as the CLIENT does it, degenerate keys and all."""
     k1, k2, k3 = key24[0:8], key24[8:16], key24[16:24]
     if k1 == k2:
         return DES.new(k3, DES.MODE_CBC, iv).decrypt(ct)
-    if k1 == k3:                      # EDE with K1 == K3 is still a real 2-key 3DES
+    if k1 == k3:
         return DES3.new(key24, DES3.MODE_CBC, iv).decrypt(ct)
     return DES3.new(key24, DES3.MODE_CBC, iv).decrypt(ct)
 
 
 def auth_payload_decrypt(ct: bytes, key24: bytes, iv_seed: int) -> bytes | None:
-    """Decrypt an auth payload and check its magic. None means the key was wrong.
-
-    The magic is the client's own integrity check -- a 32-bit value at a known
-    offset, so a wrong key is caught with ~2^-32 false accepts. That is what lets
-    the server VERIFY a password without ever holding one: try the stored hash as
-    the key and see whether the magic comes back.
-    """
+    """Decrypt an auth payload and check its magic. None means the key was wrong."""
     pt = auth_cbc_decrypt(ct, key24, tiger_iv(iv_seed))
     if int.from_bytes(pt[:4], "little") != BD_AUTH_MAGIC:
         return None
@@ -5222,22 +3128,8 @@ def auth_payload_decrypt(ct: bytes, key24: bytes, iv_seed: int) -> bytes | None:
 
 
 def parse_login(body: bytes) -> dict:
-    """Decode a 0x0a (login) request. It IDENTIFIES THE ACCOUNT -- 19 bytes:
-
-        [u8 0x0a][tc bit][u32 iv_seed][u32 titleId][64 raw bits]
-
-    and the 64-bit field is `Tiger192(username)[:8]`, checked against **180 of
-    180** captured login requests across eight consoles. The project had this
-    down as "type, iv_seed, proof" and the server ignored it, guessing identity
-    from the source IP instead -- which is the single thing that made two players
-    behind one router into one player.
-
-    There is no password proof in this message, and that is not an oversight: the
-    authentication runs the other way. The client says who it is, and the SERVER
-    proves it knows the account by encrypting the login reply with
-    Tiger192(password) -- a server that does not know it cannot produce a reply
-    the client accepts. `build_login_reply(session_key, key24=...)`.
-    """
+    """Decode a 0x0a login request: [u8 0x0a][tc bit][u32 iv_seed][u32 titleId][64 bits
+    handle], the handle being Tiger192(username)[:8]. It carries no password."""
     msg_type, seed, title, r = parse_auth_header(body)
     r.type_checked = False
     return {"type": msg_type, "iv_seed": seed, "title_id": title,
@@ -5245,28 +3137,14 @@ def parse_login(body: bytes) -> dict:
 
 
 def parse_lsg_connect(payload: bytes) -> dict | None:
-    """Pull the ClientOpaqueAuthProof out of an LSG connect message (service 7).
-
-        [u8 enc=0][u8 service=7][tc bit][u32 titleId][u32 0][128B proof, raw]
-        16 + 1 + 37 + 37 + 1024 = 1115 bits -> 140 bytes, the captured length.
-
-    The proof is the one `build_client_opaque_proof()` issued at login and the
-    client relays verbatim; it is UNENCRYPTED by design. It carries the username
-    and the session key, so **the LSG connection can identify itself from its own
-    first message** -- no source address anywhere in the chain.
-
-    (Correction while decoding this: the server has always logged service 7 as
-    `op=29`. There is no op. 29 is the low byte of the title id, 0x131d & 0xff,
-    read by a `u8()` where the field is a typed u32. Harmless -- nothing branches
-    on it -- but it is not an opcode and `gapmap` should not grow one.)
-    """
+    """Pull the ClientOpaqueAuthProof out of an LSG connect message (service 7)."""
     if len(payload) < 4 or payload[0] == 1:
         return None
     magic = struct.pack("<Q", OPAQUE_PROOF_MAGIC)
     r = bd.BdReader(payload)
     r.bitmode = True
     try:
-        r.read_bits(16 + 1 + 37 + 37)       # enc, service, tc bit, titleId, u32 0
+        r.read_bits(16 + 1 + 37 + 37)
         proof = bytes(r.read_bits(128 * 8))
     except Exception:
         return None
@@ -5279,28 +3157,7 @@ def parse_lsg_connect(payload: bytes) -> dict | None:
 
 
 def parse_create_account(body: bytes) -> dict:
-    """Decode a 0x00 (create account) request -- username and password, in clear.
-
-    Read off the builder at `0x08c141b4` (which stores the type byte 0x00 to its
-    stack buffer first) and
-    confirmed by decrypting all 62 captured requests, which yielded every
-    console's real name and `Tiger192('123456')`, the rig's password, with zero
-    failures:
-
-        [u8 0x00][tc bit][u32 iv_seed][u32 titleId]
-        [ 64 bits zero ]        <- hash64(account), and there is no account yet
-        [768 bits ciphertext, 96 bytes]
-            key = BD_BOOTSTRAP_KEY          (see its comment: effectively DES-0)
-            iv  = Tiger192(iv_seed as LE u32)[:8]
-            plaintext = [u32 LE 0xEFBDADDE]
-                        [char username[64], zero-filled then NUL-terminated]
-                        [Tiger192(password), 24 bytes]
-                        [4 bytes pad]
-
-    THE POINT: `password_hash` is exactly `account_key(password)` -- the key the
-    login proof is encrypted with. So a credential store can hold the digest and
-    never a password, and the server never needs to know what the player typed.
-    """
+    """Decode a 0x00 (create account) request -- username and password, in clear."""
     msg_type, seed, title, r = parse_auth_header(body)
     r.type_checked = False
     account = bytes(r.read_bits(64)[:8])
@@ -5316,32 +3173,9 @@ def parse_create_account(body: bytes) -> dict:
 
 
 def parse_change_password(body: bytes, candidate_keys=()) -> dict:
-    """Decode a 0x02 (change password) request.
-
-    Read straight off the builder at `0x08c14400` (reached from
-    bdAuthService::changePassword `0x08c13a20`, which the game calls at
-    `0x08971200`). After the common header it writes two RAW, UNTAGGED fields --
-    `0x08be619c(buf, src, nbits)` with 0x40 and 0x100 bits:
-
-        [u8 0x02][tc bit][u32 iv_seed][u32 titleId]
-        [ 8B user hash  ]      <- 0x08c19fbc(username), a 64-bit digest
-        [32B ciphertext ]      <- E(key = hash(currentPassword), iv = f(iv_seed))
-                                  over [u32 0xEFBDADDE][hash(newPassword)][pad]
-
-    The bit arithmetic is exact: 8 + 1 + (5+32) + (5+32) + 64 + 256 = 403 bits
-    = 51 bytes, which is the captured body length to the byte.
-
-    All of it is confirmed against a live capture with a KNOWN current password:
-    console 1 typed 123456 / 135790 and the payload decrypted to
-    `deadbdef` + `Tiger192('135790')` + four zero bytes, exact.
-
-    `candidate_keys` are (label, 24-byte key) pairs to try. The magic is the
-    client's own integrity check, so a key that reproduces it IS the account's
-    password hash -- which is how the current password gets VERIFIED without the
-    server ever holding a password.
-    """
+    """Decode a 0x02 (change password) request."""
     msg_type, seed, title, r = parse_auth_header(body)
-    r.type_checked = False          # the rest is raw bits, no type tags
+    r.type_checked = False
     user_hash = bytes(r.read_bits(64)[:8])
     ciphertext = bytes(r.read_bits(256)[:32])
     out = {"type": msg_type, "iv_seed": seed, "title_id": title,
@@ -5357,24 +3191,21 @@ def parse_change_password(body: bytes, candidate_keys=()) -> dict:
 
 
 def build_auth_reply(reply_type: int, error_code: int, auth_data: bytes = b"") -> bytes:
-    """Reproduce bd auth response framing (response.rs::to_response):
-    bit-mode: u8 type (untyped) -> type_checked_bit=1 -> u32 error (typed) ->
-    auth_data (raw bytes, already bit/byte-shaped by caller). Then wrap
-    unencrypted: [u32 le len][0x00][payload]."""
+    """An auth reply: [u8 type][tc bit][typed u32 error] then the raw auth data,
+    framed unencrypted as [u32 len][0x00][payload]."""
     w = bd.BdWriter()
     w.bitmode = True
     w.type_checked = False
-    w.u8(reply_type)                 # 8 bits, untyped
+    w.u8(reply_type)
     w.type_checked = True
-    w.write_bits(b"\x01", 1)         # type_checked_bit = 1
-    w.u32(error_code)                # typed u32 (5-bit tag 8 + 32 bits)
+    w.write_bits(b"\x01", 1)
+    w.u32(error_code)
     payload = w.getvalue()
     if auth_data:
-        payload += auth_data         # ticket/proof appended at byte boundary
+        payload += auth_data
     return bd.frame_unencrypted(payload)
 
 
-#: Live connections per source address, for the concurrency cap.
 CONNS_PER_IP: dict[str, int] = {}
 
 
@@ -5385,16 +3216,16 @@ class AuthConnection(asyncio.Protocol):
         self.peer = f"{self.peer_ip}:{self.peer_port}"
         self.ident = identity_for(self.peer_ip)
         self.buf = b""
-        self.rx_bytes = 0          # byte COUNT, not the bytes
-        self.msg_window = [0.0, 0]  # [window start, messages in it]
-        self.counted = False       # did we take a slot in CONNS_PER_IP?
-        self.next_txn = 0          # TaskReply transaction ids, like the reference
-        self.is_lsg = False        # set by the buffer-size announce (LSG conns only)
-        self.account = None        # bound at login / at LSG connect, from the WIRE
-        self.session_key = None    # per-sign-in LSG key; None until bound
-        self.authenticated = True  # False between a handle bind and its first readable RPC (§60)
-        self.proof_handle = None   # the clear-proof handle this connection presented, if any
-        self.pending_ident = None  # (name, user_id) a bind has verified but not yet adopted
+        self.rx_bytes = 0
+        self.msg_window = [0.0, 0]
+        self.counted = False
+        self.next_txn = 0
+        self.is_lsg = False
+        self.account = None
+        self.session_key = None
+        self.authenticated = True
+        self.proof_handle = None
+        self.pending_ident = None
         live = CONNS_PER_IP.get(self.peer_ip, 0)
         if live >= serverconfig.MAX_CONNS_PER_IP:
             log(f"TCP connect from {self.peer} REFUSED: {live} connections already "
@@ -5406,13 +3237,7 @@ class AuthConnection(asyncio.Protocol):
         log(f"TCP connect from {self.peer} (console identity {self.ident[0]!r} id={self.ident[1]})")
 
     def over_limit(self, data: bytes) -> bool:
-        """Per-connection caps. A peer that misbehaves loses its OWN connection.
-
-        `self.rx` used to be the whole byte stream, kept forever and used for
-        nothing but its length in a log line -- so any peer could grow the
-        server's memory without bound just by sending. It is a counter now, and
-        the counter itself is capped.
-        """
+        """Per-connection caps. A peer that misbehaves loses its OWN connection."""
         self.rx_bytes += len(data)
         if self.rx_bytes > serverconfig.MAX_STREAM_BYTES:
             log(f"  (!! {self.peer} sent {self.rx_bytes}B this connection, over "
@@ -5421,19 +3246,12 @@ class AuthConnection(asyncio.Protocol):
         return False
 
     def over_msg_rate(self, n: int) -> bool:
-        """Count MESSAGES, not reads. Counting `data_received` calls does not
-        work: TCP coalesces, and 400 keepalive frames sent back to back arrive
-        as one read -- measured, the cap never fired. Frames are what a handler
-        costs, so frames are what is limited."""
+        """Count MESSAGES, not reads."""
         now = time.monotonic()
         if now - self.msg_window[0] >= 1.0:
             self.msg_window = [now, n]
         else:
             self.msg_window[1] += n
-        # Check AFTER both branches. Checking only the accumulate branch let a
-        # single burst through untouched -- 400 frames in one write opened a
-        # fresh window and was never compared against anything, which is exactly
-        # the shape of the attack the cap is for. Measured: the cap did not fire.
         if self.msg_window[1] > serverconfig.MAX_MSGS_PER_SEC:
             log(f"  (!! {self.peer} sent {self.msg_window[1]} messages in a "
                 f"second, over limits.max_msgs_per_sec -- closing)")
@@ -5441,19 +3259,7 @@ class AuthConnection(asyncio.Protocol):
         return False
 
     def resolve_login(self, body: bytes) -> tuple[str, int, bytes, str, bool]:
-        """(username, user_id, proof key, how, refused) for a 0x0a request.
-
-        The handle is authoritative when we recognise it. The source-address
-        guess survives only as a fallback for a console whose name we have never
-        seen -- on the rig that is nobody, because IDENTITIES names every console
-        and a name is all a handle needs.
-
-        `refused` is the fifth field because a refusal here is not a refusal to
-        ANSWER -- it is an answer encrypted under a key the caller cannot have,
-        which is the only refusal this protocol has. The caller needs to know it
-        happened so it does not register the session key it is about to send in
-        clear; see `new_session_key`.
-        """
+        """(username, user_id, proof key, how, refused) for a 0x0a request."""
         try:
             req = parse_login(body)
         except Exception as e:
@@ -5469,11 +3275,6 @@ class AuthConnection(asyncio.Protocol):
                     return name, uid, acct["pwhash"], \
                         f"handle {req['handle'].hex()}, stored credential", False
                 if serverconfig.SHARED_PASSWORD_FALLBACK:
-                    # DEVELOPMENT default: an account with no stored credential
-                    # signs in on the shared rig password. It is what lets the
-                    # eight-console rig work with an empty store. A deployment
-                    # sets accounts.shared_password_fallback = false, and then
-                    # only accounts that actually created themselves can sign in.
                     return name, uid, account_key(ACCOUNT_PASSWORD), \
                         f"handle {req['handle'].hex()}, shared password", False
                 log(f"  (!! {name!r} has no stored credential and the shared "
@@ -5482,17 +3283,6 @@ class AuthConnection(asyncio.Protocol):
                 return name, uid, secrets.token_bytes(24), \
                     f"handle {req['handle'].hex()}, NO CREDENTIAL", True
             if not serverconfig.SHARED_PASSWORD_FALLBACK:
-                # A5. The refusal above was inside `if acct:`, so it only ever
-                # covered a KNOWN account with no stored credential. An UNKNOWN
-                # handle fell straight through to the source-address guess below
-                # and was answered with a complete proof under the shared rig
-                # password -- i.e. turning the fallback off did not actually
-                # stop anyone signing in, it only stopped accounts we had heard
-                # of. Measured: a handle for `nosuchplayer` came back as a full
-                # 268-byte proof for `player1`, invented from the source address.
-                #
-                # With the fallback ON (the rig default) nothing changes: the
-                # guess is what lets eight consoles work against an empty store.
                 uname, uid = self.ident
                 self.account = uname
                 log(f"  (!! login handle {req['handle'].hex()} is not an account "
@@ -5505,13 +3295,6 @@ class AuthConnection(asyncio.Protocol):
         uname, uid = self.ident
         self.account = uname
         if not serverconfig.SHARED_PASSWORD_FALLBACK:
-            # §64. Both refusals above sit behind `if req is not None`, so a
-            # login the server could not DECODE -- a 0x0a too short to carry
-            # its handle -- fell through to here and was answered with a
-            # complete proof for an invented `playerN` under the shared rig
-            # password, fallback or no fallback. No console sends such a
-            # message; anything else can, in one line. With the fallback off
-            # the source-address guess is never a credential.
             log(f"  (!! the login request could not be decoded and the shared "
                 f"password fallback is off -> refusing by answering with a "
                 f"key it cannot have)")
@@ -5520,39 +3303,15 @@ class AuthConnection(asyncio.Protocol):
         return uname, uid, account_key(ACCOUNT_PASSWORD), "by source address", False
 
     def bind_lsg(self, payload: bytes) -> bool:
-        """Bind this LSG connection to an account, from its own first message.
-
-        The connect message relays the opaque proof we issued at login, in clear,
-        carrying the username and the session key. So the LSG connection does not
-        have to be correlated with the login connection by address -- it says who
-        it is. That is the last place the source IP decided identity.
-
-        Returns False when it could not be bound, and the caller then CLOSES the
-        connection (§54). It used to return regardless and leave the connection
-        running under whatever the source address happened to mean, which turned
-        a failed credential check into a successful sign-in as somebody.
-
-        A stale key from before a restart takes the same path, and dropping is
-        right there too: a restart already raises `connection-lost` on every
-        console and nothing works again until a full sign-in.
-        """
+        """Bind this LSG connection to an account, from its own first message."""
         proof = parse_lsg_connect(payload)
         self.proof_handle = None
         if proof is not None and PROOF_HANDLE and proof["session_key"] in PROOF_HANDLES:
-            # §60: the connect relays the clear proof, so it presents the
-            # HANDLE. Look the key up, and bind PROVISIONALLY -- the single-
-            # session rule (A7) and the push-route re-key wait for the first
-            # RPC that decrypts under that key, see `complete_bind`.
             acct, key = PROOF_HANDLES[proof["session_key"]]
             if acct == proof["username"]:
                 self.proof_handle = proof["session_key"]
                 proof["session_key"] = key
         if proof is None:
-            # The cold-boot case lands here: the console's own NAT/STUN struct
-            # hits the auth socket, the framer steps over it, and what is left of
-            # the connect is unreadable. That console was going to show
-            # "Connection Lost!" either way -- closing makes it fail at once
-            # instead of running on as whoever the source address means.
             log("  (!! LSG connect carried no readable proof -- "
                 + ("keeping it on the source address, because "
                    "WOW2_LSG_NO_KEY_CHECK=1)" if LSG_NO_KEY_CHECK
@@ -5563,21 +3322,13 @@ class AuthConnection(asyncio.Protocol):
             self.pending_ident = (name, proof["user_id"] or self.ident[1])
             self.session_key = proof["session_key"]
             if self.proof_handle:
-                # Provisional: the identity is known but not yet adopted, so
-                # this connection is invisible to pushes and to the A7 rule
-                # until its first RPC decrypts under the ticket key.
                 self.authenticated = False
                 log(f"  LSG connect: account {name!r} id={proof['user_id']} "
                     f"presents the handle we issued -> provisional; the first "
                     f"RPC that decrypts under the ticket key completes it")
                 return True
-            # The key itself, not the handle: only the ticket carries it, so
-            # whoever presents it has opened the ticket. Bind fully now.
             self.complete_bind("session key verified as one we issued")
             return True
-        # Either a stale key from before a restart, or a client presenting a key
-        # we never issued -- including one we issued and deliberately did not
-        # register, which is what a refused login is given.
         log(f"  (!! LSG connect for {name!r} presents a session key we did "
             f"not issue: {proof['session_key'].hex()[:16]}.. -- "
             + ("using the fixed key and the source address, because "
@@ -5586,22 +3337,7 @@ class AuthConnection(asyncio.Protocol):
         return LSG_NO_KEY_CHECK
 
     def complete_bind(self, why: str) -> None:
-        """The second half of a bind: the single-session rule and the push route.
-
-        RE-KEY the push route. LSG_CONNS is populated at the buffer-size
-        announce, which arrives BEFORE the connect -- so it went in under the
-        source address, and without this the account-keyed lookup in
-        push_to_account() would never match and connection_lost() would leak
-        the stale entry. Caught by watching a live clan invite log "PUSH type
-        17 to 10.42.0.2" instead of "to testuser".
-
-        A7: this account is already online somewhere. The second console wins
-        -- see `evict_other_lsg` for why the gate is here and not at the login
-        request. §60 moved this out of `bind_lsg` for the handle path: a
-        connection that has only shown the clear proof must not sign the
-        account's other console out; the one that decrypts under the ticket
-        key does, ~70 ms later on a real console.
-        """
+        """The second half of a bind: the single-session rule and the push route."""
         was = self.ident_key
         name, uid = self.pending_ident
         self.account = name
@@ -5616,13 +3352,7 @@ class AuthConnection(asyncio.Protocol):
 
     @property
     def ident_key(self) -> str:
-        """What identity-keyed state hangs off: the ACCOUNT when we know it.
-
-        Everything used to hang off `peer_ip`, which is why two consoles behind
-        one router were one player. Handlers that need a real ADDRESS (the
-        Sessions family, which stores a host address and rewrites it) still get
-        `peer_ip`; everything else gets this.
-        """
+        """What identity-keyed state hangs off: the ACCOUNT when we know it."""
         return self.account or self.peer_ip
 
     def data_received(self, data):
@@ -5634,31 +3364,12 @@ class AuthConnection(asyncio.Protocol):
               f"stream={self.rx_bytes})")
         frames, self.buf, skipped = bd.parse_frame(self.buf)
         if skipped:
-            # Not framing noise to shrug off -- record it. This is the console's
-            # NAT/STUN struct (see bd.parse_frame) and is worth reversing later.
             path = CAP / f"unframed-{self.peer_ip.replace('.', '_')}.bin"
             with open(path, "ab") as f:
                 f.write(skipped)
             log(f"  (!! {len(skipped)}B could not be framed; resynchronised past it "
                 f"-> {path.name}: {skipped[:32].hex()}...)")
-        # Anything the framer could not consume is either a partial frame (fine) or
-        # evidence that our length convention is wrong (not fine). Either way, show
-        # it -- the LSG connect leaves exactly 1 byte here and it used to be silently
-        # discarded, which is precisely the kind of thing that hides a whole message.
-        # Logged before handle() because the LSG path drops the buffer to realign.
         if self.buf:
-            # CAPPED, and the cap is the whole point. This used to hexdump the
-            # ENTIRE accumulated buffer on every read, so the cost was quadratic
-            # in what a peer sent: `fuzz.py --limits` pushing 6.2 MB at the
-            # byte cap grew the session log from 236 kB to 65 MB in 18 seconds,
-            # 15.4x the bytes it was defending against. A cap that is paid for
-            # in 15x its own size of disk writes is not much of a cap.
-            #
-            # The useful case is a SMALL leftover -- the LSG connect leaves
-            # exactly 1 byte here and it used to be silently discarded, which is
-            # precisely the kind of thing that hides a whole message. A leftover
-            # of megabytes is a different animal and its length is the finding,
-            # not its bytes.
             head = self.buf[:LEFTOVER_HEXDUMP_MAX]
             debug(f"  (leftover {len(self.buf)}B in parse buffer: {head.hex()}"
                   f"{'...' if len(self.buf) > LEFTOVER_HEXDUMP_MAX else ''})")
@@ -5666,9 +3377,6 @@ class AuthConnection(asyncio.Protocol):
             self.t.close()
             return
         for kind, payload in frames:
-            # One bad message must not take the connection down with it. Every
-            # handler already guards its own parse, but a handler is a lot of
-            # code and this is the backstop: drop the message, keep the peer.
             try:
                 self.handle(kind, payload)
             except Exception as e:
@@ -5681,28 +3389,15 @@ class AuthConnection(asyncio.Protocol):
             self.t.write((0).to_bytes(4, "little"))
             return
         if kind == "bufsize":
-            # Only bdRemoteTaskManager::onConnected sends this, and it sends it first
-            # -- so it is a reliable marker that this socket is the LSG, which matters
-            # because the LSG connect message itself carries enc=0 (like the auth
-            # messages) and would otherwise be read as an auth request.
             self.is_lsg = True
-            LSG_CONNS[self.ident_key] = self        # so a push can be routed here
+            LSG_CONNS[self.ident_key] = self
             n = int.from_bytes(payload, "little")
             log(f"  <- recv BUFSIZE announce: {n} bytes available (no reply); "
                 f"this connection is the LSG")
             return
-        # kind == msg
         enc, body = bd.unwrap_message(payload)
         debug(f"  <- recv MSG {len(payload)}B enc={enc}\n{hexdump(payload)}")
         if self.is_lsg or enc == 1:
-            # LSG (bdLobbyConnection) traffic. Every message is
-            #   [u8 enc][u8 service_id][bit-mode: tc-bit, typed u8 op_id, params]
-            # (encrypted ones wrap that in [u32 seed][3DES-CBC([u32 hmac] ...)]).
-            # Service 7 is the connect/auth presentation and wants a ConnectionId;
-            # everything else is a bdRemoteTask RPC and wants a TaskReply carrying
-            # the SAME op id back -- the game's own state machine checks it.
-            # The connect message is enc=0, so it is readable before any key is
-            # bound -- and it is the message that carries the key. Bind first.
             if enc == 0 and len(payload) > 1 and payload[1] == LSG_SERVICE_LOBBY:
                 if not self.bind_lsg(payload):
                     self.t.close()
@@ -5721,26 +3416,14 @@ class AuthConnection(asyncio.Protocol):
                 debug("  decrypted plaintext:\n" + hexdump(dec["plain"]))
 
             if svc == LSG_SERVICE_LOBBY:
-                # The client took session_key=\x42*24 from the login proof (verified
-                # live), so it can decrypt an ENCRYPTED reply. Per bd_response.rs the
-                # ConnectionId reply is `encrypted_if_available`; the client has the
-                # key, so reply encrypted (enc=1). WOW2_LSG_MODE selects the experiment.
                 mode = os.environ.get("WOW2_LSG_MODE", "enc_connid")
                 if mode == "enc_connid":
-                    # §60: under the ticket key, which is `session_key` even
-                    # when the connect presented the handle. It has to be
-                    # readable BEFORE the client sends anything encrypted, and
-                    # it cannot be sent twice under two keys: a frame that
-                    # fails the client's 0xDEADBEEF check is not skipped, it
-                    # closes the connection (console 1 dropped the LSG 63 ms
-                    # after such a pair and drew `Couldn't sign in`). Phase
-                    # 9's "silently discarded" was about UNENCRYPTED frames.
                     reply = build_lsg_connid_reply_encrypted(1, session_key)
                     desc = "encrypted LsgServiceConnectionId (enc=1, DES-CBC session key)"
                 elif mode == "proof":
                     reply = build_login_reply(session_key, account_key(ACCOUNT_PASSWORD))
                     desc = "0x0b auth proof"
-                else:  # plain_connid
+                else:
                     reply = build_lsg_connid_reply(1)
                     desc = "unencrypted LsgServiceConnectionId (type 4)"
                 log(f"  -> send LSG connect reply [{desc}] {len(reply)}B")
@@ -5748,25 +3431,12 @@ class AuthConnection(asyncio.Protocol):
                 self.t.write(reply)
                 return
 
-            # A service RPC, and it is served to a BOUND connection only (§54).
-            # Closing the connect that fails to bind is not enough on its own:
-            # the connect can simply be skipped. An unencrypted RPC needs no key
-            # at all to build, so a peer that never presents one would be served
-            # under `ident_key`, which falls back to the source address -- the
-            # same hole through the other door. `self.session_key` is set only by
-            # a successful `bind_lsg`, so it is exactly "this connection proved
-            # which account it is".
             if self.session_key is None and not LSG_NO_KEY_CHECK:
                 log(f"  (!! service={svc} op={op} on an LSG connection that "
                     f"never presented a session key we issued -- closing)")
                 self.t.close()
                 return
             if PROOF_HANDLE and not LSG_NO_KEY_CHECK:
-                # §60. A service RPC has to be encrypted, and it has to decrypt
-                # under the ticket key -- a connection that only ever showed
-                # the clear proof cannot do either. A real console sends
-                # nothing unencrypted past the connect (3461 enc=1 service RPCs
-                # against 0 enc=0 in the logs), so no console pays for this.
                 first = not getattr(self, "authenticated", True)
                 if dec["enc"] != 1:
                     log(f"  (!! service={svc} op={op} arrived UNENCRYPTED on a "
@@ -5784,32 +3454,19 @@ class AuthConnection(asyncio.Protocol):
                 if first:
                     self.complete_bind("first RPC decrypts under the ticket key")
 
-            # bdRemoteTaskManager::startTask (0x08c2486c) registered a
-            # pending bdRemoteTask for it and the game blocks until it completes, so
-            # every request needs an answer -- an unanswered one hangs sign-in forever
-            # (the task's timeout is 0 = never).
-            # WOW2_LSG_HOLD="svc:op,svc:op" leaves those RPCs unanswered. The client's
-            # task timeout is 0 (never), so a held RPC parks the game at "Signing in..."
-            # instead of failing -- which is how you bisect *which* reply it rejects:
-            # hold one, and if the failure disappears that RPC's result data is the
-            # problem, not anything earlier in the chain.
             if f"{svc}:{op}" in os.environ.get("WOW2_LSG_HOLD", "").split(","):
                 log(f"  (WOW2_LSG_HOLD: not answering service={svc} op={op})")
                 return
-            err = int(os.environ.get("WOW2_LSG_ERR", "0"), 0)  # BdErrorCode 0 = NoError
+            err = int(os.environ.get("WOW2_LSG_ERR", "0"), 0)
             txn = self.next_txn
             self.next_txn += 1
             block = lsg_result_block(svc, op, dec, self.ident, self.peer_ip,
                                      self.ident_key)
-            # A handler may return a THIRD element: the BdErrorCode for its own
-            # reply. Almost none do -- `err=0` is right for every RPC that simply
-            # worked -- but a *create* has a second successful outcome ("it was
-            # already there"), and the client branches on it. See profile_upload().
             if len(block) == 3:
                 nres, results, err = block
             else:
                 nres, results = block
-            census_note(svc, op, dec)       # what did that handler NOT read?
+            census_note(svc, op, dec)
             reply = build_lsg_taskreply_encrypted(session_key, transaction_id=txn,
                                                   error_code=err, operation_id=op or 0,
                                                   num_results=nres, results=results)
@@ -5817,11 +3474,6 @@ class AuthConnection(asyncio.Protocol):
                     f"err={err}, "
                     f"{'1 result, no count field' if nres is None else f'{nres} results'})"
                     f" {len(reply)}B")
-            # WOW2_LSG_DELAY holds the reply back N seconds. The client's task timeout
-            # is 0 (= never), so it waits happily -- and the pause is a window in which
-            # `wow2 mem read` can snapshot the task/connection before *and* after the
-            # reply lands. That is the only instrument left when the debugger's
-            # breakpoint channel has gone deaf but memory reads still work.
             delay = float(os.environ.get("WOW2_LSG_DELAY", "0"))
             if delay > 0:
                 log(f"  -> [deferred {delay}s] {desc}")
@@ -5838,11 +3490,6 @@ class AuthConnection(asyncio.Protocol):
         auth_type = body[0]
         log(f"  auth message type = 0x{auth_type:02x}")
         if auth_type == AUTH_CREATE_ACCOUNT_REQ:
-            # This request carries the account's REAL name and the key its login
-            # proof must be built with, in a payload the client encrypts with a
-            # constant it ships (see BD_BOOTSTRAP_KEY). Decoding it is what makes
-            # a per-account server possible at all -- until now identity was
-            # guessed from the source IP.
             try:
                 req = parse_create_account(body)
                 if req["username"] is None:
@@ -5857,10 +3504,6 @@ class AuthConnection(asyncio.Protocol):
                 log(f"  (couldn't decode the create-account request: {e})")
                 req = None
             name = (req or {}).get("username")
-            # §56. The name is TAKEN iff we hold a credential for it. Decide
-            # BEFORE storing anything, or the check is against what we just
-            # wrote. (A row carrying only an `account_id` is something an older
-            # server noticed in passing, not an account anyone made.)
             taken = bool(name) and stored_credential(name) is not None
             if CREATE_MODE == "name_exists" or (
                     CREATE_MODE == "refuse_duplicates" and taken):
@@ -5871,37 +3514,20 @@ class AuthConnection(asyncio.Protocol):
                        f"does not get to replace it" if taken else "")
                     + f") {len(reply)}B")
                 if taken:
-                    # The client now re-issues as a SIGN-IN (0x08a68b84). The
-                    # owner's password decrypts the proof and they are in; a
-                    # second player who chose the same profile name cannot, and
-                    # the client draws `Net.Err.AccDup` -- "already in use",
-                    # which is the true statement and the useful one.
                     log(f"     ({name!r} will now be retried as a sign-in; it "
                         f"succeeds only for whoever set that password)")
             else:
                 if name:
                     note_account(name, req["password_hash"], self.peer_ip)
-                # Success: account created. Client should proceed to login (0x0a).
                 reply = build_auth_reply(AUTH_CREATE_ACCOUNT_REPLY, BD_AUTH_NO_ERROR)
                 log(f"  -> send CreateAccountReply (0x01, SUCCESS 700, no body) {len(reply)}B")
             self.t.write(reply)
         elif auth_type == 0x0A:
-            # LOGIN. The request says WHO -- Tiger192(username)[:8] -- so identity
-            # comes off the wire, not off the source address. The server then
-            # proves it knows the account by encrypting the reply with
-            # Tiger192(password): a server without the credential cannot produce
-            # a reply the client will accept, which is what authentication means
-            # here. (The client sends no password proof of its own.)
             uname, uid, kc, how, refused = self.resolve_login(body)
-            # A REFUSED login gets an unregistered key. §54: the reply carries
-            # the session key twice and only one copy is encrypted, so a refusal
-            # that registered its key still issued a usable LSG credential --
-            # the client could not read the ticket and did not need to.
             session_key = new_session_key(
                 uname, register=not refused or LSG_NO_KEY_CHECK)
             handle = None
             if PROOF_HANDLE and not refused:
-                # §60: the clear proof gets a handle, the ticket keeps the key.
                 handle = secrets.token_bytes(24)
                 PROOF_HANDLES[handle] = (uname, session_key)
             reply = build_login_reply(session_key, kc, username=uname,
@@ -5917,28 +3543,8 @@ class AuthConnection(asyncio.Protocol):
                     f"for that key; the key itself is only in the ticket)")
             self.t.write(reply)
         elif auth_type == AUTH_CHANGE_PASSWORD_REQ:
-            # WHY THIS EXISTS AT ALL: with no reply the console hangs FOREVER.
-            # `Change password` on the User profile edit screen opens a new auth
-            # TCP connection and its state machine polls the task every frame
-            # (0x089712ec calls the task's status getter at 0x08c13c70 and
-            # returns while it is non-zero). m_status is only
-            # cleared when a reply is processed, so silence is an infinite lock --
-            # every button inert, measured at 48 minutes, recoverable only by
-            # restarting the emulator. It is one row from `Upload flag`.
-            #
-            # ANY reply frees it: the reply dispatcher (`0x08c14764`) reads the
-            # typed u32 error FIRST and, when it is not 700, branches straight to
-            # `0x08c14db8` ("Task returned with error code %u") and completes the
-            # task -- the reply-type byte is never even looked at. The game then
-            # maps the code to a string and transitions to its own error state.
-            # So an honest refusal is safe and needs none of the unknowns below.
             err = BD_AUTH_UNKNOWN_ERROR
             try:
-                # The request names its own account: the 8-byte field is the same
-                # Tiger192(username)[:8] the login request carries. So this does
-                # not depend on which connection it arrived on -- and it must not,
-                # because Change password opens a BRAND NEW auth connection that
-                # has never logged in.
                 req = parse_change_password(body)
                 acct = account_by_handle(req["user_hash"])
                 name = acct["name"] if acct else None
@@ -5950,24 +3556,12 @@ class AuthConnection(asyncio.Protocol):
                 pt = auth_payload_decrypt(req["ciphertext"], current, req["iv_seed"])
                 if name is None:
                     err = BD_AUTH_BAD_ACCOUNT
-                    # Say what to do, because this is a dead end for the
-                    # console and it cannot tell you so. A change-password
-                    # request names its account by HANDLE, which is a one-way
-                    # hash, and the name is only ever sent once -- in the create
-                    # message. So a server that missed that message, or lost its
-                    # store, can never learn the name from any later traffic,
-                    # and the console cannot write its own credential by any
-                    # route. Only the operator can, and only if a human
-                    # remembers the name.
                     log("    no account with that handle -> 704 "
                         "BD_AUTH_BAD_ACCOUNT")
                     log("    (the name is not recoverable from a handle. If you "
                         "know it: wow2-account set <name>, then have the console "
                         "sign in with that password)")
                 elif pt is None:
-                    # The magic did not come back, so the player mistyped their
-                    # CURRENT password. A real answer, and the client has a string
-                    # for it.
                     err = BD_AUTH_INCORRECT_PASSWORD
                     log("    current password does NOT match -> 716 "
                         "BD_AUTH_INCORRECT_PASSWORD")
@@ -5979,20 +3573,6 @@ class AuthConnection(asyncio.Protocol):
                         f"-> {new_hash.hex()} (stored)")
             except Exception as e:
                 log(f"  (couldn't decode the change-password request: {e})")
-            # REPLY TYPE: 0x03 by the 0x00 -> 0x01 convention. It is NOT confirmed
-            # -- the client's only reply-type jump table covers 0x0b..0x13 (real
-            # handlers at 0x0b/0x0d/0x0f/0x11, all of which read a user ticket) and
-            # 0x03 is outside it. That is harmless here precisely because a non-700
-            # error short-circuits before the switch; it would matter for a SUCCESS
-            # reply, which this server cannot send yet anyway.
-            # REPLY TYPE: 0x03, by the 0x00 -> 0x01 convention. Still not
-            # confirmed, and it does not have to be. The client's only reply
-            # dispatcher (0x08c14764) reads the error FIRST; a non-700 error
-            # short-circuits to 0x08c14db8, and on 700 an out-of-range type falls
-            # through 0x08c14d78 to the same return of the error -- so the task
-            # completes carrying 700 either way. The reply type matters only for
-            # the four handlers that read a user TICKET (0x0b/0x0d/0x0f/0x11), and
-            # change-password does not want one.
             err = int(os.environ.get("WOW2_CHANGE_PW_ERR", err))
             reply = build_auth_reply(AUTH_CHANGE_PASSWORD_REPLY, err)
             log(f"  -> send ChangePasswordReply (0x03, error {err}"
@@ -6011,10 +3591,6 @@ class AuthConnection(asyncio.Protocol):
         if was_lsg:
             del LSG_CONNS[self.ident_key]
         log(f"TCP {self.peer} closed ({exc})")
-        # Only the LSG connection an account is bound to takes its sessions
-        # with it (§65). An auth connection closing -- every login, every
-        # password change, from anyone sharing the address -- used to expire
-        # every session hosted from that address.
         if was_lsg:
             sessions_host_gone(self.ident_key)
 
@@ -6040,43 +3616,15 @@ NO_SELF_REWRITE = os.environ.get("WOW2_NO_SELF_REWRITE") == "1"
 
 
 def discovered_self(ip: str) -> str:
-    """What to tell a console its OWN address is, in the 0x1f/0x15 reply.
-
-    This is not cosmetic: the console publishes what we say here. A live create
-    request announced private `7f 00 00 01 03 0c`, byte for byte the
-    `1f 02 00 7f 00 00 01 03 0c` we had just sent it, and it re-sends that same
-    bdCommonAddr *inside the peer protocol*, where the server never sees the
-    bytes and host_addr_for() cannot reach them. Telling console 1 "you are
-    127.0.0.1" therefore hands every namespaced joiner an address that resolves
-    to the joiner's own empty loopback -- and the joiner does try it: right after
-    the host's 96-byte session message it fires bdNAT intro requests at both
-    announced endpoints, 192.0.2.72:3075 and 127.0.0.1:3075.
-
-    The bridge address is reachable from the host itself and from every
-    namespace, so for a loopback client it is strictly the better answer. Only
-    rewrite when the bridge actually exists, so a single-console rig with no
-    namespaces is untouched. WOW2_NO_SELF_REWRITE=1 disables it.
-    """
+    """What to tell a console its OWN address is, in the 0x1f/0x15 reply."""
     if NO_SELF_REWRITE or not BRIDGE_UP or not ip.startswith("127."):
         return ip
     return rigconfig.NETNS_BRIDGE_IP
 
 
 def server_address_for(client_ip: str) -> str:
-    """OUR address, as the console at `client_ip` reaches us.
-
-    Not to be confused with `discovered_self()`, which answers the opposite
-    question -- what to tell the console ITS address is. Mixing the two hands a
-    console its own address as the server's, and it is not always a harmless
-    mistake: the NAT type probe SENDS test 3 to whatever we name here, so a
-    console told "the server is you" probes itself and the test silently never
-    happens.
-    """
+    """OUR address, as the console at `client_ip` reaches us."""
     ip = natrelay.server_addr_for(client_ip)
-    # The rig's bridge correction, for the same reason as in discovered_self():
-    # loopback is right for the host console and useless to every namespaced
-    # one. An operator who set `public_address` explicitly is never second-
-    # guessed.
     if (ip.startswith("127.") and BRIDGE_UP and not NO_SELF_REWRITE
             and not natrelay.PUBLIC_ADDRESS):
         ip = rigconfig.NETNS_BRIDGE_IP
@@ -6084,56 +3632,14 @@ def server_address_for(client_ip: str) -> str:
 
 
 def discovered_endpoint(addr: tuple[str, int]) -> tuple[str, int]:
-    """The (ip, port) to tell a console its own public address is.
-
-    WITHOUT the relay this is `discovered_self()` and the console's own source
-    port -- a plain STUN-style reflection.
-
-    WITH the relay it is the console's MAILBOX, and that single substitution is
-    what makes the whole thing work. The console publishes this address: in the
-    `bdCommonAddr` of its create request, in `addrA` of every introduction it
-    originates, and -- the one that matters -- in the copy it re-advertises
-    inside the encrypted peer protocol, which the server cannot see and could
-    never rewrite. Because it is only ever told one address for itself, that
-    unreachable-by-the-server copy is correct by construction.
-    """
+    """The (ip, port) to tell a console its own public address is."""
     mb = natrelay.RELAY.mailbox_for(addr)
     if mb is None:
         return discovered_self(addr[0]), addr[1]
-    # The mailbox is on US, so the address has to be ours -- and reachable by the
-    # console's FUTURE PEER, not by the console itself. A loopback client would
-    # otherwise be told the server is at 127.0.0.1, and the namespaced joiner it
-    # is about to play would dial its own empty loopback.
     return server_address_for(addr[0]), mb.port
 
 
 # ---------------------------------------------------------------- NAT TYPE
-# The game's own three-test STUN probe, `bdNATTypeDiscoveryClient`. It fires at
-# the `stun.*` names, which our DNS points here, and we ignored every packet --
-# so the console spent three timeouts at startup and learned nothing.
-#
-# THE REQUEST IS FOUR BYTES: [u8 0x14][u16 2][u8 changeFlags], built by the
-# constructor at 0x08c93974 (`sb 0x14; sh 2, +2; sw flags, +4`) and written by
-# the serialiser at 0x08c93990 as 1 + 2 + 1 bytes. The flags are RFC 3489's
-# CHANGE-REQUEST bits, read straight off the three call sites:
-#
-#   test 1  flags 0   plain binding request     -> MAPPED + CHANGED
-#   test 2  flags 3   change IP *and* port      -> reply received = BD_NAT_OPEN
-#   test 3  flags 2   change port only          -> reply received = BD_NAT_MODERATE
-#                                                  no reply         = BD_NAT_STRICT
-#
-# THE REPLY IS [u8 0x15][u16 2][bdAddr mapped][bdAddr changed] -- first the
-# console's own public address, then ours. The client stores them at +0x14 and
-# +0xc of the discovery object (0x08c92d3c) and then:
-#
-#   * test 2's reply is accepted only if its source IP EQUALS changed.ip and its
-#     source port DIFFERS from changed.port (0x08c92e84). So `changed` is what
-#     decides where test 2 may come from, and it is ours to choose.
-#   * test 3's reply is accepted from ANY source; the only check is that the
-#     mapped address still matches test 1's (0x08c92f20). Which is why answering
-#     test 3 from the MAIN port is worthless: it always arrives, so it always
-#     says MODERATE. The distinction the test exists to make is made by the
-#     SOURCE PORT, so the reply has to go out of a different socket.
 NAT_TYPE_REQ = 0x14
 NAT_TYPE_REPLY = 0x15
 NAT_CHANGE_NONE, NAT_CHANGE_PORT, NAT_CHANGE_BOTH = 0, 2, 3
@@ -6150,61 +3656,31 @@ class NatTypeSocket(asyncio.DatagramProtocol):
         self.t = transport
 
     def datagram_received(self, data, addr):
-        # Nothing should ever dial these; a console only ever talks to the main
-        # port. Log it rather than drop it in silence -- if it happens, some
-        # assumption above is wrong.
         log(f"UDP {addr[0]}:{addr[1]} -> {self.name} socket, {len(data)}B "
             f"(unexpected): {data[:32].hex()}")
 
 
-NAT_TYPE_PORT_SOCK: NatTypeSocket | None = None   # same IP, different port
-NAT_TYPE_ADDR_SOCK: NatTypeSocket | None = None   # different IP and port
+NAT_TYPE_PORT_SOCK: NatTypeSocket | None = None
+NAT_TYPE_ADDR_SOCK: NatTypeSocket | None = None
 
 
 def nat_type_changed_addr(addr: tuple[str, int]) -> tuple[str, int]:
-    """What to advertise as CHANGED. It does TWO jobs, and the second is easy to
-    miss: it is the address test 2's reply must come from, AND IT IS WHERE THE
-    CONSOLE SENDS TEST 3 (0x08c929f8 takes the address at +0xc of the reply,
-    where tests 1 and 2 use the one at +4). Name an address the console cannot
-    reach and test 3 is not
-    slow or rejected -- it never arrives anywhere, and the probe ends with no
-    NAT type at all.
-
-    With a second public address configured this names it, and test 2 becomes a
-    real full-cone test. Without one it names us, which is honest and still
-    useful -- test 3 comes back here and is answered from the alternate PORT --
-    and we then decline to answer test 2 rather than answer it from this address,
-    because a reply from the same IP passes the client's check and would declare
-    BD_NAT_OPEN for a NAT that is merely address-restricted.
-    """
+    """What to advertise as CHANGED."""
     alt = serverconfig.NAT_TYPE_ALT_ADDRESS
     return (alt or server_address_for(addr[0])), serverconfig.PORT
 
 
-# UDP is connectionless, so nothing on this socket has a per-connection cap
-# the way the TCP side does (`over_limit`). §65 bounds the three things a
-# datagram used to grow without limit: the bdNAT endpoint table, the sample
-# ring of unrecognised datagrams, and the per-source sample FILES -- one file
-# per source port, appended for ever, which a sender can mint at will.
 import collections
 _UNKNOWN_UDP: collections.deque = collections.deque(maxlen=64)
-UNKNOWN_UDP_LOG_PER_MIN = 20      # full lines per minute; the rest are counted
-UNKNOWN_UDP_FILES_MAX = 16        # distinct sample files per run
-UNKNOWN_UDP_FILE_BYTES = 65536    # and each stops growing here
-_unknown_udp_minute = [0.0, 0, 0, set()]   # window start, logged, suppressed, sources
+UNKNOWN_UDP_LOG_PER_MIN = 20
+UNKNOWN_UDP_FILES_MAX = 16
+UNKNOWN_UDP_FILE_BYTES = 65536
+_unknown_udp_minute = [0.0, 0, 0, set()]
 _unknown_udp_files: set[str] = set()
 
 
 def unknown_udp_note(peer: str, data: bytes, addr: tuple[str, int]) -> None:
-    """Log and sample an unrecognised datagram, within the caps above.
-
-    The traffic is worth seeing -- it is how the "'Joining game...' sends
-    nothing to the server" reading was found to be wrong -- and it is also
-    the one thing anybody on the internet can send here at any rate, so the
-    first twenty a minute are printed in full and the rest become one summary
-    line per minute. Sample files are written only with hexdumps on (the rig)
-    and stop at sixteen files of 64 KB.
-    """
+    """Log and sample an unrecognised datagram, within the caps above."""
     now = time.time()
     win = _unknown_udp_minute
     if now - win[0] >= 60:
@@ -6240,67 +3716,16 @@ def unknown_udp_note(peer: str, data: bytes, addr: tuple[str, int]) -> None:
         pass
 
 # ------------------------------------------------- bdNAT traversal brokering
-#
-# bdNATTravClient (the game's own source path string is bdNATTravClient.cpp).
-# Its packets are 29 bytes and share one class, bdNATTraversalPacket:
-#
-#   [0]      u8   type
-#   [1:3]    u16  version, always 2 -- the deserialiser bails if it reads < 2
-#   [3:13]   u8   hmac[10]
-#   [13:17]  u32  identifier        (the peer's bdCommonAddr id; the key the
-#                                    originator files its pending request under)
-#   [17:23]  bdAddr addrA           4 in_addr bytes + u16 LE port
-#   [23:29]  bdAddr addrB
-#
-# Types, from the switch at +0x48cec4 (dispatcher +0x48a4a4 admits 0x0a..0x13,
-# the switch then handles only these five and silently drops the rest):
-#
-#   0x0a  INTRO NAT REQ   client -> introducer (us). On a CLIENT this case is a
-#                         no-op that warns "Received server packet in client
-#                         code" -- it is addressed to the server, and we are it.
-#   0x0b  relayed intro   introducer -> the target peer. The target flips the
-#                         type to 0x0c and sends it to the packet's addrA.
-#   0x0c  INTRO REPLY     peer -> originator. HMAC-verified, then the pending
-#                         entry's callback is handed the DATAGRAM'S SOURCE
-#                         ADDRESS as where the peer can be reached.
-#   0x0d  INTRO REQ       peer -> peer directly, same flip-to-0x0c reply.
-#   0x0e  keep alive      every 15 s (a literal 15.0f compare in pump()).
-#                         Its case body is `b <return>` -- it wants NO reply.
-#
-# So there is no 0x0f: the "0x1e->0x1f / 0x14->0x15" pattern does not extend
-# here, and our silence on 0x0e was correct all along.
-#
-# Our whole job is one line of work: on 0x0a, put 0x0b in byte 0 and send the
-# SAME 29 bytes to addrB. Nothing else may change, because the 10-byte HMAC
-# covers identifier|addrA|addrB under a key only the originator has -- the
-# relay cannot recompute it and does not need to.
-#
-# Rewriting an address here is not a small mistake, it is a redirect. An early
-# attempt answered the joiner with 0x0b carrying the JOINER's own address in
-# addrA; the joiner dutifully sent its 0x0c there, received it, verified the
-# (untouched, still valid) HMAC, and took the source address of that datagram
-# as the peer -- so it opened a full session handshake with itself, 30/169/106/
-# 32-byte datagrams to 10.42.0.2:3074 looping straight back.
 NAT_INTRO_REQ = 0x0A
 NAT_INTRO_RELAY = 0x0B
 NAT_INTRO_REPLY = 0x0C
 NAT_KEEPALIVE = 0x0E
 NAT_MSG_SIZE = 29
 NAT_ADDR_SIZE = 6
-NAT_ADDR_UNSET = bytes.fromhex("00ff00ff0000")   # a default-constructed bdAddr
+NAT_ADDR_UNSET = bytes.fromhex("00ff00ff0000")
 
 NAT_BROKER = os.environ.get("WOW2_NAT_BROKER", "relay").lower()
 
-# ...re-read per request from capture/nat-broker.mode if that file exists,
-# because every server restart costs a full re-drive of BOTH consoles (sign in,
-# host, browse) before a join can be attempted again.
-#
-#   relay   the real thing: 0x0b to the host, verbatim but for byte 0
-#   reply   answer the joiner 0x0c ourselves. The HMAC still checks out, but
-#           0x0c's callback believes the SOURCE of the datagram is the peer,
-#           so this tells the joiner the host is US. Diagnostic only -- it
-#           proves the joiner's parse without involving the host at all.
-#   off     drop it, i.e. the behaviour before any of this existed
 NAT_MODE_FILE = CAP / "nat-broker.mode"
 
 
@@ -6312,27 +3737,8 @@ def nat_broker_mode() -> str:
         return NAT_BROKER
 
 
-# Where each console's bdNAT socket really is, learned from its keepalives.
-# This matters because the addrB a joiner asks for is the address WE gave it:
-# host_addr_for() rewrote the host's own 192.0.2.72 to the bridge, so the
-# relay has to be SENT to console 1's real 127.0.0.1:3075 while the bytes on
-# the wire keep saying 10.42.0.1:3075 -- change them and the HMAC dies.
-#
-# endpoint -> when it last keepalived. A console keepalives every 15 s, so an
-# entry that has been silent for NAT_PEER_TTL is a console that is gone (or a
-# datagram that was never a console), and it is swept rather than kept for
-# ever (§65). The table is also capped: past NAT_PEERS_MAX the oldest entry
-# goes, so a run of forged keepalives cannot grow it -- and cannot make the
-# port-match in nat_endpoint_for() ambiguous for a real console, because the
-# forged entries age out 90 s after they stop.
 NAT_PEERS: dict[tuple[str, int], float] = {}
 NAT_PEER_TTL = 90.0
-# Every ONLINE console holds one entry (its keepalive every 15 s), so this is
-# a ceiling on the population, not only on a flood: past it the oldest
-# console's entry goes and an introduction to it fails until its next
-# keepalive. 256 (§65) was that ceiling; an entry is ~100 bytes, so the cap
-# is now far above any population this server will see and only the TTL does
-# real work.
 NAT_PEERS_MAX = 16384
 
 
@@ -6358,14 +3764,7 @@ def nat_parse(data: bytes):
 
 
 def nat_endpoint_for(target: tuple[str, int], sender: tuple[str, int]):
-    """Translate an advertised peer address to where that console really is.
-
-    A console only ever learns a peer address from us, so the address it names
-    is ours to undo. Matching on the port is enough and stays honest: each
-    console keepalives from its own single bdNAT socket, so "the endpoint on
-    that port which is not the sender" is unambiguous with two consoles, and
-    this returns None rather than guessing if that ever stops being true.
-    """
+    """Translate an advertised peer address to where that console really is."""
     nat_peers_sweep()
     if target in NAT_PEERS:
         return target
@@ -6382,17 +3781,8 @@ class Discovery(asyncio.DatagramProtocol):
         reply = None
         if len(data) >= 3 and data[1:3] == b"\x02\x00":
             if data[0] == 0x1E:
-                # The ONLY reply the console is known to publish (Phase 15: a
-                # create request carried these nine bytes back verbatim), so it
-                # is the only one that gets a relay mailbox.
                 reply = b"\x1f\x02\x00" + bd_addr(*discovered_endpoint(addr))
             elif data[0] == NAT_TYPE_REQ:
-                # A different socket asks this one -- measured on the rig, the
-                # 0x1e and the bdNAT keepalives both come from the game's bd
-                # socket on 3075 while 0x14 comes from an ephemeral port that
-                # then says nothing else at all. Handing it a mailbox would burn
-                # a port on a console that will never use it and invent a second
-                # peer at the same address, so it keeps the plain reflection.
                 self.nat_type(data, addr)
                 return
         if reply:
@@ -6402,41 +3792,21 @@ class Discovery(asyncio.DatagramProtocol):
 
         msg = nat_parse(data)
         if msg and msg[0] == NAT_KEEPALIVE:
-            # One line the first time a console turns up and silence after
-            # that: it is every 15 s per console, which buried the log, but
-            # never printing it left no way to tell whether the endpoint table
-            # the relay depends on had been populated at all.
             nat_peers_sweep()
             if addr not in NAT_PEERS:
                 log(f"UDP {peer} bdNAT keepalive -- console registered "
                     f"(now {len(NAT_PEERS) + 1} known)")
             NAT_PEERS[addr] = time.time()
-            # The keepalive is what holds this mapping open, and the mapping is
-            # where the bootstrap 0x0b has to be sent -- so it is also the right
-            # place to make sure the console has a mailbox even if we somehow
-            # missed its discovery request.
             natrelay.RELAY.mailbox_for(addr)
             return
         if msg and msg[0] == NAT_INTRO_REQ and nat_broker_mode() != "off":
             self.introduce(data, msg, addr)
             return
 
-        # Anything else used to be dropped in silence, and that hid the most
-        # interesting traffic on the rig: joining a game sends 29-byte datagrams
-        # to UDP 3074 -- OUR port, not the host console's -- roughly once a
-        # second before the joiner moves on to the host's 3075. They arrived,
-        # matched neither discovery opcode, and vanished without a line, so the
-        # "'Joining game...' sends nothing to the server" reading was wrong: it
-        # sends plenty, we just never printed it.
         unknown_udp_note(peer, data, addr)
 
     def nat_type(self, data: bytes, addr: tuple[str, int]) -> None:
-        """Answer one test of the console's NAT type probe.
-
-        The reply for test 3 goes out of a DIFFERENT SOCKET on purpose; see the
-        NAT TYPE block above for why answering it from here would turn the whole
-        probe into a constant.
-        """
+        """Answer one test of the console's NAT type probe."""
         peer = f"{addr[0]}:{addr[1]}"
         flags = data[3] if len(data) > 3 else NAT_CHANGE_NONE
         name = {NAT_CHANGE_NONE: "test 1", NAT_CHANGE_PORT: "test 3 (change port)",
@@ -6444,10 +3814,6 @@ class Discovery(asyncio.DatagramProtocol):
         if not serverconfig.NAT_TYPE:
             log(f"UDP {peer} NAT type {name} -- ignored (type discovery off)")
             return
-        # MAPPED is always what the request arrived from. It is the same in every
-        # test because every test goes to this same socket, which is the point:
-        # the client compares test 3's against test 1's to catch a NAT that
-        # remapped underneath it.
         mine = discovered_self(addr[0])
         body = (bytes([NAT_TYPE_REPLY, 0x02, 0x00])
                 + bd_addr(mine, addr[1])
@@ -6462,16 +3828,6 @@ class Discovery(asyncio.DatagramProtocol):
             via = (f"{serverconfig.NAT_TYPE_ALT_ADDRESS} (ephemeral port)"
                    if serverconfig.NAT_TYPE_ALT_ADDRESS
                    else "second-public-address")
-            # A SECOND ADDRESS THAT IS THE FIRST ONE IS NOT A SECOND ADDRESS.
-            # The client only checks that the source IP equals the advertised
-            # CHANGED ip and the port differs -- so `alt = <our own address>`
-            # passes, and the console reports OPEN for a NAT that merely lets
-            # our IP back in on any port. That is the one wrong answer with a
-            # cost: OPEN means "skip the relay, punch directly", and the punch
-            # then fails. Refuse rather than over-report.
-            # Compare against both the routed answer and the raw one: the rig
-            # rewrites loopback to the bridge, so either alone can miss an
-            # operator who wrote the other form.
             ours = {server_address_for(addr[0]), natrelay.server_addr_for(addr[0])}
             if sock is not None and serverconfig.NAT_TYPE_ALT_ADDRESS in ours:
                 log(f"UDP {peer} NAT type {name} -- NOT answered: "
@@ -6485,9 +3841,6 @@ class Discovery(asyncio.DatagramProtocol):
             log(f"UDP {peer} NAT type {name} -- unknown change flags, ignored")
             return
         if sock is None:
-            # Not a failure: an unanswerable test is how the console learns its
-            # NAT is restrictive. Say so, because "no reply" and "no socket" look
-            # identical from the console and only one of them is a measurement.
             log(f"UDP {peer} NAT type {name} -- NOT answered "
                 f"(no {via} socket; the console will retry, time out and "
                 f"fall through to the next test)")
@@ -6511,10 +3864,6 @@ class Discovery(asyncio.DatagramProtocol):
 
         target = None
         if natrelay.RELAY.enabled:
-            # With the relay on, addrB is a mailbox we handed out, so this is an
-            # exact lookup rather than the port-matching guess below. Pairing the
-            # two consoles here is what lets the host's 0x0c be attributed when
-            # it arrives from an endpoint we have never seen.
             owner = natrelay.RELAY.owner_of_advertised(b_addr)
             if owner is not None:
                 natrelay.RELAY.pair(natrelay.RELAY.console_at(addr), owner)
@@ -6529,37 +3878,16 @@ class Discovery(asyncio.DatagramProtocol):
             log(f"    no bdNAT socket known for {b_addr[0]}:{b_addr[1]} "
                 f"-- seen: {sorted(NAT_PEERS)}")
             return
-        # Byte 0 and nothing else. The address bytes stay as the joiner wrote
-        # them even though we are sending them somewhere else -- they are under
-        # the HMAC, and the host reads addrA (the joiner) to know where to
-        # answer, which is correct as written.
         out = bytes([NAT_INTRO_RELAY]) + data[1:]
         self.t.sendto(out, target)
         log(f"    0x0b -> {target[0]}:{target[1]}  {out.hex()}")
 
 
-#: Tiger192 of the empty string. Any implementation that gets this wrong is not
-#: the hash this protocol is built on.
 TIGER_EMPTY = tiger.TIGER_EMPTY
 
 
 def check_tiger() -> None:
-    """Refuse to start if Tiger192 is wrong.
-
-    Tiger192 is the hash the entire auth path depends on -- the login proof key,
-    the account handle, the credential store. If it were wrong, `resolve_login()`
-    would key every reply with garbage and the console would get a TCP
-    connection that accepts its login and then draws "The online profile name or
-    password is incorrect" -- a maddening thing to debug, because the port is
-    open, the server is running and the log looks healthy.
-
-    Until Phase 64 the digest came from the `rhash` binary, and that is where
-    this check earned its place: on the first real deployment `apt install
-    rhash python3-venv` aborted on an unrelated 404, apt rolled the whole
-    transaction back, and every sign-in simply hung. `tools/tiger.py` is pure
-    Python now and verifies its own table at import, so this is belt and
-    braces -- but a startup line is still cheaper than an hour of captures.
-    """
+    """Refuse to start if Tiger192 is wrong."""
     got = tiger192(b"").hex()
     if got != TIGER_EMPTY:
         raise SystemExit(
@@ -6571,12 +3899,7 @@ def check_tiger() -> None:
 
 
 async def start_nat_type_sockets(loop, bind: str) -> None:
-    """Bind the extra source addresses the NAT type probe needs.
-
-    A bind that fails is logged and survived: the console then times that test
-    out and reports a more restrictive NAT, which is the safe direction to be
-    wrong in.
-    """
+    """Bind the extra source addresses the NAT type probe needs."""
     global NAT_TYPE_PORT_SOCK, NAT_TYPE_ADDR_SOCK
     if not serverconfig.NAT_TYPE:
         return
@@ -6590,13 +3913,6 @@ async def start_nat_type_sockets(loop, bind: str) -> None:
         log(f"!! NAT type: could not bind UDP {bind}:{alt_port} ({e}) -- test 3 "
             f"will go unanswered, so every console reports STRICT")
     if alt_addr:
-        # EPHEMERAL PORT, deliberately. It cannot share `alt_port`: with the
-        # usual bind of 0.0.0.0 the change-port socket above already holds that
-        # port on every address, including this one. And it does not need a
-        # fixed port -- the client's only requirement for test 2 is that the
-        # source port differs from the advertised CHANGED port, which is the
-        # main one. So there is nothing here for an operator to open or
-        # remember.
         try:
             _tr, NAT_TYPE_ADDR_SOCK = await loop.create_datagram_endpoint(
                 lambda: NatTypeSocket("nat-type change-addr"),
@@ -6608,9 +3924,6 @@ async def start_nat_type_sockets(loop, bind: str) -> None:
 
 async def main():
     check_tiger()
-    # The store, before the port: an import of a JSON store happens here, in
-    # the log, and a damaged database or an unreadable file stops the process
-    # before a console can reach it (§66).
     store.set_logger(log)
     try:
         store.startup()

@@ -4,28 +4,6 @@
     .venv/bin/python tools/blocktest.py            # the suite
     .venv/bin/python tools/blocktest.py --revert   # WOW2_NO_BLOCK_GUARD=1
     .venv/bin/python tools/blocktest.py --keep     # leave the scratch dir
-
-WHY THIS IS NOT DRIVEN ON THE RIG. The retail half of F19 belongs on two
-consoles and is run there; this covers the half a console cannot reach. The
-direction that matters -- *they* blocked *me* and I invite them anyway -- needs a
-sender whose client has not already decided to be polite about it, and a retail
-console has. It also needs all three invite paths in one run, which on the rig
-is a host, a clan and about twenty minutes.
-
-WHAT F19 FOUND, and what it did not. The suite measured the other direction:
-block somebody, then `Add buddy by name` them, and the CLIENT sends `op 6
-UNBLOCK` before the invite -- one cross, two RPCs, 101 ms apart, block gone,
-nothing on screen naming it. That is the client's decision and the server has no
-say in it. The case then recorded that `friends_add()` "does not consult
-`blocked` at all", which is WRONG: the guard has been there since Phase 28, in
-the direction the test did not exercise. What was really missing is the other
-two invites -- a match invite (Friends op 8) and a clan invite (Teams op 6) both
-sailed straight past the block list, so a block stopped one of the three things
-it looks like it stops.
-
-Standing up a whole server per run is the cheap part (~1 s) and it buys a
-data dir nobody else is writing, which is the only way a check can assert on
-`friends-db.json` and mean it.
 """
 from __future__ import annotations
 
@@ -41,7 +19,7 @@ import tempfile
 import time
 from pathlib import Path
 
-HERE = Path(__file__).resolve().parent     # beside authserver.py in both trees
+HERE = Path(__file__).resolve().parent
 sys.path.insert(0, str(HERE))
 
 import bdproto as bd                                        # noqa: E402
@@ -59,7 +37,8 @@ CLAN_NAME = "blockclan"
 # --------------------------------------------------------------- request bodies
 def _rpc(service: int, op: int) -> bd.BdWriter:
     """The writer for a parameterised RPC: service byte, tc bit, op, and the
-    [u8 0] lead-in every RPC carries. `Console.send()` encrypts it."""
+    [u8 0] lead-in every RPC carries. `Console.send()` encrypts it.
+    """
     w = bd.BdWriter()
     w.bitmode = True
     w.type_checked = False
@@ -67,7 +46,7 @@ def _rpc(service: int, op: int) -> bd.BdWriter:
     w.write_bits(b"\x01", 1)
     w.type_checked = True
     w.u8(op)
-    w.u8(0)                       # the [u8 0] lead-in, constant on every RPC
+    w.u8(0)
     return w
 
 
@@ -103,11 +82,8 @@ def req_clan_invite(team_id: int, target: int) -> bytes:
 
 
 def encrypt_rpc(key: bytes, seed: int, payload: bytes) -> bytes:
-    """Frame `payload` (service byte first, then the bit stream) the way a
-    console sends every service RPC (§60): [u8 1][u32 seed] then 3DES-CBC
-    under the session key of [u32 hmac slot][u8 service][bits], padded with
-    the seed's low byte. Same construction as `lsgauth.lsg_rpc_encrypted`,
-    for a payload that carries parameters."""
+    """Frame `payload` the way a console sends a service RPC (§60): [u8 1][u32 seed]
+    then 3DES-CBC under the session key, padded with the seed's low byte."""
     from authserver import session_cbc_encrypt, tiger_iv
     plain = struct.pack("<I", 0) + payload
     plain += bytes([seed & 0xFF]) * ((-len(plain)) % 8)
@@ -117,15 +93,7 @@ def encrypt_rpc(key: bytes, seed: int, payload: bytes) -> bytes:
 
 # ------------------------------------------------------------------- the peers
 class Console:
-    """A signed-in LSG connection that can send service RPCs.
-
-    It needs the password. Until §60 it did not -- the opaque proof came back
-    in clear beside the ticket and an unencrypted RPC on it was served -- and
-    this tool was the demonstration of that residue. Now the connect binds
-    only provisionally and the first RPC has to decrypt under the key inside
-    the ticket, which only the password opens; an unencrypted RPC closes the
-    connection, which is what this tool hit for a phase (Phase 64).
-    """
+    """A signed-in LSG connection that can send service RPCs."""
 
     def __init__(self, host: str, port: int, account: str):
         self.account = account
@@ -144,7 +112,7 @@ class Console:
     def send(self, payload: bytes) -> None:
         self.seed += 1
         self.p.send(encrypt_rpc(self.key, self.seed, payload))
-        self.p.frames(timeout=1.0)          # let the reply land before we assert
+        self.p.frames(timeout=1.0)
 
     def close(self) -> None:
         self.p.close()
@@ -178,11 +146,7 @@ def start_server(tmp: Path, revert: bool) -> subprocess.Popen:
 
 
 def seed(tmp: Path) -> None:
-    """Three accounts with real credentials, and a clan alice1 already owns.
-
-    The clan is seeded rather than created over the wire because the thing under
-    test is the INVITE, and a create would only add a way for the setup to fail.
-    """
+    """Three accounts with real credentials, and a clan alice1 already owns."""
     tmp.mkdir(parents=True, exist_ok=True)
     accounts, names = {}, {}
     for i, a in enumerate(ACCOUNTS):
@@ -208,7 +172,8 @@ def seed(tmp: Path) -> None:
 
 def friends(tmp: Path) -> dict:
     """The social store as the JSON file had it -- exported from the scratch
-    server's own SQLite store (§66 step 4), same keys, same shapes."""
+    server's own SQLite store (§66 step 4), same keys, same shapes."
+    """
     import store
     conn = store.connect(tmp / store.DB_NAME)
     try:
@@ -219,7 +184,8 @@ def friends(tmp: Path) -> dict:
 
 def teams(tmp: Path) -> dict:
     """The clan store as the JSON file had it, exported from the scratch
-    server's own SQLite store (§66 step 5)."""
+    server's own SQLite store (§66 step 5)."
+    """
     import store
     conn = store.connect(tmp / store.DB_NAME)
     try:
@@ -249,9 +215,9 @@ class Checks:
 
 def run(tmp: Path, revert: bool) -> int:
     check = Checks()
-    alice = Console("127.0.0.1", PORT, ACCOUNTS[0])       # the sender
-    bob = Console("127.0.0.1", PORT, ACCOUNTS[1])         # blocks alice
-    carol = Console("127.0.0.1", PORT, ACCOUNTS[2])       # blocks nobody
+    alice = Console("127.0.0.1", PORT, ACCOUNTS[0])
+    bob = Console("127.0.0.1", PORT, ACCOUNTS[1])
+    carol = Console("127.0.0.1", PORT, ACCOUNTS[2])
 
     print("\n-- bob blocks alice, carol blocks nobody")
     bob.send(req_block(alice.entity, 1))
@@ -327,9 +293,6 @@ def main() -> int:
         else:
             shutil.rmtree(tmp, ignore_errors=True)
     if a.revert:
-        # The guards must all fail and the control must still pass, so "some
-        # failed" is the pass condition -- a clean run here means the switch
-        # reverted nothing and the checks are worth nothing.
         return 0 if failed else 1
     return 1 if failed else 0
 

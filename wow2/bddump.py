@@ -1,24 +1,10 @@
 #!/usr/bin/env python3
 """Decode an LSG message body into its typed bd fields.
 
-Every LSG payload (client->server request or our reply) is a type-checked
-bitstream: a 1-bit `type_checked` flag, then for each field a 5-bit data-type
-tag followed by the value.  Because the tags are in the stream, a message can
-be walked WITHOUT knowing the RPC's parameter list -- which is exactly what you
-need when mapping a service you have never answered before.
-
     tools/bddump.py --log                       # last message in the newest session log
     tools/bddump.py --log --svc 4 --op 5        # ...the last Stats op 5
     tools/bddump.py --log --all --svc 21        # every Matchmaking message
     tools/bddump.py --hex "c1dd098c 04 47c1..." # a plaintext pasted from a log
-
-Input is the DECRYPTED plaintext as the server logs it under "decrypted
-plaintext:", i.e. [u32 hmac][u8 service][bitstream].  --raw skips that header
-and treats the input as a bare body.
-
-Ranged ints (BD_RANGED_*) cannot be decoded blind -- their width comes from a
-min/max the sender and receiver agree on out of band -- so the walk stops there
-and reports how many bits were left.
 """
 import argparse, pathlib, re, sys
 
@@ -55,9 +41,6 @@ def read_field(r: bd.BdReader):
     if t in FIXED:
         n = FIXED[t]
         if t == bd.BD_BOOL:
-            # A bool is ONE BIT, not one byte: read_bits(1) returns a byte whose
-            # low bit is the value, and slicing it to n//8 = 0 bytes used to make
-            # this raise IndexError and truncate the whole walk.
             return t, bool(r.read_bits(1)[0] & 1)
         raw = r.read_bits(n)[: n // 8]
         if t == bd.BD_F32:
@@ -86,10 +69,6 @@ def read_field(r: bd.BdReader):
                 break
         return t, "".join(out)
     if t == bd.BD_BLOB:
-        # The length is a nested TYPED u32: the blob tag is followed by a u32 tag
-        # and only then the count. Reading the 32 bits straight (no inner tag)
-        # shifts everything by 5 bits and yields a nonsense length -- that is what
-        # a "blob length N exceeds the buffer" complaint usually means.
         lt = r._read_data_type()
         if lt != bd.BD_UINT32:
             raise ValueError(f"blob length has type {lt}, expected u32")

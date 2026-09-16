@@ -1,81 +1,7 @@
 #!/usr/bin/env python3
-"""bdNAT relay -- carry the peer session through the server when punching cannot.
-
-WHY THIS EXISTS (netrecon Phase 35). The introduction broker works: a joiner's
-`0x0a` is relayed to the host as `0x0b`, both directions, measured across two
-real NATs. The punch still fails, because each console's NAT mapping was created
-by talking to the SERVER and the punch arrives from the OTHER CONSOLE. Carrier
-NAT drops that, and carrier NAT is most mobile connections and a growing share
-of domestic ones. A relay is not a fallback for exotic networks; for two players
-on mobile data it is the only route there is.
-
-THE IDEA IS ONE SENTENCE: give every console a UDP socket on the server and tell
-it that socket IS its own public address. It publishes what we tell it -- that is
-already proven, `discovered_self()` exists because of it -- so from then on every
-address either console can possibly learn points at us:
-
-    * the host's `bdCommonAddr` in the create request, which the search reply
-      hands to the joiner
-    * `addrA` in the joiner's introduction request, which is how the host learns
-      where to answer (measured on hardware: the PSP wrote its own NAT-mapped
-      `80.187.87.236:17689` there, i.e. exactly what we had told it it was)
-    * the copy the console re-advertises INSIDE the encrypted peer protocol,
-      which the server cannot reach and could never rewrite
-
-That last one is the point. It was written down as the risk that could sink this
-whole approach -- if the peer acts on an address the server cannot touch, a relay
-is bypassed. It cannot be rewritten, so instead it is never wrong: the console is
-only ever told one address for itself, and that address is its mailbox.
-
-HOW A DATAGRAM MOVES. Mailbox `S_X` belongs to console X. It is the address
-everyone else dials to reach X, and the address X sees replies come from.
-
-    J believes  "I am SERVER:S_J, and H is at SERVER:S_H"
-    H believes  "I am SERVER:S_H, and J is at SERVER:S_J"
-
-    J --> SERVER:S_H   arrives on S_H, so it is FOR H
-                       leaves from S_J, so H sees the address it knows
-    H --> SERVER:S_J   arrives on S_J, so it is FOR J
-                       leaves from S_H, likewise
-
-Two sockets, no parsing, no decryption, no address rewriting anywhere in the
-payload -- which matters, because the 10-byte HMAC on a bdNAT packet covers
-`identifier|addrA|addrB` under a key only the originator holds. We never touch
-those bytes, so it never has to verify.
-
-WHERE EACH CONSOLE REALLY IS is learned, never configured: the source address of
-whatever it sends us. `Console.seen[port]` is "the endpoint this console talks to
-our socket `port` from", one entry per socket, because a symmetric NAT gives a
-different mapping per destination and the reply has to go back to the mapping the
-packet came from. Since we always answer out of the socket the peer dialled, the
-mapping we learned is by construction the right one. That is the whole reason a
-relay works where a punch does not: every packet the console receives comes from
-an address it has itself sent to.
-
-THE BOOTSTRAP IS THE EXISTING `0x0b` RELAY, and it is not redundant. Before H has
-ever sent anything to `S_J`, H's NAT has no mapping that would admit a packet
-from `S_J` -- a port-restricted cone drops it. But H's mapping toward the main
-UDP port is alive, because bdNAT keepalives run every 15 s. So:
-
-    1. J fires `0x0d` straight at SERVER:S_H  ->  we learn J's mapping toward S_H
-    2. J fires `0x0a` at the main port        ->  we relay `0x0b` to H from the
-                                                  main port, where H's mapping IS
-                                                  alive
-    3. H flips it to `0x0c` and answers `addrA` = SERVER:S_J
-                                              ->  H's mapping toward S_J is now
-                                                  created, and we have learned it
-    4. we forward that `0x0c` out of S_H to J ->  J verifies the untouched HMAC
-                                                  and takes the datagram's source,
-                                                  SERVER:S_H, as where H lives
-
-Both mappings now exist, both directions are known, and the match traffic that
-follows is pure forwarding.
-
-COST: ~7 datagrams/sec each way per pair (Phase 18), so a four-player match is
-roughly 50 KB/s through the server.
-
-OPERATIONALLY: the relay ports must be open in the firewall, exactly like the
-main UDP port. The server logs the range at startup for that reason.
+"""The bdNAT relay: every console gets a UDP socket on the server and is told
+that socket is its own public address, so the peer session is carried here
+when a punch cannot (netrecon §35-§37; tools/README.md "natrelay.py").
 """
 from __future__ import annotations
 
@@ -96,13 +22,6 @@ def set_logger(fn) -> None:
 
 
 # ------------------------------------------------------------------ our address
-#
-# What the console should be told the server's address is. Not the same question
-# as "what address did we bind": the bind is a wildcard, the rig reaches us on a
-# bridge address and a VPS on a public one, and the console has to be handed
-# something it can actually dial. The kernel already knows -- connecting a UDP
-# socket performs a route lookup and nothing else, so getsockname() on it is the
-# source address we would use to reach that client.
 _ADDR_CACHE: dict[str, str] = {}
 
 
@@ -115,7 +34,7 @@ def server_addr_for(client_ip: str) -> str:
     try:
         s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
         try:
-            s.connect((client_ip, 9))          # discard port; no packet is sent
+            s.connect((client_ip, 9))
             ip = s.getsockname()[0]
         finally:
             s.close()
@@ -130,11 +49,6 @@ PORT_BASE = int(serverconfig.get("nat", "relay_port_base"))
 PORT_COUNT = int(serverconfig.get("nat", "relay_ports"))
 IDLE_TIMEOUT = float(serverconfig.get("nat", "relay_idle_timeout"))
 PUBLIC_ADDRESS = str(serverconfig.get("nat", "public_address") or "")
-#: Mailboxes one source ADDRESS may hold at once (§65). A household behind one
-#: NAT has a few consoles; a run of forged keepalives from one address has as
-#: many source ports as it likes, and without this it took the whole pool.
-#: Past the cap the longest-idle console from that address is recycled, so a
-#: real console that restarted (new mapped port) still gets in.
 PER_ADDRESS_MAX = int(os.environ.get("WOW2_RELAY_PER_ADDRESS", "8"))
 
 
@@ -144,12 +58,8 @@ class Console:
     __slots__ = ("key", "mailbox", "seen", "peers", "last")
 
     def __init__(self, key: tuple[str, int]):
-        #: where it contacted bdDiscovery from -- its mapping toward the MAIN
-        #: port, which the keepalives hold open. The bootstrap `0x0b` goes here.
         self.key = key
         self.mailbox: "Mailbox | None" = None
-        #: our socket port -> the endpoint this console talks to that socket from.
-        #: One entry per socket on purpose: a symmetric NAT maps per destination.
         self.seen: dict[int, tuple[str, int]] = {}
         self.peers: set["Console"] = set()
         self.last = time.time()
@@ -160,12 +70,7 @@ class Console:
 
 
 class Mailbox(asyncio.DatagramProtocol):
-    """One UDP socket, owned by one console, and that console's public address.
-
-    Everything arriving here is FOR the owner. Everything leaving here was sent
-    BY the owner -- so the peer sees the address it dialled, which is the whole
-    trick and the reason there are two sockets per pair rather than one.
-    """
+    """One UDP socket, owned by one console, and that console's public address."""
 
     __slots__ = ("relay", "port", "owner", "transport", "rx", "tx", "dropped",
                  "_last_drop_log")
@@ -184,7 +89,7 @@ class Mailbox(asyncio.DatagramProtocol):
     def datagram_received(self, data: bytes, src: tuple[str, int]) -> None:
         self.rx += 1
         owner = self.owner
-        if owner is None:                      # a stale mapping to a freed port
+        if owner is None:
             return
         owner.last = time.time()
         sender = self.relay.sender_for(self, src, data)
@@ -206,9 +111,6 @@ class Mailbox(asyncio.DatagramProtocol):
             return
         dest = owner.seen.get(out.port)
         if dest is None:
-            # The owner has never spoken to that socket, so its NAT has no
-            # mapping that would admit us. Dropping is right: the bootstrap is
-            # the `0x0b` on the main port, and the client retries.
             self._drop(f"no return path to {owner} on :{out.port} yet "
                        f"(waiting for it to dial SERVER:{out.port})")
             return
@@ -221,7 +123,7 @@ class Mailbox(asyncio.DatagramProtocol):
     def _drop(self, why: str) -> None:
         self.dropped += 1
         now = time.time()
-        if now - self._last_drop_log > 2.0:      # one line per two seconds
+        if now - self._last_drop_log > 2.0:
             self._last_drop_log = now
             _log(f"RELAY drop on :{self.port}: {why} [{self.dropped} so far]")
 
@@ -250,13 +152,7 @@ class Relay:
 
     # ----------------------------------------------------------------- startup
     async def start(self, bind: str) -> None:
-        """Bind the whole pool up front.
-
-        Lazily would be tidier and is not worth it: allocation happens inside a
-        datagram callback, which is synchronous, and an idle UDP socket costs
-        nothing. Binding here also means a port conflict is a startup error
-        rather than a join that mysteriously does not work.
-        """
+        """Bind the whole pool up front."""
         if not self.enabled:
             return
         loop = asyncio.get_running_loop()
@@ -281,14 +177,7 @@ class Relay:
         asyncio.get_running_loop().create_task(self._report())
 
     async def _report(self) -> None:
-        """A traffic line whenever something moved, and silence otherwise.
-
-        Worth having because a relayed session is INVISIBLE in every other log
-        the server keeps: the peer protocol is encrypted, it never reaches a
-        handler, and the only evidence that a match is being carried at all is
-        the packet count. Rate-limited to a minute so it cannot become the noise
-        that hexdumps were.
-        """
+        """A traffic line whenever something moved, and silence otherwise."""
         last = None
         while True:
             await asyncio.sleep(60)
@@ -300,14 +189,7 @@ class Relay:
             last = now
 
     def sweep(self, now: float | None = None) -> int:
-        """Forget every console idle past IDLE_TIMEOUT. How many went.
-
-        Reclaiming used to happen only when the pool ran dry, so a console
-        that stopped talking kept its mailbox and its entry until then. A
-        keepalive every 15 s is what holds a console's NAT mapping open, so
-        ten silent minutes means nothing behind that endpoint is reachable
-        any more, and the sweep costs nothing (§65).
-        """
+        """Forget every console idle past IDLE_TIMEOUT. How many went."""
         now = time.time() if now is None else now
         idle = [c for c in list(self.consoles.values()) if now - c.last > IDLE_TIMEOUT]
         for c in idle:
@@ -318,7 +200,8 @@ class Relay:
     # -------------------------------------------------------------- allocation
     def mailbox_for(self, endpoint: tuple[str, int]) -> Mailbox | None:
         """The mailbox for the console that speaks from `endpoint`, allocating
-        one if this is the first we have seen of it."""
+        one if this is the first we have seen of it.
+        """
         if not self.enabled:
             return None
         c = self.consoles.get(endpoint)
@@ -327,8 +210,6 @@ class Relay:
             return c.mailbox
         mb = self._free_mailbox(endpoint[0])
         if mb is None:
-            # No Console object either (§65): one used to be made here and
-            # kept for ever, since only a mailbox owner was ever reclaimed.
             self.exhausted += 1
             _log(f"RELAY: pool exhausted ({len(self.mailboxes)} ports, all in "
                  f"use) -- {endpoint[0]}:{endpoint[1]} gets the direct path")
@@ -352,7 +233,6 @@ class Relay:
         for mb in self.mailboxes:
             if mb.owner is None:
                 return mb
-        # Nothing free: reclaim the longest-idle console past the timeout.
         now = time.time()
         stale = [mb for mb in self.mailboxes
                  if mb.owner and now - mb.owner.last > IDLE_TIMEOUT]
@@ -379,14 +259,7 @@ class Relay:
         return self.consoles.get(endpoint)
 
     def owner_of_advertised(self, addr: tuple[str, int] | None) -> Console | None:
-        """Whoever owns the mailbox an advertised address names.
-
-        A console only ever learns an address from us, so any address it repeats
-        back is one of ours -- which makes this an exact identification and not a
-        heuristic. The IP is deliberately not checked: the console was told
-        whichever of our addresses is reachable from where it sits, and the port
-        alone is unique across the pool.
-        """
+        """Whoever owns the mailbox an advertised address names."""
         if addr is None:
             return None
         mb = self.by_port.get(addr[1])
@@ -395,23 +268,9 @@ class Relay:
     def sender_for(self, mb: Mailbox, src: tuple[str, int],
                    data: bytes) -> Console | None:
         """Which console sent this, in order of how much it is worth trusting."""
-        # 1. We have seen this exact endpoint before. Always true after the first
-        #    packet of a path, and true from the start behind a cone NAT.
         for c in self.consoles.values():
             if c.key == src or src in c.seen.values():
                 return c
-        # 2. A bdNAT introduction carries the originator's OWN address in addrA
-        #    (29 bytes, version 2; addrA at 17). It names a mailbox, so it names
-        #    a console. This is what identifies a symmetric-NAT console on the
-        #    first packet of a new path, where its endpoint is unrecognisable.
-        #
-        #    ...unrecognisable by PORT. A symmetric NAT maps a new port per
-        #    destination and keeps the address, so the source address still
-        #    has to be the console's own (§65). Without that, a 29-byte
-        #    datagram from anywhere naming a live mailbox port in addrA was
-        #    taken for that console, and `seen[port]` -- where the owner's
-        #    replies are sent -- moved to wherever it came from. Rule 3 gets
-        #    the same condition for the same reason.
         if len(data) == 29 and data[1:3] == b"\x02\x00":
             c = self.owner_of_advertised(_bd_addr_at(data, 17))
             if c is not None and c is not mb.owner:
@@ -420,8 +279,6 @@ class Relay:
                 _log(f"RELAY: {src[0]}:{src[1]} names {c}'s mailbox in addrA "
                      f"but is not at {c.key[0]} -- not attributed")
                 return None
-        # 3. This mailbox has exactly one peer, so there is nothing to confuse it
-        #    with. Covers the host's `0x0c`, whose addrA names the joiner.
         if mb.owner and len(mb.owner.peers) == 1:
             peer = next(iter(mb.owner.peers))
             if peer.key[0] == src[0]:
@@ -435,7 +292,8 @@ class Relay:
 
     def pair(self, a: Console | None, b: Console | None) -> None:
         """Called when an introduction names two consoles, before either has
-        sent the other anything. Seeds `peers` so rule 3 above can fire."""
+        sent the other anything. Seeds `peers` so rule 3 above can fire.
+        """
         if a is not None and b is not None:
             self.link(a, b)
 

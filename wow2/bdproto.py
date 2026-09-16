@@ -1,16 +1,12 @@
-"""Minimal Demonware 'bd' protocol codec for WOW2 PSP.
-
-Ported from the reference open-bitdemon-emulator (bd_reader.rs / bd_writer.rs /
-bd_message.rs / bd_response.rs). Framing and bit layout are stable across the
-SDK generations; only the auth message-type numbers differ for 2007-era titles,
-which we pin from our own BOOT.BIN + live captures.
+"""The bd wire codec: bit- and byte-mode readers and writers with 5-bit type
+tags, connection framing, and the blind typed-field walk. Ported from the
+reference open-bitdemon-emulator and pinned to this 2007 title by capture.
 """
 from __future__ import annotations
 
 import struct
 
 # ---- bd data type tags (5-bit in bit mode, 1 byte in byte mode) ----
-# Exact values from bd_data_type.rs (reference). Array types = primitive + 100.
 BD_NOTYPE = 0x0
 BD_BOOL = 0x1
 BD_SINT8 = 0x2
@@ -27,7 +23,7 @@ BD_RANGED_UINT32 = 0xC
 BD_F32 = 0xD
 BD_F64 = 0xE
 BD_RANGED_F32 = 0xF
-BD_STR = 0x10       # signed char8 string
+BD_STR = 0x10
 BD_USTR = 0x11
 BD_MBSTR = 0x12
 BD_BLOB = 0x13
@@ -45,13 +41,12 @@ class BdReader:
 
     def __init__(self, buf: bytes):
         self.buf = buf
-        self.pos = 0            # byte cursor
-        self.bit_offset = 8     # 8 == byte-aligned / need fresh byte
+        self.pos = 0
+        self.bit_offset = 8    # 8 = byte-aligned, take a fresh byte next
         self.last_byte = 0
         self.bitmode = False
         self.type_checked = False
 
-    # -- byte-mode primitives --
     def _rd(self, n: int) -> bytes:
         b = self.buf[self.pos:self.pos + n]
         if len(b) != n:
@@ -59,7 +54,6 @@ class BdReader:
         self.pos += n
         return b
 
-    # -- bit reader (port of read_bits) --
     def read_bits(self, count: int) -> bytes:
         assert self.bitmode
         out = bytearray()
@@ -99,7 +93,6 @@ class BdReader:
     def _int(self, nbytes: int, signed: bool, want_type: int) -> int:
         if self.type_checked:
             t = self._read_data_type()
-            # tolerate: just record mismatch, don't raise (recon)
         if not self.bitmode:
             raw = self._rd(nbytes)
         else:
@@ -114,22 +107,13 @@ class BdReader:
     def i64(self): return self._int(8, True, BD_SINT64)
 
     def bool_(self) -> bool:
-        """BD_BOOL: a type tag then ONE bit, mirroring BdWriter.bool_.
-
-        The reader went without this for a long time because every request the
-        rig had decoded happened to start with u8/u64/str/blob. `Storage op 1`
-        (the upload) is the first with a bool in the middle -- and reading it as
-        anything wider silently eats the following field's type tag, so the
-        filename comes back as rubbish rather than as an error."""
+        """BD_BOOL: a type tag then ONE bit, mirroring BdWriter.bool_."""
         if self.type_checked:
             self._read_data_type()
         return bool(self.read_bits(1)[0] & 1)
 
     def f64(self) -> float:
-        """BD_F64: a type tag then 64 bits of little-endian IEEE double.
-
-        Added for `net::tPublicProfile`, which is the only thing in this title
-        that puts a double on the wire (two of them, members +0x48 and +0x50)."""
+        """BD_F64: a type tag then 64 bits of little-endian IEEE double."""
         if self.type_checked:
             self._read_data_type()
         raw = self.read_bits(64)[:8] if self.bitmode else self._rd(8)
@@ -148,14 +132,10 @@ class BdReader:
         return out.decode("latin1")
 
     def blob(self) -> bytes:
-        """BD_BLOB: a blob tag, then a NESTED TYPED u32 byte count, then the bytes.
-
-        The length carries its own u32 type tag -- reading the 32 bits straight
-        after the blob tag is off by 5 bits and yields a nonsense length (that is
-        what a "blob length N exceeds the buffer" complaint means)."""
+        """BD_BLOB: a blob tag, then a NESTED TYPED u32 byte count, then the bytes."""
         if self.type_checked:
-            self._read_data_type()          # BD_BLOB
-        n = self.u32()                      # typed u32 (tag included when checked)
+            self._read_data_type()
+        n = self.u32()
         return self.bytes_raw(n)
 
     def bytes_raw(self, n: int) -> bytes:
@@ -226,7 +206,8 @@ class BdWriter:
         self._emit(v.to_bytes(1, "little"))
     def bool_(self, v):
         """BD_BOOL: a type tag then ONE bit (bddump FIXED[BD_BOOL] = 1), not a byte.
-        Only meaningful in bitmode -- byte mode has no sub-byte field."""
+        Only meaningful in bitmode -- byte mode has no sub-byte field.
+        """
         if self.type_checked: self._dt(BD_BOOL)
         self.write_bits(b"\x01" if v else b"\x00", 1)
 
@@ -250,12 +231,7 @@ class BdWriter:
         if self.type_checked: self._dt(BD_F64)
         self._emit(struct.pack("<d", float(v)))
     def str_(self, v, maxlen=64):
-        """BD_STR: a type tag then raw 8-bit chars terminated by NUL.
-
-        The client's reader (bdLeaderBoardRow, 0x08c258ac) loops `read_bits(8)` and
-        stops on a 0 byte or after `maxlen` chars -- there is NO length prefix and no
-        padding to the field width, so emit exactly the bytes plus the terminator.
-        """
+        """BD_STR: a type tag then raw 8-bit chars terminated by NUL."""
         if self.type_checked: self._dt(BD_STR)
         b = v.encode("latin1") if isinstance(v, str) else bytes(v)
         b = b[:maxlen - 1].replace(b"\x00", b"")
@@ -265,7 +241,7 @@ class BdWriter:
         """BD_BLOB, mirroring BdReader.blob: tag, typed u32 length, raw bytes."""
         if self.type_checked:
             self._dt(BD_BLOB)
-        self.u32(len(b))                    # typed u32 (tag included when checked)
+        self.u32(len(b))
         self._emit(bytes(b))
 
     def _emit(self, raw: bytes):
@@ -289,35 +265,17 @@ def frame_unencrypted(payload: bytes) -> bytes:
     return len(body).to_bytes(4, "little") + body
 
 
-# The header word is a length EXCEPT for two magic values, exactly as in the
-# reference socket loop (bd_socket.rs): 0 = ping, and one "available buffer size"
-# announce followed by a u32. The reference's announce constant is 200; this 2007
-# SDK uses **180 (0xB4)** -- bdRemoteTaskManager::onConnected (0x08c17740) writes
-# `[u32 0xB4][u32 conn->freeSpace]` and pushes it raw before its first message
-# (the free-space getter is 0x08d072a0; live value 0xFFFF).
-#
-# Getting this wrong is not cosmetic: with 180 read as a length the parser eats
-# 4 bytes of the *following* frame, and every LSG service request the client sent
-# in the same burst was silently swallowed. That is what hid the game's global
-# storage request for the whole of phases 9-10.
-BUFSIZE_ANNOUNCE = 180
+BUFSIZE_ANNOUNCE = 180    # this 2007 SDK's value; the reference emulator's is 200
 
 
-MAX_FRAME = 0x10000        # the client announces a 65535-byte buffer
+MAX_FRAME = 0x10000
 
 
-AUTH_TYPES = (0x00, 0x0a, 0x0b)     # create-account, login, login-reply
+AUTH_TYPES = (0x00, 0x0a, 0x0b)
 
 
 def _frames_here(buf: bytes, j: int) -> bool:
-    """Does a REAL frame start at j?
-
-    Deliberately strict. Resync scans byte by byte, and garbage is full of
-    zero words and small integers, so "some plausible length" finds false
-    frames a few bytes into the noise and then happily parses nonsense. A
-    candidate therefore has to look like an actual message: sane length, a
-    valid enc flag, and -- when unencrypted -- an auth type we know.
-    """
+    """Does a REAL frame start at j?"""
     if j + 6 > len(buf):
         return False
     ln = int.from_bytes(buf[j:j+4], "little")
@@ -333,7 +291,8 @@ def _frames_here(buf: bytes, j: int) -> bool:
 
 def _chains_to_end(buf: bytes, j: int) -> bool:
     """Do frames from j consume the rest of the buffer (a trailing partial
-    frame is fine)? One lucky length is a coincidence; a clean chain is not."""
+    frame is fine)? One lucky length is a coincidence; a clean chain is not.
+    """
     i = j
     seen = 0
     while i + 4 <= len(buf):
@@ -346,26 +305,13 @@ def _chains_to_end(buf: bytes, j: int) -> bool:
         if not (2 <= ln <= MAX_FRAME):
             return False
         if i + 4 + ln > len(buf):
-            return seen > 0                 # partial tail: still consistent
+            return seen > 0
         i += 4 + ln; seen += 1
     return seen > 0
 
 
 def parse_frame(buf: bytes):
-    """Yield (kind, data). kind in {'ping','bufsize','msg'}.
-
-    Returns (frames, leftover, skipped). `skipped` is stream that could not be
-    framed at all and was stepped over to resynchronise.
-
-    Why resync: a console whose STUN lookup resolves to a reachable address
-    opens its NAT/STUN connection to that address and pushes ~100 bytes of raw
-    struct down it -- live PSP pointers and all, no bd framing -- and THEN
-    reuses the same socket for the auth request. On the host console that never
-    happens, because /etc/hosts resolves the STUN names to ::1 and the IPv4
-    server refuses the connection instantly. Without resync the leading garbage
-    parks a huge bogus length at the head of the buffer and every real frame
-    behind it is invisible forever.
-    """
+    """Yield (kind, data). kind in {'ping','bufsize','msg'}."""
     out = []
     skipped = b""
     i = 0
@@ -382,7 +328,7 @@ def parse_frame(buf: bytes):
                                              and _chains_to_end(buf, j)):
                 j += 1
             if j + 4 > len(buf):
-                break                       # nothing framable yet; wait for more
+                break
             skipped += buf[i:j]
             i = j
             continue
@@ -398,18 +344,11 @@ def unwrap_message(msg: bytes):
 
 
 # --------------------------------------------------------- generic field walk
-# A type-checked bitstream carries a 5-bit tag before every value, so a message
-# can be read (and replayed) WITHOUT knowing its parameter list. That is what
-# lets the server store a client-built payload -- e.g. the bdMatchMakingInfo a
-# host publishes -- and hand it back verbatim to whoever searches for it, with
-# no need to model every field first.
 _FIELD_BITS = {BD_BOOL: 1, BD_SINT8: 8, BD_UINT8: 8, BD_WCHAR16: 16,
                BD_SINT16: 16, BD_UINT16: 16, BD_SINT32: 32, BD_UINT32: 32,
                BD_F32: 32, BD_SINT64: 64, BD_UINT64: 64, BD_F64: 64}
 _FIELD_SIGNED = {BD_SINT8, BD_SINT16, BD_SINT32, BD_SINT64}
 _FIELD_FLOAT = {BD_F32: "<f", BD_F64: "<d"}
-# Ranged ints negotiate their width from a min/max the two sides agree on out of
-# band, so a blind walk cannot decode (or re-emit) them.
 _FIELD_UNWALKABLE = {BD_RANGED_SINT32, BD_RANGED_UINT32, BD_RANGED_F32}
 
 
@@ -460,7 +399,8 @@ def read_field(r: "BdReader"):
 
 def read_fields(r: "BdReader", limit: int = 4096):
     """Every typed field until the buffer runs out. Stops cleanly on the zero
-    padding that follows the last field (type 0 is not a real type)."""
+    padding that follows the last field (type 0 is not a real type).
+    """
     out = []
     while len(out) < limit and bits_left(r) >= 5:
         try:

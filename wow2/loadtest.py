@@ -1,31 +1,11 @@
 #!/usr/bin/env python3
 """How many players? N synthetic consoles sign in at the same instant and each
-runs the game's own sign-in burst, a match start and two heavier calls, against
-a store pre-filled for L lifetime players. Its own server on 3877.
+runs the game's own sign-in burst, a match start and two heavier calls,
+against a store pre-filled for L lifetime players. Its own server on 3877.
 
     .venv/bin/python tools/loadtest.py --consoles 32 --lifetime 200
     .venv/bin/python tools/loadtest.py --consoles 128 --lifetime 200   # concurrency
-    .venv/bin/python tools/loadtest.py --consoles 32 --lifetime 5000   # store size
-
-WHAT IT MEASURES, and what it found on 2026-09-16 (this workstation; a small
-VPS is slower, scale the numbers down by its CPU):
-
-  * Concurrency is not the limit. 128 consoles signing in at the same instant
-    all finish within 3.4 s (worst single sign-in 2.5 s) and the process
-    sustains ~850 RPC/s. A signed-in console is nearly silent, a sign-in is
-    ~20 RPCs and a match start 5, so hundreds online is not what breaks it.
-  * The LIFETIME population is. Every store is JSON re-read per request, so
-    each RPC that touches the leaderboards parses stats-db.json whole:
-      lifetime   200  ( 70 KB)  32 sign-ins at once: median 0.24 s, ~900 RPC/s
-      lifetime  2000  (700 KB)  median 1.9 s, worst 4.9 s, ~115 RPC/s
-      lifetime 10000  (3.5 MB)  19 of 32 did not finish inside 8 s per RPC
-    `wow2-account list | wc -l` is the number to watch; a parsed-store cache
-    keyed on mtime would move that cliff by an order of magnitude and is the
-    obvious next step if a deployment approaches a thousand accounts.
-
-`ok` counts consoles whose every call was answered inside the per-call timeout;
-a console that ran out of time is neither ok nor failed, so ok < consoles with
-failed=0 means timeouts.
+    .venv/bin/python tools/loadtest.py --consoles 32 --lifetime 10000  # store size
 """
 from __future__ import annotations
 
@@ -115,7 +95,6 @@ def seed(tmp, consoles, lifetime):
                        "handle": tiger192(a.encode())[:8].hex(),
                        "first_seen": "2026-09-16T00:00:00", "last_seen": "2026-09-16T00:00:00"}
         fnames[f"{ent:016x}"] = a
-        # what a player who has played a few ranked matches leaves behind
         for board in (1, 2, 3, 5, 9, 12, 15):
             row = [1000 + (i * 7919) % 900, 0, a]
             if board == 1:
@@ -183,7 +162,6 @@ def main():
             t2 = time.time()
             ok2 = match_start(c)
             t3 = time.time()
-            # a leaderboard page read and one upload of a flag, the two heavier reads/writes
             err, r = c.call(req_stats_page(5), timeout=8.0)
             err2, r2 = c.call(req_storage_upload("xyzzy.ufd", b"F" * 2048), timeout=8.0)
             t4 = time.time()
@@ -205,7 +183,7 @@ def main():
     proc.terminate(); proc.wait(timeout=5)
     ok = [r for r in results.values() if r.get("ok")]
     bad = [r for r in results.values() if not r.get("ok")]
-    rpcs = len(ok) * (13 + 5 + 2) + len(names) * 2       # + login and connect
+    rpcs = len(ok) * (13 + 5 + 2) + len(names) * 2
     timed_out = len(names) - len(ok) - len([r for r in bad if "error" in r])
     print(f"consoles={a.consoles} lifetime={a.lifetime} stats-db={stats_bytes/1024:.0f} KB  "
           f"wall={wall:.1f}s  ok={len(ok)} timed_out={timed_out} "

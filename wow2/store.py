@@ -1,42 +1,11 @@
 #!/usr/bin/env python3
 """The SQLite store: one file, `wow2.sqlite3`, in the data directory (§66).
 
-WHY. Every JSON store was re-parsed per request, so the cost of an RPC grew
-with the number of players the server had EVER seen, not with the number
-online: `loadtest.py` measured sign-ins at 0.24 s with 200 lifetime accounts,
-1.9 s at 2,000 and timeouts at 10,000, while 128 simultaneous sign-ins
-against a small store finished in 3.4 s. SQLite is in the standard library,
-so "python 3.11 and nothing else" still holds; it is one file the operator
-can open with `sqlite3 wow2.sqlite3` while the server runs; and a lookup by
-key costs the same at ten thousand accounts as at ten.
-
-WHAT IS HERE. The connection, the schema, the JSON importer and exporter,
-and the rules every caller follows:
-
-  * ONE connection per process (`db()`), WAL mode, a 5 s busy timeout. The
-    CLIs (`wow2 pot`, `wow2-account`, `wow2-db`) are other processes and read
-    the same file; WAL lets them read while the server writes.
-  * ONE transaction per handler: every write goes inside `with store.tx():`.
-    A handler that raised halfway through a JSON load-mutate-save left the
-    file untouched; with autocommit it could leave half a change, so the
-    transaction is the rule and nesting is allowed (the outermost commits).
-  * The corrupt-store rule survives: `PRAGMA quick_check` at startup and a
-    JSON file that does not parse both REFUSE TO START. Nothing here ever
-    overwrites or renames a file it could not read.
-  * `startup()` imports a JSON store the first time a build that reads that
-    store from SQLite starts, in one transaction, and renames the file to
-    `<name>.imported-<date>`. The stores migrate one at a time (`MIGRATED`
-    below says which this build reads from SQLite); a store not yet migrated
-    is left to its JSON file and its handlers. A JSON file that reappears
-    after its import is IGNORED, loudly -- it is never imported twice.
-
-THE SCHEMA. Relational where the server looks things up by key or in order;
-a JSON text column where it only ever handles the whole record (a profile's
-nine typed fields, a pot's ledger entry, board 1's completion tail).
-Entities are the 16-hex-digit account ids every JSON store used, so a row
-reads the same in `sqlite3` as it did in the file. Ranks are not stored:
-rank is `1 + COUNT(*) WHERE board = ? AND score > ?`, ties sharing a rank,
-exactly as `statsdb.board()` computed it from the file.
+The connection, the schema, the JSON importer and exporter, and the rules
+every caller follows: one connection per process, one transaction per handler
+(`with store.tx():`), refuse to start on a damaged database or an unreadable
+JSON file, import each JSON store once and rename it aside. tools/README.md
+"The SQLite store" has the schema and the operator's side.
 """
 from __future__ import annotations
 
@@ -56,20 +25,16 @@ from tiger import tiger192                                      # noqa: E402
 DB_NAME = "wow2.sqlite3"
 SCHEMA_VERSION = 1
 
-#: The seven JSON stores the server kept before §66, in import order, and the
-#: file each one lived in. The name is what `MIGRATED`, `wow2-db` and the
-#: `imported:<store>` meta flags all use.
 STORES: dict[str, str] = {
     "accounts": "accounts.json",
-    "friends": "friends-db.json",      # names, friends, invites, blocks, messages
+    "friends": "friends-db.json",
     "teams": "teams-db.json",
     "profiles": "profile-db.json",
-    "storage": "storage-db.json",      # the rows; the blobs stay in storage/
+    "storage": "storage-db.json",
     "stats": "stats-db.json",
     "pots": "pot.json",
 }
 
-#: The tables behind each store, for the import guard and `wow2-db check`.
 TABLES: dict[str, tuple[str, ...]] = {
     "accounts": ("accounts",),
     "friends": ("names", "friends", "friend_invites", "blocks", "messages"),
@@ -80,14 +45,8 @@ TABLES: dict[str, tuple[str, ...]] = {
     "pots": ("pots",),
 }
 
-#: Which stores THIS build of the server reads from SQLite. A store not listed
-#: here is still read from its JSON file by its handlers, and `startup()` leaves
-#: that file alone. Each step of ROADMAP §66 adds its store; step 7 lists all
-#: seven and deletes `_jload`/`_jsave` for them.
-MIGRATED: tuple[str, ...] = tuple(STORES)          # all seven since §66 step 6
+MIGRATED: tuple[str, ...] = tuple(STORES)
 
-#: Clan ids are `TEAM_ID_BASE + counter`, obviously ours in a capture. The
-#: importer needs it to keep `meta.teams_next` ahead of every imported id.
 TEAM_ID_BASE = 0x00C1A0_0000_0000
 
 SCHEMA = """
@@ -236,12 +195,7 @@ def path(data_dir: Path | None = None) -> Path:
 
 
 def connect(db_path: Path | str) -> sqlite3.Connection:
-    """Open (creating if needed) one database and make sure its schema is there.
-
-    `isolation_level=None` is autocommit: nothing here begins a transaction
-    behind the caller's back, `tx()` does it explicitly, and a plain SELECT
-    never holds a lock open across an `await`.
-    """
+    """Open (creating if needed) one database and make sure its schema is there."""
     p = Path(db_path)
     p.parent.mkdir(parents=True, exist_ok=True)
     conn = sqlite3.connect(str(p), isolation_level=None)
@@ -272,12 +226,8 @@ def connect(db_path: Path | str) -> sqlite3.Connection:
 
 
 def _statements(script: str) -> list[str]:
-    """The statements of a script, one at a time, comments and all.
-
-    `executescript` would do this and also COMMIT whatever transaction is
-    open, which is exactly what `connect()` must not do inside `tx()`; and a
-    split on ';' cuts a comment that contains one. `complete_statement`
-    knows the difference."""
+    """The statements of a script, one at a time, comments and all."""
+    # not executescript(): that commits the transaction tx() may hold open
     out, buf = [], ""
     for line in script.splitlines(keepends=True):
         buf += line
@@ -290,17 +240,8 @@ def _statements(script: str) -> list[str]:
 
 
 def _same_owner_as_directory(p: Path) -> None:
-    """A root-run CLI must not leave the service unable to open its own store.
-
-    WAL keeps two side files beside the database, `-wal` and `-shm`, created
-    by whichever process opens the file first. On a system install the
-    server runs as `wow2` and the operator runs `wow2-db` or `wow2-account`
-    as root; a `-shm` that root created is one the service cannot open, and
-    the symptom is a server that refuses to start on a store it owns. So a
-    process running as root gives the database and its side files to the
-    owner of the directory they live in, which is the service user. Nothing
-    happens when not root, or when the ownership already agrees.
-    """
+    """Give the database and its -wal/-shm to the data directory's owner when run as
+    root, or a root-run CLI leaves the service unable to open its own store."""
     if os.name != "posix" or os.geteuid() != 0:
         return
     try:
@@ -330,16 +271,7 @@ def set_logger(fn) -> None:
 
 
 def db() -> sqlite3.Connection:
-    """The process's connection to the configured data directory's store.
-
-    The first open in ANY process runs `startup()` -- the integrity check and
-    the `imported:<store>` bookkeeping -- but only the SERVER (and an explicit
-    `wow2-db import`) moves a JSON file into the database. A CLI that finds a
-    migrated store's file still un-imported refuses instead: an older server
-    build may still be running on that file, and importing it out from under
-    that process would leave it writing to a fresh file the next start
-    ignores. The CLI says which command to run; nothing is lost either way.
-    """
+    """The process's connection to the configured data directory's store."""
     global _CONN
     if _CONN is None:
         startup(import_files=False)
@@ -355,13 +287,7 @@ def close() -> None:
 
 @contextlib.contextmanager
 def tx(conn: sqlite3.Connection | None = None):
-    """One transaction. Nest freely: only the outermost begins and commits.
-
-    BEGIN IMMEDIATE takes the write lock up front, so a handler that reads
-    and then writes cannot have another process slip a write in between --
-    the CLIs edit the same file while the server runs, which is the habit
-    the JSON stores had and this keeps.
-    """
+    """One transaction. Nest freely: only the outermost begins and commits."""
     conn = conn or db()
     if conn.in_transaction:
         yield conn
@@ -412,12 +338,7 @@ def _stamp() -> str:
 
 def startup(log=None, stores: tuple[str, ...] | None = None,
             data_dir: Path | None = None, import_files: bool = True) -> sqlite3.Connection:
-    """What the server calls at startup: connect, check, import what it reads.
-
-    Refuses to start on a damaged database or an unreadable JSON store,
-    because the alternative -- serving an empty board and writing it back --
-    is how data is lost with no error anywhere.
-    """
+    """What the server calls at startup: connect, check, import what it reads."""
     data_dir = Path(data_dir or serverconfig.DATA_DIR)
     log = log or _LOG
     global _CONN
@@ -437,10 +358,7 @@ def startup(log=None, stores: tuple[str, ...] | None = None,
 
 def migrate(conn: sqlite3.Connection, stores: tuple[str, ...], data_dir: Path,
             log=print, import_files: bool = True) -> None:
-    """Import each named store's JSON file once, then rename it aside.
-
-    `import_files=False` is the CLI's setting: a file that is still to be
-    imported is a refusal, not an import (see `db()`)."""
+    """Import each named store's JSON file once, then rename it aside."""
     for s in stores:
         jpath = data_dir / STORES[s]
         when = meta_get(conn, f"imported:{s}")
@@ -470,7 +388,7 @@ def migrate(conn: sqlite3.Connection, stores: tuple[str, ...], data_dir: Path,
                 counts = IMPORTERS[s](conn, d, data_dir, log)
             meta_set(conn, f"imported:{s}", now_iso())
         if d is None:
-            if import_files:            # the server says so; a CLI stays quiet
+            if import_files:
                 log(f"  store: no {jpath.name} to import; {s} starts empty in {DB_NAME}")
             continue
         aside = jpath.with_name(f"{jpath.name}.imported-{_stamp()}")
@@ -490,7 +408,8 @@ def table_count(conn: sqlite3.Connection, table: str) -> int:
 
 def load_json(p: Path) -> dict:
     """Parse one JSON store, or refuse. A file that does not parse is the only
-    copy of its data and is never moved, renamed or written over."""
+    copy of its data and is never moved, renamed or written over.
+    """
     try:
         raw = p.read_text()
     except OSError as e:
@@ -506,8 +425,6 @@ def load_json(p: Path) -> dict:
 
 
 # ------------------------------------------------------------------ importers
-# Each takes the parsed JSON, writes it inside the caller's transaction, and
-# returns {table: rows written}. `data_dir` is where storage blobs live.
 
 def _hex_owner(v) -> str | None:
     """A storage owner however the row spelt it: 16-hex, decimal, int, or none."""
@@ -542,12 +459,7 @@ def import_accounts(conn, d: dict, data_dir: Path, log=print) -> dict[str, int]:
 
 
 def _message_ids(msgs: list, next_msg: int) -> tuple[list[tuple[int, dict]], int]:
-    """(id, message) for each mailbox row, and the next free id.
-
-    A row whose id is taken or invalid gets a fresh one rather than being
-    lost -- two rows with one id would be one row to `Messaging op 4`. The
-    same rule serves the importer and the round-trip comparison, so the two
-    cannot disagree about what a colliding row becomes."""
+    """(id, message) for each mailbox row, and the next free id."""
     out, used = [], set()
     for m in msgs:
         if not isinstance(m, dict):
@@ -682,8 +594,8 @@ def import_profiles(conn, d: dict, data_dir: Path, log=print) -> dict[str, int]:
 
 
 def import_storage(conn, d: dict, data_dir: Path, log=print) -> dict[str, int]:
-    """Rows only; the bytes are files. A row with inline `data` (the Phase 26
-    seeds) is written out to storage/<id:x>-<name> so every row is a file."""
+    """Rows only; the bytes are files. A row with inline `data` is written out to
+    storage/<id:x>-<name> so every row is a file."""
     n = 0
     blobs = Path(data_dir) / "storage"
     for f in d.get("files") or []:
@@ -775,14 +687,7 @@ IMPORTERS = {
 def import_dir(conn: sqlite3.Connection, src: Path, data_dir: Path,
                stores: tuple[str, ...] | None = None, log=print,
                rename: bool = False) -> dict[str, dict[str, int]]:
-    """`wow2-db import DIR`: every JSON store found in DIR, in one transaction.
-
-    Refuses a store whose tables already hold rows -- merging two histories
-    has no right answer -- and marks each store imported, so a server opened
-    on this database afterwards does not import the same files again.
-    `rename` moves each imported file aside the way `startup()` does; the CLI
-    sets it when DIR is the database's own data directory.
-    """
+    """`wow2-db import DIR`: every JSON store found in DIR, in one transaction."""
     src = Path(src)
     done: dict[str, dict[str, int]] = {}
     with tx(conn):
@@ -807,8 +712,6 @@ def import_dir(conn: sqlite3.Connection, src: Path, data_dir: Path,
 
 
 # ------------------------------------------------------------------ exporters
-# The inverse: the same JSON shapes the server kept before §66, so a store
-# can still be read in an editor, diffed, or fed to `wow2-db import`.
 
 def _dict(row: sqlite3.Row, *keys: str) -> dict:
     """The named columns of a row, minus the NULLs."""
@@ -989,11 +892,7 @@ def check(conn: sqlite3.Connection, data_dir: Path) -> tuple[list[str], list[str
 def _canon(store: str, d: dict, log=print) -> object:
     """A JSON store reduced to what the import keeps, so that the JSON as
     found and the JSON as exported can be compared field by field.
-
-    What it drops is exactly what the schema drops, each on purpose: the
-    accounts' `account_id` (derived, and checked here against the derivation),
-    `_comment` keys, a stale cosmetic rank, an inline `data` string that the
-    import turned into a file (checked separately, byte for byte)."""
+    """
     if store == "accounts":
         out = {}
         for name, row in d.items():
@@ -1124,7 +1023,8 @@ def _diff(a, b, at="") -> list[str]:
 
 def roundtrip(src: Path, work: Path, log=print) -> tuple[list[str], list[str]]:
     """Import the JSON stores in `src` into a scratch database under `work`,
-    export them again, and compare. Returns (failures, report lines)."""
+    export them again, and compare. Returns (failures, report lines).
+    """
     src, work = Path(src), Path(work)
     conn = connect(work / DB_NAME)
     try:
@@ -1139,7 +1039,6 @@ def roundtrip(src: Path, work: Path, log=print) -> tuple[list[str], list[str]]:
             before = _canon(s, load_json(src / STORES[s]), log)
             after = _canon(s, load_json(out / STORES[s]), log)
             diffs = _diff(before, after)
-            # Rows the import turned from inline data into files: the bytes.
             if s == "storage":
                 for f in load_json(src / STORES[s]).get("files") or []:
                     if isinstance(f, dict) and f.get("data") is not None and f.get("id"):
@@ -1147,7 +1046,6 @@ def roundtrip(src: Path, work: Path, log=print) -> tuple[list[str], list[str]]:
                         want = str(f["data"]).encode("latin1", "replace")
                         if not p.is_file() or p.read_bytes() != want:
                             diffs.append(f"/{f['id']}: inline data not written to {p.name}")
-            # A stale cosmetic rank in the file is not data; report it apart.
             if s == "stats":
                 a = load_json(src / STORES[s])
                 b = load_json(out / STORES[s])

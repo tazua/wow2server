@@ -7,39 +7,6 @@ cannot be.
     .venv/bin/python tools/lsgauth.py --revert         # the pre-fix behaviour, as a control
     .venv/bin/python tools/lsgauth.py --as player1       # sign in as an account, against
                                                        # the LIVE server, and hold it
-
-WHAT IT IS FOR. The login reply carries the LSG session key TWICE: inside the
-3DES ticket, keyed on `Tiger192(password)`, and again in the 128-byte opaque
-proof written bit-continuous right after it **in clear**. The opaque copy is
-the one the client relays at the LSG connect. So everything the password is
-supposed to protect hangs on a value that goes out unencrypted, and the only
-thing that can make it mean anything is the server refusing a key it did not
-issue. Until §54 it did not:
-
-  * `new_session_key()` registered the key before anyone decided whether to
-    refuse, so a REFUSED login still handed out a registered, working
-    credential -- the refusal garbled the ticket, which the attacker did not
-    need to read;
-  * `bind_lsg()` met an unrecognised key with a `!!` and carried on "using the
-    fixed key and the source address", i.e. it fell back to the identity model
-    the whole project spent Phase 33 removing;
-  * and the connect could simply be SKIPPED, since an unencrypted RPC needs no
-    key to build.
-
-Each of those is one check below. The point of the tool is that it is a peer
-the game cannot be: a real console always presents the proof it was given, so
-no amount of driving the rig can ask these questions.
-
-HOW IT RUNS. Its own `authserver` on a spare port with a scratch data dir, like
-`relaytest.py` -- nothing here touches the live rig, its accounts or its
-consoles. The store is seeded with ONE account that has a credential, so the
-positive control has something honest to be; `shared_password_fallback` is off,
-which is the deployment setting and the one the refusal paths need.
-
-The positive control is not decoration. Four of the five checks pass if the
-server simply closes every LSG connection it is offered, which is also what a
-badly broken server does -- so check 1 signs in properly, and check 6 repeats it
-after the hostile ones to show the server is still serving.
 """
 from __future__ import annotations
 
@@ -61,16 +28,16 @@ import rigconfig                                                # noqa: E402
 BD_AUTH_NO_ERROR = 700
 BD_AUTH_CREATE_USERNAME_EXISTS = 707
 
-HERE = Path(__file__).resolve().parent     # beside authserver.py in both trees
-PORT = 3874                 # not 3074: the live rig keeps that one
+HERE = Path(__file__).resolve().parent
+PORT = 3874    # not 3074: the live rig keeps that one
 TITLE_ID = 0x131D
-GOOD_ACCOUNT = "lsgauthok"          # seeded with a credential
+GOOD_ACCOUNT = "lsgauthok"
 GOOD_PASSWORD = "314159"
-NEW_ACCOUNT = "lukas1"              # A12: nobody holds this yet
+NEW_ACCOUNT = "lukas1"
 NEW_PASSWORD = "271828"
-IMPOSTOR_PASSWORD = "161803"        # a second player, same profile name
-KNOWN_NO_CRED = "player1"             # in IDENTITIES, so the server knows the NAME
-UNKNOWN_ACCOUNT = "nobodyatall"     # not in IDENTITIES and not in the store
+IMPOSTOR_PASSWORD = "161803"
+KNOWN_NO_CRED = "player1"
+UNKNOWN_ACCOUNT = "nobodyatall"
 
 
 # ------------------------------------------------------------------ the wire
@@ -82,18 +49,7 @@ def tiger192(data: bytes) -> bytes:
 
 
 def create_request(username: str, password: str, seed: int = 0x1234) -> bytes:
-    """A 0x00 create-account request, exactly as the console builds one.
-
-        [u8 0x00][tc bit][u32 iv_seed][u32 titleId][64 bits zero]
-        [768 bits 3DES-CBC(BD_BOOTSTRAP_KEY, iv=Tiger192(seed))]
-            plaintext = [u32 0xEFBDADDE][char name[64]][Tiger192(password)][pad]
-
-    The 64 zero bits are the account handle field, and they are zero because
-    there is no account yet. Note what this message does NOT contain: any proof
-    that the sender is entitled to the name. It cannot -- it is the message that
-    establishes the credential. That is why a duplicate has to be refused rather
-    than checked.
-    """
+    """A 0x00 create-account request, exactly as the console builds one."""
     sys.path.insert(0, str(HERE))
     from authserver import (BD_BOOTSTRAP_KEY, TICKET_MAGIC, cbc_3des_encrypt,
                             tiger_iv)
@@ -101,8 +57,6 @@ def create_request(username: str, password: str, seed: int = 0x1234) -> bytes:
     plain = (struct.pack("<I", TICKET_MAGIC) + nb + b"\x00" * (64 - len(nb))
              + tiger192(password.encode()) + b"\x00" * 4)
     assert len(plain) == 96, len(plain)
-    # K1 == K2 in the bootstrap key, so EDE collapses to single DES on K3 and
-    # pycryptodome refuses the 24-byte form. Encrypt the way the client does.
     from Crypto.Cipher import DES
     ct = DES.new(BD_BOOTSTRAP_KEY[16:24], DES.MODE_CBC,
                  tiger_iv(seed)).encrypt(plain)
@@ -121,11 +75,7 @@ def create_request(username: str, password: str, seed: int = 0x1234) -> bytes:
 
 
 def login_request(handle: bytes, seed: int = 0x1234) -> bytes:
-    """[u8 0x0a][tc bit][u32 iv_seed][u32 titleId][64 raw bits handle] -- 19 B.
-
-    There is no password anywhere in it, which is the whole reason this tool
-    exists: nothing can be validated when a login request arrives.
-    """
+    """[u8 0x0a][tc bit][u32 iv_seed][u32 titleId][64 raw bits handle] -- 19 B."""
     w = bd.BdWriter()
     w.bitmode = True
     w.type_checked = False
@@ -141,7 +91,8 @@ def login_request(handle: bytes, seed: int = 0x1234) -> bytes:
 
 def short_login_request(seed: int = 0x1234) -> bytes:
     """A 0x0a with the header and NO handle -- 11 bytes where a console sends
-    19. `parse_login()` raises on it, which is the path §64 closes."""
+    19. `parse_login()` raises on it, which is the path §64 closes."
+    """
     w = bd.BdWriter()
     w.bitmode = True
     w.type_checked = False
@@ -170,7 +121,8 @@ def lsg_connect(proof: bytes) -> bytes:
 
 def lsg_rpc(service: int, op: int) -> bytes:
     """A bare unencrypted service RPC. Storage op 7 needs no parameters to be
-    recognisably itself, and recognisable is all this has to be."""
+    recognisably itself, and recognisable is all this has to be.
+    """
     w = bd.BdWriter()
     w.bitmode = True
     w.type_checked = False
@@ -182,10 +134,9 @@ def lsg_rpc(service: int, op: int) -> bytes:
 
 
 def lsg_rpc_encrypted(key: bytes, seed: int, service: int, op: int) -> bytes:
-    """The same RPC the way a console sends it (§60): [u8 1][u32 seed] then
-    3DES-CBC under `key` (IV = Tiger192(seed)[:8]) of [u32 hmac slot][u8
-    service][bits], padded to the block with the seed's low byte, which is
-    what the client does (169 of 169 logged plaintexts)."""
+    """The same RPC the way a console sends it (§60): [u8 1][u32 seed] then 3DES-CBC
+    under `key` of [u32 hmac slot][u8 service][bits], padded with the seed's low
+    byte."""
     sys.path.insert(0, str(HERE))
     from authserver import session_cbc_encrypt, tiger_iv
     w = bd.BdWriter()
@@ -215,7 +166,8 @@ def ticket_key(ticket: bytes, password: str) -> bytes | None:
 
 def reply_opens(frame: bytes, key: bytes) -> bool:
     """Does an encrypted server frame (connect reply or TaskReply) decrypt
-    under `key`? The client's own test: the first plaintext u32 is 0xDEADBEEF."""
+    under `key`? The client's own test: the first plaintext u32 is 0xDEADBEEF.
+    """
     sys.path.insert(0, str(HERE))
     from authserver import session_cbc_decrypt, tiger_iv
     if not frame or frame[0] != 1:
@@ -234,11 +186,7 @@ def bufsize_announce(n: int = 0xFFFF) -> bytes:
 
 
 def read_login_reply(body: bytes) -> tuple[bytes, bytes]:
-    """(ticket, opaque) out of a 0x0b reply. Both 128 B, and the SECOND is clear.
-
-    Bit 51 is where the proof starts -- 8 (type) + 1 (tc) + 37 (typed u32 error)
-    + 5 filler. The client reads exactly here; so does this.
-    """
+    """(ticket, opaque) out of a 0x0b reply. Both 128 B, and the SECOND is clear."""
     r = bd.BdReader(body)
     r.bitmode = True
     r.read_bits(8 + 1 + 37 + 5)
@@ -256,13 +204,7 @@ def read_reply_error(body: bytes) -> int:
 
 
 def ticket_opens(ticket: bytes, password: str) -> bool:
-    """Can `password` decrypt this login ticket? This is the client's own test.
-
-    The client 3DES-CBC-decrypts the proof with Tiger192(password) and IV
-    Tiger192(0), then looks for the magic. No magic, no sign-in -- it draws an
-    error and never opens the LSG connection. So this one boolean IS "would the
-    console have signed in".
-    """
+    """Can `password` decrypt this login ticket? This is the client's own test."""
     sys.path.insert(0, str(HERE))
     from authserver import TICKET_MAGIC, auth_cbc_decrypt, tiger_iv
     try:
@@ -326,7 +268,8 @@ class Peer:
 
     def is_closed(self, timeout: float = 2.5) -> bool:
         """Did the SERVER hang up? A quiet socket is not a closed one, so read
-        until EOF or the timeout and say which happened."""
+        until EOF or the timeout and say which happened.
+        """
         self.s.settimeout(timeout)
         deadline = time.time() + timeout
         while time.time() < deadline:
@@ -347,12 +290,7 @@ class Peer:
 
 
 def login(host: str, port: int, username: str) -> tuple[bytes, bytes]:
-    """Sign in as `username` and return (ticket, opaque proof).
-
-    Note what this does NOT need: the password. The request carries a handle
-    and nothing else, and the reply comes back regardless -- a refusal is a
-    reply encrypted under a key we cannot read, not a silence.
-    """
+    """Sign in as `username` and return (ticket, opaque proof)."""
     p = Peer(host, port)
     p.send(login_request(tiger192(username.encode())[:8]))
     for kind, data in p.frames(timeout=4.0):
@@ -388,17 +326,9 @@ def start_server(tmp: Path, revert: bool) -> subprocess.Popen:
                WOW2_SHARED_PASSWORD_FALLBACK="false",
                WOW2_NO_NAT_TYPE="1")
     if revert:
-        # Everything this tool tests, put back the way it was. One flag and not
-        # two, because the question `--revert` answers is "would these checks
-        # have caught it?" -- the per-behaviour switches stay separate in the
-        # server for bisecting.
-        env["WOW2_LSG_NO_KEY_CHECK"] = "1"      # §54
-        env["WOW2_CREATE_MODE"] = "success"     # §56
-        env["WOW2_NO_PROOF_HANDLE"] = "1"       # §60
-    # The readiness probe below is a TCP connect, so a server that is already
-    # on this port -- somebody else's -- would pass it, and every check would
-    # then run against that server with that server's store (Phase 64: an
-    # installed public build on 3874 failed two checks that way).
+        env["WOW2_LSG_NO_KEY_CHECK"] = "1"
+        env["WOW2_CREATE_MODE"] = "success"
+        env["WOW2_NO_PROOF_HANDLE"] = "1"
     try:
         socket.create_connection(("127.0.0.1", PORT), timeout=0.3).close()
     except OSError:
@@ -423,12 +353,7 @@ def start_server(tmp: Path, revert: bool) -> subprocess.Popen:
 
 
 def seed_store(tmp: Path) -> None:
-    """One account with a real credential, so the positive control is honest.
-
-    The digest IS the credential -- `Tiger192(password)` is exactly the key the
-    login reply is encrypted with -- so this is what a store looks like after a
-    console has created an account, and it holds no password.
-    """
+    """One account with a real credential, so the positive control is honest."""
     tmp.mkdir(parents=True, exist_ok=True)
     (tmp / "accounts.json").write_text(json.dumps({
         GOOD_ACCOUNT: {"pwhash": tiger192(GOOD_PASSWORD.encode()).hex(),
@@ -440,17 +365,7 @@ def seed_store(tmp: Path) -> None:
 
 def sign_in_as(host: str, port: int, account: str, hold: float,
                bad_key: bool = False, password: str | None = None) -> int:
-    """A headless console: log in as `account` and hold the LSG connection.
-
-    This is how A7 is tested with ONE real console. The interesting half of
-    "two consoles, one account" is what the FIRST one does when it is evicted,
-    and the second only has to be something the server will bind -- so it may as
-    well be forty lines instead of an emulator and a renamed game profile.
-
-    It is also, unavoidably, the demonstration of what §54 could not fix: this
-    needs no password, because the opaque proof comes back in clear beside the
-    ticket. Do not read a successful run as a test of the credential.
-    """
+    """A headless console: log in as `account` and hold the LSG connection."""
     ticket, proof = login(host, port, account)
     print(f"logged in as {proof_username(proof)!r} "
           f"(user_id {struct.unpack_from('<Q', proof, 28)[0]}, "
@@ -460,10 +375,6 @@ def sign_in_as(host: str, port: int, account: str, hold: float,
         print("  the password does not open the ticket -- a console would draw "
               "Net.Err.AccDen here and never connect; connecting anyway")
     if bad_key:
-        # What a WRONG PASSWORD looks like from the server's side. A real client
-        # that cannot decrypt the ticket draws Net.Err.AccDen and never opens an
-        # LSG connection at all, so the server sees no completed bind -- exactly
-        # what this produces, and the reason A7's eviction is gated here.
         proof = retag(proof, b"\x5A" * 24)
         print("  presenting a session key we were never issued (--bad-key)")
     p = Peer(host, port)
@@ -478,9 +389,6 @@ def sign_in_as(host: str, port: int, account: str, hold: float,
           + (" -- and the reply decrypts under the ticket key" if key and any(
               reply_opens(d, key) for kind, d in replies if kind == "msg") else ""))
     if key:
-        # §60: the connect only binds PROVISIONALLY. What completes it is an
-        # RPC that decrypts under the ticket key -- the thing a console does
-        # ~70 ms later, and the thing nothing can do without the password.
         p.send(lsg_rpc_encrypted(key, 0, 10, 7))
         rep = [d for kind, d in p.frames(timeout=3.0) if kind == "msg"]
         ok = bool(rep) and reply_opens(rep[0], key)
@@ -543,9 +451,6 @@ def main() -> int:
         print(f"lsgauth against an isolated server on {host}:{PORT}"
               + ("  [--revert: pre-54 behaviour]" if args.revert else ""))
 
-        # 1. POSITIVE CONTROL. An account with a stored credential signs in and
-        #    its proof is accepted. Without this the rest proves nothing: a
-        #    server that closes every LSG connection passes checks 2-5.
         _ticket, good = login(host, PORT, GOOD_ACCOUNT)
         check(proof_username(good) == GOOD_ACCOUNT,
               f"login for {GOOD_ACCOUNT!r} returns a proof naming it")
@@ -553,16 +458,10 @@ def main() -> int:
         check(bool(replies) and not closed,
               "a session key we issued is ACCEPTED (connid reply, socket open)")
 
-        # 2. A key that was never issued at all. This is the branch that used to
-        #    log `!!` and carry on with the source address.
         closed, replies = present(host, PORT, retag(good, b"\xA5" * 24))
         check(closed and not replies,
               "a session key we never issued is REFUSED (connection closed)")
 
-        # 3. A refusal must not hand out a credential. `player1` is a name the
-        #    server knows (IDENTITIES) with no stored credential, and the
-        #    fallback is off -- so the ticket is garbage. The opaque proof is
-        #    not, and that is the whole finding.
         _t, refused_known = login(host, PORT, KNOWN_NO_CRED)
         check(proof_username(refused_known) == KNOWN_NO_CRED,
               f"a REFUSED login still returns a readable clear proof for "
@@ -571,25 +470,20 @@ def main() -> int:
         check(closed and not replies,
               "the clear proof from a NO CREDENTIAL refusal is REFUSED")
 
-        # 4. Same again for a name the server has never heard of.
         _t, refused_unknown = login(host, PORT, UNKNOWN_ACCOUNT)
         closed, replies = present(host, PORT, refused_unknown)
         check(closed and not replies,
               "the clear proof from an UNKNOWN ACCOUNT refusal is REFUSED")
 
-        # 5. Skip the connect entirely. Closing the connect that fails to bind
-        #    is not enough on its own -- an unencrypted RPC needs no key to
-        #    build, so a peer that never presents one must not be served.
         p = Peer(host, PORT)
         p.send(bufsize_announce())
-        p.send(lsg_rpc(10, 7))              # Storage: list my files
+        p.send(lsg_rpc(10, 7))
         replies = p.frames(timeout=2.0)
         closed = not replies and p.is_closed()
         p.close()
         check(closed and not replies,
               "an RPC on a connection that never bound is REFUSED")
 
-        # 6. The positive control again, after the hostile ones.
         _ticket2, good2 = login(host, PORT, GOOD_ACCOUNT)
         closed, replies = present(host, PORT, good2)
         check(bool(replies) and not closed,
@@ -602,8 +496,6 @@ def main() -> int:
         check(k is not None and proof_session_key(good3) != k,
               "the clear proof carries a HANDLE, not the key the ticket holds")
 
-        # 7. The handle alone: the connect is answered (provisionally) but an
-        #    unencrypted RPC on it is refused -- a console never sends one.
         p = Peer(host, PORT)
         p.send(bufsize_announce())
         p.send(lsg_connect(good3))
@@ -615,8 +507,6 @@ def main() -> int:
         check(bool(first) and closed,
               "an UNENCRYPTED RPC after a handle-only connect is REFUSED")
 
-        # 8. Encrypted, but under the handle value itself (all a reader of the
-        #    clear proof has): does not decrypt under the ticket key -> refused.
         p = Peer(host, PORT)
         p.send(bufsize_announce())
         p.send(lsg_connect(good3))
@@ -628,8 +518,6 @@ def main() -> int:
         check(closed,
               "an RPC encrypted under the HANDLE value is REFUSED")
 
-        # 9. Positive control of the gate: under the ticket key it is served,
-        #    and the reply is readable under that key.
         p = Peer(host, PORT)
         p.send(bufsize_announce())
         p.send(lsg_connect(good3))
@@ -638,10 +526,7 @@ def main() -> int:
         rep = [d for kind, d in p.frames(timeout=2.0) if kind == "msg"]
         check(bool(rep) and reply_opens(rep[0], k),
               "an RPC encrypted under the TICKET key is served (reply under it)")
-        # keep p open: it is now the account's connection, for check 10
 
-        # 10. A handle-only connection does not sign the account's other
-        #     console out; one that completes its bind does (A7 unchanged).
         ticket4, good4 = login(host, PORT, GOOD_ACCOUNT)
         q = Peer(host, PORT)
         q.send(bufsize_announce())
@@ -659,10 +544,6 @@ def main() -> int:
         q.close()
 
         # ---- A12: two players, one profile name (§56) ----------------------
-        # The online account name is the LOCAL player profile's name -- nothing
-        # is ever typed for it -- so two people who both call a profile
-        # `lukas1` are one account and neither is warned. What the server does
-        # about that is the whole of this group.
         print("\n  -- A12: two players pick the same profile name --")
         err = create_account(host, PORT, NEW_ACCOUNT, NEW_PASSWORD)
         check(err == BD_AUTH_NO_ERROR,
@@ -675,9 +556,6 @@ def main() -> int:
         check(err == BD_AUTH_CREATE_USERNAME_EXISTS,
               f"a SECOND player picking the same name is refused (707), got {err}")
 
-        # The refusal only means something if the credential survived it. This
-        # is the takeover: pre-§56 the request overwrote the digest and the
-        # server then answered 700, so the newcomer owned the account.
         owner_t, _pr = login(host, PORT, NEW_ACCOUNT)
         check(ticket_opens(owner_t, NEW_PASSWORD),
               "...the ORIGINAL owner's password still opens the ticket")
@@ -686,13 +564,6 @@ def main() -> int:
               "'already in use' instead of signing in")
 
         # ---- §64: a login the server cannot DECODE ---------------------------
-        # Every refusal above sits behind `if req is not None`. A 0x0a whose
-        # body is too short to carry the handle raised in parse_login(), and the
-        # handler fell through to the source-address guess -- the pre-§33
-        # identity model -- fallback or no fallback, and answered with a
-        # complete proof for an invented `playerN` under the shared rig
-        # password, which is in the public source. Nothing a console sends
-        # looks like this; a peer that is not a console can send it in one line.
         print("\n  -- a login that cannot be decoded (§64) --")
         p = Peer(host, PORT)
         p.send(short_login_request())

@@ -5,58 +5,6 @@
     .venv/bin/python tools/ownertest.py --revert   # the pre-§65 server; the
                                                    # ownership checks must FAIL
     .venv/bin/python tools/ownertest.py --keep     # leave the scratch dir
-
-WHY A SYNTHETIC PEER. Every check here needs a client that does something a
-retail console never does: read another account's leaderboard row before its
-own, update a session it did not create, invite to a clan it does not
-administer, send a datagram that is not a bdNAT packet. `blocktest.py`
-already had the peer -- a signed-in LSG connection that can send any service
-RPC under the ticket key -- so this borrows it and adds the reply reader.
-
-WHAT THE 2026-09-16 EXTERNAL REVIEW FOUND (reviews/), against the current
-code, and what each section proves:
-
-  identity   `Stats op 4` used to LEARN a connection's account id from the
-             first entity it asked about, and `account_for()` served that
-             ahead of the derivation -- in memory and in `accounts.json`. A
-             console reads itself first, so the rig never saw it; anything
-             else could name another account's id and be filed as that
-             account for every identity-keyed op. The derivation is the only
-             source now.
-  sessions   `Sessions op 2`/`op 3` took any live session id from any bound
-             connection; the ids are sequential and every search reply lists
-             them. Host only now. And EVERY TCP close expired every session
-             hosted from that address -- another player behind the same
-             router signing in took the host's lobby down. The host's own
-             LSG connection is what expires it now.
-  clans      `Teams op 6` (invite) and `op 25` (cancel) checked that the clan
-             existed and nothing about the caller. Administrator or owner
-             now, like op 4 has been since Phase 40. The accept's Caccept
-             goes to the proposal's inviter, not to whoever the request names.
-  storage    `Storage op 1` filed the row and returned the id after the blob
-             write had FAILED. An error now, no row.
-  udp        the bdNAT endpoint table, the unrecognised-datagram sample ring
-             and its per-source files all grew without bound; the relay made
-             a Console object for any endpoint that ever spoke and reclaimed
-             only mailbox owners; a 29-byte datagram from anywhere naming a
-             mailbox port in addrA re-pointed that console's return path.
-
-AND THE CLAN LIFECYCLE (§66 step 5): create, memberships, roster and ranks,
-promote, demote, transfer, remove, leave, disband -- the verbs the retail
-C-cases drive, run here as carol and dave so the store behind them is proved
-without a console. AND THE STORAGE / PROFILE ROUND TRIP (§66 step 6): op 7
-lists an upload, op 2 replaces its bytes and op 5 fetches them, op 2 / op 4
-from another account are refused (D9), op 4 removes it; Profile op 1 answers
-0 then 800 (P1) and op 2 hands the nine fields back verbatim (P3). `--revert`
-fails the nine §65 checks and one consequence of the learned identity
-(45/57: the two D9 checks join them, because bob IS alice).
-
-Standing up a whole server per run is the cheap part (~1 s) and it buys a
-data dir nobody else is writing, which is the only way a check can assert on
-the store and mean it: the read-backs go through `store.export_*()`, which
-returns the JSON files' shapes from the scratch server's own `wow2.sqlite3`.
-The udp/relay checks that need the tables themselves run in-process against
-the modules.
 """
 from __future__ import annotations
 
@@ -103,7 +51,8 @@ def req_stats_read(board: int, entities: list[int]) -> bytes:
 def _session_info(w: bd.BdWriter, name: str, sid: bytes | None = None) -> None:
     """The bdMatchMakingInfo the create/update handlers read generically: the
     25-byte address, the session id (update only), the host name, and the
-    settings ints (`[1]` roster, `[6]` play mode, `[10]` maxPlayers)."""
+    settings ints (`[1]` roster, `[6]` play mode, `[10]` maxPlayers).
+    """
     w.blob(ADDR25)
     if sid is not None:
         w.blob(sid)
@@ -138,7 +87,8 @@ def req_session_get(sid: bytes) -> bytes:
 
 def req_session_search(want: int, start: int = 0) -> bytes:
     """Sessions op 5 -- [u8 0][i32 1][i32 numResults][i32 startIndex]... as the
-    browser sends it (the rest of its filters are 'Any')."""
+    browser sends it (the rest of its filters are 'Any').
+    """
     w = _rpc(5, 5)
     w.i32(1)
     w.i32(want)
@@ -157,8 +107,6 @@ def search_rows(c: Console, want: int, start: int = 0):
     names = []
     for _ in range(n):
         fields = bd.read_fields(r, limit=30)
-        # each row is one bdMatchMakingInfo; its first string is the host name.
-        # read_fields runs to the end of the buffer, so slice per row by count:
         names.append([v for t, v in fields if isinstance(v, str)])
         break
     flat = [v for group in names for v in group]
@@ -190,7 +138,8 @@ def req_clan_create(name: str) -> bytes:
 
 def req_clan_pair(op: int, team_id: int, gamer: int) -> bytes:
     """Ops 3 / 26 (promote / demote), 4 (remove), 5 (leave / disband / remove),
-    27 (transfer): [u8 0][u64 teamId][u64 gamerId]."""
+    27 (transfer): [u8 0][u64 teamId][u64 gamerId].
+    """
     w = _rpc(3, op)
     w.u64(team_id)
     w.u64(gamer)
@@ -216,7 +165,7 @@ def memberships(r) -> list[tuple[int, str, int]]:
         for _ in range(r.u32() if r is not None else 0):
             out.append((r.u64(), r.str_(64), r.u8()))
     except EOFError:
-        pass                      # a reply cut short reads as fewer rows, not a crash
+        pass
     return out
 
 
@@ -244,7 +193,8 @@ def req_storage_upload(name: str, data: bytes) -> bytes:
 
 def req_storage_by_id(op: int, fid: int, data: bytes | None = None) -> bytes:
     """Storage op 2 (overwrite: [u8 0][u64 id][blob]), op 4 (delete) and
-    op 5 (fetch): [u8 0][u64 id]."""
+    op 5 (fetch): [u8 0][u64 id].
+    """
     w = _rpc(10, op)
     w.u64(fid)
     if data is not None:
@@ -264,7 +214,8 @@ def req_storage_list(op: int, owner: int = 0, start: int = 0, count: int = 128) 
 
 def storage_rows_of(r) -> dict[int, dict]:
     """The op 7/8 rows by id: [u32 n] then [u32 size][u64 id][u32 created]
-    [u32 modified][bool private][bool][u64 owner][str name]."""
+    [u32 modified][bool private][bool][u64 owner][str name].
+    """
     out = {}
     try:
         for _ in range(r.u32() if r is not None else 0):
@@ -343,7 +294,8 @@ def decrypt(frame: bytes, key: bytes) -> bytes | None:
 
 def task_reply(frames: list, key: bytes):
     """(err, reader positioned at the result count) of the first TaskReply in
-    `frames`, or (None, None)."""
+    `frames`, or (None, None).
+    """
     for kind, body in frames:
         pt = decrypt(body, key) if kind == "msg" else None
         if pt is None or pt[4] != 1:
@@ -352,9 +304,9 @@ def task_reply(frames: list, key: bytes):
         r.bitmode = True
         r.read_type_checked_bit()
         r.type_checked = True
-        r.u64()                                 # transaction id
+        r.u64()
         err = r.u32()
-        r.u8()                                  # op id
+        r.u8()
         return err, r
     return None, None
 
@@ -379,7 +331,8 @@ class Console(_Console):
 
     def call(self, payload: bytes, timeout: float = 1.5):
         """Send one RPC; return (err, reader) of its reply -- and keep any push
-        that arrived alongside in `self.pushes`."""
+        that arrived alongside in `self.pushes`.
+        """
         self.seed += 1
         self.p.send(encrypt_rpc(self.key, self.seed, payload))
         frames = []
@@ -424,13 +377,14 @@ def session_live(c: Console, sid: bytes):
 # ------------------------------------------------------------------ the server
 class Server:
     """The isolated server, with its log captured in a thread -- the UDP
-    checks make it print more than a pipe buffer holds."""
+    checks make it print more than a pipe buffer holds.
+    """
 
     def __init__(self, tmp: Path, revert: bool):
         env = dict(os.environ,
                    WOW2_PORT=str(PORT),
                    WOW2_DATA_DIR=str(tmp),
-                   WOW2_HEXDUMPS="1",           # so the sample-file cap is exercised
+                   WOW2_HEXDUMPS="1",
                    WOW2_LOG_LEVEL="info",
                    WOW2_SHARED_PASSWORD_FALLBACK="false",
                    WOW2_NO_NAT_TYPE="1",
@@ -482,7 +436,8 @@ class Server:
 
 def seed(tmp: Path) -> None:
     """Three accounts with credentials; a clan alice1 owns with bob222 as an
-    ordinary member and carol3 outside it."""
+    ordinary member and carol3 outside it.
+    """
     tmp.mkdir(parents=True, exist_ok=True)
     accounts, names = {}, {}
     for i, a in enumerate(ACCOUNTS):
@@ -513,7 +468,8 @@ def jload(tmp: Path, name: str) -> dict:
 
 def store_row(tmp: Path, sql: str, args=()):
     """One row out of the scratch server's own SQLite store (§66). A second
-    connection to the file the server has open is what WAL is for."""
+    connection to the file the server has open is what WAL is for.
+    """
     import store
     conn = store.connect(tmp / store.DB_NAME)
     try:
@@ -524,7 +480,8 @@ def store_row(tmp: Path, sql: str, args=()):
 
 def teams_json(tmp: Path) -> dict:
     """The clan store in the JSON file's shape, exported from the scratch
-    server's own SQLite store (§66 step 5)."""
+    server's own SQLite store (§66 step 5)."
+    """
     import store
     conn = store.connect(tmp / store.DB_NAME)
     try:
@@ -548,7 +505,8 @@ def proposals(tmp: Path) -> list:
 
 def friends_json(tmp: Path) -> dict:
     """The social store in the JSON file's shape, exported from the scratch
-    server's own SQLite store (§66 step 4)."""
+    server's own SQLite store (§66 step 4)."
+    """
     import store
     conn = store.connect(tmp / store.DB_NAME)
     try:
@@ -634,8 +592,6 @@ def run_server_checks(tmp: Path, srv: Server, check: Checks) -> None:
     check(live and host == "alice-lobby-2", "CONTROL: the host's own update is applied",
           f"live={live} host={host!r}")
 
-    # another connection from the SAME address (a second console behind the
-    # router signing in): its auth connection opens, is answered, and closes.
     login("127.0.0.1", PORT, ACCOUNTS[2])
     time.sleep(0.5)
     live, host = session_live(carol, sid)
@@ -656,7 +612,6 @@ def run_server_checks(tmp: Path, srv: Server, check: Checks) -> None:
     check(len(sid2) == 8 and live is False, "CONTROL: the host's own delete removes it",
           f"sid={sid2.hex()} live={live}")
 
-    # one lobby per host, and the browser's page
     err, r = alice.call(req_session_create("alice-first"))
     sid_a1 = r.blob() if r is not None and r.u32() else b""
     err, r = alice.call(req_session_create("alice-second"))
@@ -702,7 +657,7 @@ def run_server_checks(tmp: Path, srv: Server, check: Checks) -> None:
           f"proposals={proposals(tmp)}")
 
     bob.drain()
-    carol.call(req_clan_accept(CLAN_ID, bob.entity))       # no proposal on file
+    carol.call(req_clan_accept(CLAN_ID, bob.entity))
     members = teams_json(tmp)["teams"][f"{CLAN_ID:016x}"]["members"]
     check(f"{carol.entity:016x}" not in members and 14 not in bob.drain(),
           "an accept with no proposal admits nobody and notifies nobody",
@@ -710,7 +665,7 @@ def run_server_checks(tmp: Path, srv: Server, check: Checks) -> None:
 
     alice.call(req_clan_invite(CLAN_ID, carol.entity))
     alice.drain(); bob.drain(); carol.drain()
-    carol.call(req_clan_accept(CLAN_ID, bob.entity))       # names bob as the inviter
+    carol.call(req_clan_accept(CLAN_ID, bob.entity))
     to_alice, to_bob = alice.drain(), bob.drain()
     members = teams_json(tmp)["teams"][f"{CLAN_ID:016x}"]["members"]
     check(f"{carol.entity:016x}" in members, "CONTROL: an accept with a proposal admits",
@@ -722,12 +677,9 @@ def run_server_checks(tmp: Path, srv: Server, check: Checks) -> None:
     # ------------------------------------------------- the clan lifecycle
     print("\n-- clans: create, roster and ranks, promote, demote, transfer, remove, "
           "leave, disband (the verbs the retail C-cases drive)")
-    # dave, a fourth account that has read nobody: under `--revert` bob IS
-    # alice for the life of the process (the learned identity is per name),
-    # and these checks are about the verbs, not about §65.
     dave = Console("127.0.0.1", PORT, ACCOUNTS[3])
     alice.drain()
-    carol.call(req_clan_pair(5, CLAN_ID, 0))                 # carol leaves alice's clan
+    carol.call(req_clan_pair(5, CLAN_ID, 0))
     members = teams_json(tmp)["teams"][f"{CLAN_ID:016x}"]["members"]
     check(f"{carol.entity:016x}" not in members and 16 in alice.drain(),
           "op 5 with gamer 0 from a member is LEAVE; the owner gets a Cleft",
@@ -755,7 +707,7 @@ def run_server_checks(tmp: Path, srv: Server, check: Checks) -> None:
     ros = roster(r)
     check(ros.get(carol.entity) == (True, 2) and ros.get(dave.entity) == (False, 0),
           "op 21: the owner is flagged with rank 2, a member rank 0", f"roster={ros}")
-    dave.call(req_clan_pair(3, new_id, carol.entity))         # a member promoting the owner
+    dave.call(req_clan_pair(3, new_id, carol.entity))
     carol.call(req_clan_pair(3, new_id, dave.entity))
     ros = roster(carol.call(req_clan_members(new_id))[1])
     check(ros.get(dave.entity) == (False, 1) and 17 in dave.drain(),
@@ -765,7 +717,7 @@ def run_server_checks(tmp: Path, srv: Server, check: Checks) -> None:
     ros = roster(carol.call(req_clan_members(new_id))[1])
     check(ros.get(dave.entity) == (False, 0) and 39 in dave.drain(),
           "op 26 demotes back to rank 0 with a Cordinary", f"roster={ros}")
-    dave.call(req_clan_pair(27, new_id, dave.entity))          # a member cannot take the clan
+    dave.call(req_clan_pair(27, new_id, dave.entity))
     carol.call(req_clan_pair(27, new_id, dave.entity))
     rec = teams_json(tmp)["teams"][f"{new_id:016x}"]
     ros = roster(carol.call(req_clan_members(new_id))[1])
@@ -773,7 +725,7 @@ def run_server_checks(tmp: Path, srv: Server, check: Checks) -> None:
           and ros.get(carol.entity) == (False, 0) and 28 in dave.drain(),
           "op 27 by the owner hands the clan over: the new owner is rank 2, the old "
           "one an ordinary member, and a Cowner goes to the new owner", f"rec={rec}")
-    carol.call(req_clan_pair(4, new_id, dave.entity))         # an ordinary member removing
+    carol.call(req_clan_pair(4, new_id, dave.entity))
     rec = teams_json(tmp)["teams"][f"{new_id:016x}"]
     check(len(rec["members"]) == 2, "op 4 by an ordinary member is refused",
           f"members={rec['members']}")
@@ -782,12 +734,9 @@ def run_server_checks(tmp: Path, srv: Server, check: Checks) -> None:
     check(rec["members"] == [f"{dave.entity:016x}"] and 18 in carol.drain(),
           "op 4 by the owner removes the member, who gets a Ckicked",
           f"members={rec['members']}")
-    dave.call(req_clan_invite(new_id, carol.entity))          # an outstanding invite...
+    dave.call(req_clan_invite(new_id, carol.entity))
     carol.drain()
-    dave.call(req_clan_pair(5, new_id, 0))                    # ...then the owner leaves = disband
-    # (carol's mailbox still holds the type 13 for alice's clan, which she
-    # ACCEPTED: the client deletes that row itself with Messaging op 4, and a
-    # synthetic peer does not -- so the check is for THIS clan's row.)
+    dave.call(req_clan_pair(5, new_id, 0))
     check(f"{new_id:016x}" not in teams_json(tmp)["teams"]
           and not clan_mail(tmp, carol.entity, new_id),
           "op 5 with gamer 0 from the OWNER disbands the clan and withdraws its "
@@ -893,8 +842,6 @@ def run_server_checks(tmp: Path, srv: Server, check: Checks) -> None:
           f"(peak {max(known) if known else '?'})")
     for s in socks:
         s.close()
-    # the bound that does the real work is the TTL: an endpoint that stops
-    # keepaliving is gone 90 s later. In-process, on the module's own table.
     now = time.time()
     authserver.NAT_PEERS.clear()
     for i in range(500):
@@ -919,7 +866,7 @@ def run_relay_checks(check: Checks) -> None:
     """In-process: the relay's own tables, no sockets bound."""
     import natrelay
     print("\n-- relay: the console table and who a datagram is attributed to")
-    natrelay._log = lambda *_a, **_k: None          # the module's own chatter
+    natrelay._log = lambda *_a, **_k: None
     rl = natrelay.Relay()
     rl.enabled = True
     for port in range(40100, 40132):

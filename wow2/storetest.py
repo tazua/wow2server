@@ -5,17 +5,6 @@ scratch directory (§66 step 1).
 
     storetest.py            # every check
     storetest.py --keep     # leave the scratch directory behind
-
-Two kinds of check. The ROUND TRIP: a fixture in the exact shapes the seven
-JSON stores had, including the corners the rig's own files carry (a storage
-row with inline `data`, an owner written as a decimal id, a `ranks` entry for
-a non-member, a clan id outside the counter's window, a mailbox row whose id
-collides), imported, exported and compared field by field. And the STARTUP
-rules: a store is imported once and its file renamed aside; a file that
-reappears is ignored; a JSON file that does not parse, a table that holds
-rows with no import on record, and a database that fails quick_check all
-refuse to start; a transaction nests and rolls back whole; two rows can never
-share a file id.
 """
 from __future__ import annotations
 
@@ -61,7 +50,7 @@ def fixture(d: Path) -> None:
     }))
     (d / "friends-db.json").write_text(json.dumps({
         "names": {A: "player1", B: "testuser", C: "player3", D: "player5"},
-        "friends": [[A, B], [B, A], [C, D]],                # the reversed duplicate
+        "friends": [[A, B], [B, A], [C, D]],
         "invites": [{"from": C, "from_name": "player3", "to": A, "to_name": "player1",
                      "at": "10:00:00.000"}],
         "blocked": [{"by": D, "who": C, "who_name": "player3", "at": "10:01:00.000"}],
@@ -72,7 +61,7 @@ def fixture(d: Path) -> None:
                      {"id": 9, "to": D, "type": 13, "from": A, "from_name": "player1",
                       "session": "1400000000a0c100", "clan": "wormstest",
                       "at": "10:03:00.000"}],
-        "next_msg": 5,                                        # behind its own rows
+        "next_msg": 5,
     }))
     (d / "teams-db.json").write_text(json.dumps({
         "invite_push_type": 13, "next": 3,
@@ -81,7 +70,7 @@ def fixture(d: Path) -> None:
                                  "proposals": [{"to": D, "from": A, "from_name": "player1",
                                                 "at": "10:03:00.000"}],
                                  "created": "15:37:11.449",
-                                 "ranks": {B: 1, C: 1}},     # C is not a member
+                                 "ranks": {B: 1, C: 1}},
             "c1a0c1a0c1a0c1a1": {"name": "faraway", "owner": C, "members": [C],
                                  "created": "16:00:00.000"},
         },
@@ -111,7 +100,7 @@ def fixture(d: Path) -> None:
     }))
     (d / "stats-db.json").write_text(json.dumps({
         f"5:{A}": [4649, 1, "player1"], f"5:{B}": [2771, 2, "testuser"],
-        f"5:{C}": [2771, 0, "player3"],                       # a tie, stale rank
+        f"5:{C}": [2771, 0, "player3"],
         f"1:{A}": [28, 1, "player1", [["i32", 0], ["i64", 201326592], ["i64", 0]]],
         f"2:{D}": [1000, 1, "player5"],
         "garbage": [1, 1, "x"],
@@ -196,21 +185,18 @@ def run(keep: bool) -> int:
               "only the migrated stores' tables were filled")
         check(any("imported stats-db.json" in m for m in logs),
               "the import is logged with its row counts")
-        # a file that comes back after its import
         (data / "pot.json").write_text("{}")
         logs.clear()
         store.startup(log=logs.append, stores=("stats", "pots"), data_dir=data)
         check((data / "pot.json").exists() and any("IGNORED" in m for m in logs)
               and conn.execute("SELECT COUNT(*) FROM pots").fetchone()[0] == 4,
               "a JSON file that reappears after its import is ignored, loudly")
-        # a store with no file: flagged imported, nothing renamed, nothing written
         (data / "profile-db.json").unlink()
         logs.clear()
         store.startup(log=logs.append, stores=("profiles",), data_dir=data)
         check(store.meta_get(conn, "imported:profiles") is not None
               and any("starts empty" in m for m in logs),
               "a missing file marks the store imported and starts it empty")
-        # a JSON file that does not parse refuses, and is not touched
         (data / "friends-db.json").write_text("{not json")
         try:
             store.startup(log=quiet, stores=("friends",), data_dir=data)
@@ -220,7 +206,6 @@ def run(keep: bool) -> int:
         check(refused and (data / "friends-db.json").read_text() == "{not json"
               and store.meta_get(conn, "imported:friends") is None,
               "an unreadable JSON store refuses to start and is left where it is")
-        # a CLI (db(), import_files=False) meets an un-imported file: refusal
         store.close()
         (data / "storage-db.json").write_text(json.dumps({"files": []}))
         try:
@@ -233,7 +218,6 @@ def run(keep: bool) -> int:
               "a CLI that finds a store's file still un-imported refuses rather than "
               "importing it out from under a running server")
         conn = store.db()
-        # rows with no import on record refuse
         with store.tx(conn):
             conn.execute("INSERT INTO teams (id, name) VALUES ('0000c1a000000001', 'x')")
         try:
@@ -304,7 +288,7 @@ def run(keep: bool) -> int:
         store.close()
         p = data / store.DB_NAME
         raw = bytearray(p.read_bytes())
-        raw[4096 * 2:4096 * 6] = b"\x00" * 4096 * 4        # four pages of the schema, gone
+        raw[4096 * 2:4096 * 6] = b"\x00" * 4096 * 4
         p.write_bytes(raw)
         for w in p.parent.glob(store.DB_NAME + "-*"):
             w.unlink()

@@ -1,36 +1,9 @@
 #!/usr/bin/env python3
-"""Deployment configuration for the WOW2 server -- one file, safe defaults.
-
-WHY THIS IS SEPARATE FROM `rigconfig.py`. There are two kinds of knob here and
-they were the same kind for a long time, which is why there are 43 `WOW2_*`
-environment variables:
-
-  * **Deployment settings** -- bind address, port, where data lives, whether an
-    unknown account may sign in on a shared password, whether every packet gets
-    hexdumped to disk. An operator has to set these and should not have to read
-    `CLAUDE.md` to find them. They belong in a file.
-  * **Research switches** -- `WOW2_NO_PUSH`, `WOW2_LSG_HOLD`, `WOW2_FRIEND_ROWS`
-    and the rest. They exist to bisect a protocol failure by turning one specific
-    behaviour off, they are used for minutes at a time, and putting them in a
-    config file would invite someone to deploy with one set. They stay in the
-    environment and stay undocumented outside `tools/README.md`.
-
-`rigconfig.py` is a third thing again: values the SERVER and the INPUT DRIVER
-must agree on (the account password, the emulator layout). It is about the rig,
-not about a deployment, and it keeps its own life.
-
-Precedence, highest first:   environment  >  config file  >  the defaults here.
-The environment wins so that every existing `WOW2_*` invocation keeps working
-exactly as before -- nothing in the rig had to change for this file to exist.
+"""Deployment configuration for the WOW2 server: one file, safe defaults.
+Precedence is environment > config file > built-in defaults, and every key is
+documented in wow2-server.example.toml.
 
     WOW2_CONFIG=/etc/wow2-server.toml tools/wow2 server start
-
-With no config file at all the defaults are a DEPLOYMENT's (Phase 64): the
-shared-password fallback off, hexdumps off, one log line per RPC. The rig's
-settings live in the repository's own `wow2-server.toml`, which `wow2 server
-start` finds through the search path below and which `mkpublic.py` never
-ships -- so a checkout of the public tree and a bare `wow2-server` both get
-the safe values without a file.
 """
 from __future__ import annotations
 
@@ -40,19 +13,6 @@ from pathlib import Path
 
 ROOT = Path(os.environ.get("WOW2_ROOT", Path(__file__).resolve().parent.parent))
 
-# In the source tree the rig writes to <repo>/capture and everything (git
-# history, the tools, CLAUDE.md) assumes it. Once INSTALLED, that same expression
-# points at site-packages, which is not a data directory -- a server must not
-# write its databases there and on most systems could not anyway. So default to
-# the repo only when this really is the repo, and otherwise to a directory the
-# operator can see.
-#
-# Two source layouts (§65): the private tree keeps the package under `tools/`
-# and writes to `capture/`; the public tree IS `wow2/` beside its own
-# `pyproject.toml`, and a checkout of it writes to `wow2-data/` beside the
-# checkout -- the directory `setup.sh` makes and the README names. It used to
-# be taken for an install and given `<cwd>/wow2-data`, which moved with the
-# working directory. Site-packages has a `wow2/` too, but no `pyproject.toml`.
 _RIG_TREE = (ROOT / "tools" / "authserver.py").is_file()
 _PUBLIC_TREE = (not _RIG_TREE and (ROOT / "wow2" / "authserver.py").is_file()
                 and (ROOT / "pyproject.toml").is_file())
@@ -61,7 +21,6 @@ _DEFAULT_DATA = (ROOT / "capture" if _RIG_TREE
                  else ROOT / "wow2-data" if _PUBLIC_TREE
                  else Path.cwd() / "wow2-data")
 
-#: Searched in order. The first that exists wins.
 SEARCH = [
     os.environ.get("WOW2_CONFIG"),
     "wow2-server.toml",
@@ -71,148 +30,44 @@ SEARCH = [
 
 DEFAULTS: dict[str, dict] = {
     "server": {
-        # 0.0.0.0 is the historical behaviour and what the rig needs (the
-        # namespaces reach it over the bridge). A deployment that only wants
-        # loopback can say so here instead of editing the source.
         "bind": "0.0.0.0",
-        "port": 3074,              # auth TCP, LSG TCP and bdDiscovery UDP all
+        "port": 3074,
     },
     "accounts": {
-        # When an account has no stored credential, fall back to the shared
-        # password from rigconfig. FALSE since Phase 64: only an account that
-        # actually created itself (auth 0x00, which stores Tiger192(password))
-        # can sign in, and everything else -- a known name with no credential,
-        # an unknown handle, a login too short to decode -- is answered with a
-        # key it cannot have. The eight-console rig turns it back ON in the
-        # repository's own `wow2-server.toml`, because six of its accounts
-        # predate the credential store and sign in on the shared password.
         "shared_password_fallback": False,
-        # What to answer a create-account request for a name that already has a
-        # credential. "refuse_duplicates" answers 707, which the client does not
-        # render as an error at all -- it silently re-issues as a sign-in, so the
-        # returning owner walks straight in and only a genuine collision fails.
-        #
-        # THIS MATTERS MORE THAN IT LOOKS. The online account name is the local
-        # player profile's name; nothing is ever typed for it. Two people who
-        # both call a profile `lukas1` are one account. The old default,
-        # "success", answered 700 to everyone and let the second one's request
-        # OVERWRITE the first one's password digest -- a silent account takeover.
-        # It is kept only as a bisect switch. "name_exists" answers 707 to
-        # everybody, including first-time creators, so nobody can ever register.
         "create_mode": "refuse_duplicates",
     },
     "logging": {
-        # Every message hexdumped to the session log. Invaluable for recon,
-        # unacceptable for a deployment -- the PPSSPP console log hit 357 MB once
-        # and the server log grows the same way. OFF since Phase 64; the rig's
-        # `wow2-server.toml` turns it on, because `bddump.py --log` and the
-        # request census read those dumps.
         "hexdumps": False,
-        # "debug" is every read, every message body, every reply -- the rig's
-        # setting. "info" keeps one line per RPC and drops the per-packet
-        # noise, which is ~90% of the volume and all of the reason a session
-        # log grows without bound. "info" since Phase 64.
         "level": "info",
     },
     "limits": {
-        # Nothing here has ever faced a hostile peer. These are generous -- the
-        # client's own steady state is a few messages a second and two
-        # connections per console -- and they exist so that a peer that misbehaves
-        # loses its own connection instead of the server's memory.
-        "max_msgs_per_sec": 100,     # per connection, averaged over a second
-        "max_conns_per_ip": 16,      # a console needs 2; change-password opens a 3rd
-        "max_stream_bytes": 4 * 1024 * 1024,   # per connection, lifetime
+        "max_msgs_per_sec": 100,
+        "max_conns_per_ip": 16,
+        "max_stream_bytes": 4 * 1024 * 1024,
     },
     "nat": {
-        # Carry the peer session through the server instead of relying on a NAT
-        # punch. OFF is the historical behaviour and the right default on a LAN,
-        # where the direct path always wins and is free.
-        #
-        # Turn it ON for a deployment whose players are behind carrier NAT --
-        # which, measured, defeats the introduction broker outright (Phase 35).
-        # It costs ~7 datagrams/sec each way per pair, so a four-player match is
-        # roughly 50 KB/s through the server.
-        #
-        # THE RELAY PORTS MUST BE OPEN IN THE FIREWALL, exactly like the main
-        # one. The server logs the range at startup.
         "relay": False,
         "relay_port_base": 40000,
-        "relay_ports": 32,           # one per console, so 16 two-player matches
-        "relay_idle_timeout": 600,   # seconds before a mailbox may be reclaimed
-        # What to tell a console the server's address is. Empty means "ask the
-        # routing table", which is right on the rig (bridge or loopback) and on
-        # a VPS with one address. Set it when the server sits behind its own NAT
-        # or has several addresses and the kernel would pick the wrong one.
+        "relay_ports": 32,
+        "relay_idle_timeout": 600,
         "public_address": "",
         # ---- NAT TYPE DISCOVERY (the game's own three-test STUN probe) ----
-        # The client resolves the `stun.*` names before anything else and fires
-        # a 4-byte `0x14` probe at each of three tests; the reply tells it
-        # whether it is BD_NAT_OPEN / MODERATE / STRICT. Answering them costs
-        # one extra UDP port and is what makes test 3 mean anything: the client
-        # accepts a reply from ANY source, so answering every test from the main
-        # port declares MODERATE unconditionally, which is a guess dressed up as
-        # a measurement.
         "nat_type": True,
-        # The port test 3's reply is sent FROM. Same address, different port --
-        # so the reply arrives only through a NAT that is address-restricted or
-        # better, which is exactly the distinction the test exists to make.
-        # OPEN THIS IN THE FIREWALL (outbound is enough; nothing binds a
-        # conversation to it).
         "nat_type_alt_port": 3078,
-        # A SECOND PUBLIC ADDRESS, if the deployment has one. Test 2 asks for a
-        # reply from a different IP, and a console that gets one is behind a
-        # full-cone NAT -- BD_NAT_OPEN. Without a second address the test is
-        # unanswerable, so it is left to time out rather than answered from this
-        # one: replying from the same IP would pass the client's check and
-        # declare OPEN for a NAT that is only address-restricted.
         "nat_type_alt_address": "",
     },
     "stats": {
-        # WHAT A PLAYER WITH NO RANKED ROW IS WORTH. The rating lives on the
-        # server, so a new player's opening value was always a server-side
-        # policy the client never saw -- and serving 0, which is what an absent
-        # row used to mean, puts every new account below the floor on its first
-        # ranked match (T12, §53):
-        #
-        #   served   lobby shows   actually paid   losses to the floor
-        #     0           1            **-10**     already there
-        #    10           1              0         already there
-        #   400          40             40         40
-        #
-        # The lobby displays `max(1, rating // 10)` and the client uploads
-        # `max(10, rating - rating // 10)`, and those two only agree at 11 and
-        # above. At 400 they agree exactly, a 10% wager means something from
-        # game one (400 v 400: both stake 40, pot 80, winner 440, loser 360),
-        # and the floor is forty straight losses away instead of the opening
-        # position. Serving 0 also made the client's first stake upload RISE,
-        # which the server reads as a payout and banks the pot early.
-        #
-        # Set it to 0 to get the old behaviour; nothing else in the server
-        # depends on the number.
         "starting_rating": 400,
     },
     "storage": {
-        # Where the store (wow2.sqlite3), the uploaded blobs and the logs live.
         "data_dir": str(_DEFAULT_DATA),
     },
 }
 
 
 def _read_file() -> tuple[dict, str | None]:
-    """Load the first config file that exists. A BROKEN one is fatal.
-
-    This used to print the parse error and carry on with the built-in defaults,
-    on the reasoning that a typo should not take the server down. That is the
-    wrong trade and it showed up the first time someone deployed: a missing pair
-    of quotes around `level = info` meant the server came up with hexdumps on and
-    `shared_password_fallback` back at its development default, while the
-    operator had written `false` and believed it. Silently running with settings
-    nobody chose is worse than not running, especially when one of them decides
-    who may sign in.
-
-    So: no file is fine and means "defaults". A file that exists and does not
-    parse stops the process. Delete it or fix it.
-    """
+    """Load the first config file that exists. A BROKEN one is fatal."""
     for cand in SEARCH:
         if not cand:
             continue
@@ -244,8 +99,6 @@ def _merged() -> dict[str, dict]:
 
 _CFG = _merged()
 
-#: Environment overrides, applied last. Only DEPLOYMENT settings appear here --
-#: research switches are read where they are used and are not config at all.
 _ENV = {
     ("server", "bind"): ("WOW2_BIND", str),
     ("server", "port"): ("WOW2_PORT", int),
@@ -318,7 +171,8 @@ def _nat_line() -> str:
 
 def describe() -> str:
     """One block for the server banner -- an operator should be able to see what
-    is in force without guessing which env var won."""
+    is in force without guessing which env var won.
+    """
     src = PATH or "built-in defaults (no config file)"
     return (f"config: {src}"
             f"{'' if _RIG_TREE else '  [source checkout]' if _PUBLIC_TREE else '  [installed, not a source tree]'}\n"

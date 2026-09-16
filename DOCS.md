@@ -254,7 +254,7 @@ older behaviour and must fail.
 ```bash
 .venv/bin/python -m wow2.lsgauth      # the credential path, 22 checks
 .venv/bin/python -m wow2.blocktest    # a block stops all three invites, 7 checks
-.venv/bin/python -m wow2.ownertest    # identity, ownership, UDP and relay bounds, 32 checks
+.venv/bin/python -m wow2.ownertest    # identity, ownership, UDP and relay bounds, 37 checks
 .venv/bin/python -m wow2.loadtest --consoles 32 --lifetime 200   # capacity, see below
 ```
 

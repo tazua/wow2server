@@ -1306,6 +1306,7 @@ NO_KEY_REWRITE = os.environ.get("WOW2_NO_KEY_REWRITE") == "1"
 
 SESSIONS: dict[int, dict] = {}
 _next_session_id = [0x5701]        # arbitrary; just has to fit in 8 bytes
+SEARCH_PAGE_MAX = 50               # rows per search reply; the browser asks for 25
 
 
 def sessions_create_result(dec: dict, peer_ip: str = "", host_key: str = ""):
@@ -1345,6 +1346,19 @@ def sessions_create_result(dec: dict, peer_ip: str = "", host_key: str = ""):
         rec["points"] = ints[6] if len(ints) > 6 else 0
     except Exception as e:
         log(f"  (session create decode failed: {e})")
+    # ONE SESSION PER HOST (§66 prep). A console holds one lobby at a time and
+    # deletes it before making another; the server used to keep whatever a
+    # connection created, so a peer that was not a console could fill the
+    # browser. A new create from the same host replaces its previous session,
+    # which is also what a console that crashed mid-lobby and came back needs.
+    for old_sid, old_rec in [(k, v) for k, v in SESSIONS.items()
+                             if v.get("host") == rec["host"]]:
+        SESSIONS.pop(old_sid, None)
+        log(f"  session create: {rec['host']!r} already hosted 0x{old_sid:x} "
+            f"{old_rec.get('name')!r} -- replaced")
+        settled = potbank.settle_unresolved(old_sid, ts())
+        if settled:
+            log(f"  POT: {settled}")
     sid = _next_session_id[0]
     _next_session_id[0] += 1
     rec["id"] = sid
@@ -1606,15 +1620,31 @@ def sessions_search_results(dec: dict, joiner_ip: str = ""):
     except Exception as e:
         log(f"  (session search decode failed: {e})")
         filters = []
-    rows = list(SESSIONS.values())
+    # THE PAGE. The request opens `[i32 1][i32 25][i32 0]` on every capture
+    # (44 of 44): flags, then the number of results the browser wants, then
+    # the index to start at -- bdMatchMaking's findSessions(numResults,
+    # startIndex). The server used to return every live session regardless,
+    # and at ~184 bytes a row the reply outgrows the client's 64 KB receive
+    # buffer at roughly 350 open lobbies, which would break the browser for
+    # everyone at once. Honoured now, clamped to SEARCH_PAGE_MAX either way.
+    want = filters[1] if len(filters) > 1 and 0 < filters[1] <= SEARCH_PAGE_MAX \
+        else SEARCH_PAGE_MAX
+    start = filters[2] if len(filters) > 2 and filters[2] > 0 else 0
+    # Lobbies with a free seat first, newest first within each group, so the
+    # page a full browser shows is the one worth showing.
+    live = sorted(SESSIONS.values(),
+                  key=lambda rec: (bool(rec.get("max_players")) and
+                                   rec.get("players", 0) >= rec.get("max_players", 0),
+                                   -rec.get("id", 0)))
+    rows = live[start:start + want]
 
     def emit(w):
         for rec in rows:
             bd.write_fields(w, info_with_session_id(rec, joiner_ip))
 
-    log(f"  session search: {len(rows)} session(s) -> "
+    log(f"  session search: {len(rows)} of {len(live)} session(s) -> "
         + (", ".join(f"0x{r['id']:x} {r['name']!r}" for r in rows) or "none")
-        + (f"  filters={filters[:4]}..." if filters else ""))
+        + (f"  page {start}+{want}; filters={filters[:4]}..." if filters else ""))
     return len(rows), emit
 
 
@@ -6240,7 +6270,13 @@ def nat_broker_mode() -> str:
 # forged entries age out 90 s after they stop.
 NAT_PEERS: dict[tuple[str, int], float] = {}
 NAT_PEER_TTL = 90.0
-NAT_PEERS_MAX = 256
+# Every ONLINE console holds one entry (its keepalive every 15 s), so this is
+# a ceiling on the population, not only on a flood: past it the oldest
+# console's entry goes and an introduction to it fails until its next
+# keepalive. 256 (§65) was that ceiling; an entry is ~100 bytes, so the cap
+# is now far above any population this server will see and only the TTL does
+# real work.
+NAT_PEERS_MAX = 16384
 
 
 def nat_peers_sweep(now: float | None = None) -> None:

@@ -124,6 +124,35 @@ def req_session_get(sid: bytes) -> bytes:
     return w.getvalue()
 
 
+def req_session_search(want: int, start: int = 0) -> bytes:
+    """Sessions op 5 -- [u8 0][i32 1][i32 numResults][i32 startIndex]... as the
+    browser sends it (the rest of its filters are 'Any')."""
+    w = _rpc(5, 5)
+    w.i32(1)
+    w.i32(want)
+    w.i32(start)
+    for v in (0, 0, 0, 0, 0, 0, 0, 0):
+        w.i32(v)
+    return w.getvalue()
+
+
+def search_rows(c: Console, want: int, start: int = 0):
+    """The host names a search returns to `c`, in reply order."""
+    err, r = c.call(req_session_search(want, start))
+    if r is None:
+        return None
+    n = r.u32()
+    names = []
+    for _ in range(n):
+        fields = bd.read_fields(r, limit=30)
+        # each row is one bdMatchMakingInfo; its first string is the host name.
+        # read_fields runs to the end of the buffer, so slice per row by count:
+        names.append([v for t, v in fields if isinstance(v, str)])
+        break
+    flat = [v for group in names for v in group]
+    return n, flat
+
+
 def req_clan_cancel(target: int, team_id: int) -> bytes:
     """Teams op 25 -- [u8 0][u64 gamerId][u64 teamId]. Gamer FIRST."""
     w = _rpc(3, 25)
@@ -428,6 +457,29 @@ def run_server_checks(tmp: Path, srv: Server, check: Checks) -> None:
     check(len(sid2) == 8 and live is False, "CONTROL: the host's own delete removes it",
           f"sid={sid2.hex()} live={live}")
 
+    # one lobby per host, and the browser's page
+    err, r = alice.call(req_session_create("alice-first"))
+    sid_a1 = r.blob() if r is not None and r.u32() else b""
+    err, r = alice.call(req_session_create("alice-second"))
+    sid_a2 = r.blob() if r is not None and r.u32() else b""
+    live1, _ = session_live(carol, sid_a1)
+    live2, _ = session_live(carol, sid_a2)
+    check(live1 is False and live2 is True,
+          "a second create from the same host REPLACES its first session",
+          f"first live={live1} second live={live2}")
+    bob.call(req_session_create("bob-lobby"))
+    carol.call(req_session_create("carol-lobby"))
+    got = search_rows(carol, want=2)
+    got_all = search_rows(carol, want=25)
+    got_page = search_rows(carol, want=2, start=2)
+    check(got is not None and got[0] == 2 and got_all[0] == 3 and got_page[0] == 1,
+          "a search returns the page the browser asked for (2 of 3, then the 1 left)",
+          f"want2={got and got[0]} want25={got_all and got_all[0]} start2={got_page and got_page[0]}")
+    check(got_all is not None and got_all[1][:1] == ["carol-lobby"],
+          "...newest lobby first", f"first row's strings: {got_all and got_all[1][:2]}")
+    for c, sid in ((alice, sid_a2),):
+        c.call(req_session_delete(sid))
+
     # ------------------------------------------------------------ clans
     print("\n-- clans: alice owns, bob is a member, carol is outside")
     bob.call(req_clan_invite(CLAN_ID, carol.entity))
@@ -511,10 +563,30 @@ def run_server_checks(tmp: Path, srv: Server, check: Checks) -> None:
     known = [int(m.group(1)) for m in
              (re.search(r"now (\d+) known", ln) for ln in srv.grep(r"console registered"))
              if m]
-    check(known and max(known) <= 257,
-          f"320 forged keepalives leave at most 256 endpoints registered (peak {max(known) if known else '?'})")
+    import authserver
+    cap = authserver.NAT_PEERS_MAX
+    check(known and max(known) <= cap + 1,
+          f"320 forged keepalives register at most NAT_PEERS_MAX={cap} endpoints "
+          f"(peak {max(known) if known else '?'})")
     for s in socks:
         s.close()
+    # the bound that does the real work is the TTL: an endpoint that stops
+    # keepaliving is gone 90 s later. In-process, on the module's own table.
+    now = time.time()
+    authserver.NAT_PEERS.clear()
+    for i in range(500):
+        authserver.NAT_PEERS[("10.7.7.7", 20000 + i)] = now - authserver.NAT_PEER_TTL - 1
+    authserver.NAT_PEERS[("10.7.7.8", 3075)] = now
+    authserver.nat_peers_sweep(now)
+    check(list(authserver.NAT_PEERS) == [("10.7.7.8", 3075)],
+          f"...and the sweep drops every endpoint silent for {authserver.NAT_PEER_TTL:.0f} s "
+          f"and keeps the live one ({len(authserver.NAT_PEERS)} left)")
+    for i in range(cap + 10):
+        authserver.NAT_PEERS[("10.7.7.9", i)] = now
+    authserver.nat_peers_sweep(now)
+    check(len(authserver.NAT_PEERS) == cap,
+          f"...and past the cap the oldest go ({len(authserver.NAT_PEERS)} kept)")
+    authserver.NAT_PEERS.clear()
 
     for c in (alice, bob, carol):
         c.close()

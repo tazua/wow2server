@@ -167,3 +167,32 @@ nat_type_alt_port = 3078
 # places: <repo>/capture when run from a source checkout, ./wow2-data when
 # installed. Set it if you want the data somewhere else, such as /var/lib.
 # data_dir = "/var/lib/wow2-server"
+
+[discord]
+# A live "open lobbies" board in a Discord channel, and a ping when somebody
+# hosts. Both are webhooks -- no bot, no token, nothing that has to stay
+# online -- so any operator can point an instance at their own server:
+# channel settings > Integrations > Webhooks > New Webhook > Copy Webhook URL.
+# Leave both empty and none of this runs.
+#
+# lobby_webhook: ONE message in that channel, posted at startup and edited in
+# place from then on -- every create, join, leave and close the server sees,
+# a burst coalesced into one edit two seconds later, "Server offline" in red
+# on a clean stop. The message id is kept in the store, so a restart edits the
+# same message; a message a moderator deleted is simply re-posted. Discord
+# being unreachable costs one log line a minute and nothing else: the board is
+# a picture of the session table, not a queue of events, so the next change
+# repaints the whole of it.
+#
+# announce_webhook: a new message per lobby opened ("name opened a ranked lobby
+# (1/4)"), struck through when it closes; at most one per host every five
+# minutes. `mention` is put in front of it -- a role, as "<@&ROLE_ID>" (Server
+# Settings > Roles > ... > Copy Role ID with Developer Mode on), or "@here".
+# The same URL may serve both keys if one channel is wanted for both.
+#
+# The URL is a secret: whoever holds it can post to that channel. Delete and
+# re-create the webhook in Discord if it leaks.
+lobby_webhook = ""
+announce_webhook = ""
+mention = ""
+title = "Open lobbies"

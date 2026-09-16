@@ -2,7 +2,7 @@
 #
 # Real hardware needs this. The PSP has no /etc/hosts: the only way to point it
 # at your server is to set a DNS server in its network profile, and that server
-# has to answer the eight `*.demonware.net` names the game looks up. An emulator
+# has to answer the four `*.demonware.net` names the game looks up. An emulator
 # does not -- a line in the host's /etc/hosts is enough -- which is why this can
 # be forgotten right up until the first console appears.
 #
@@ -20,7 +20,7 @@
 # which holds 127.0.0.53:53 on Debian and Ubuntu and will otherwise refuse the
 # bind with EADDRINUSE.
 #
-# It answers those eight names and NXDOMAINs everything else, so it is useless to
+# It answers those four names and NXDOMAINs everything else, so it is useless to
 # anyone as an open resolver -- but it is still a public DNS server, so point it
 # at one address and open UDP 53 deliberately.
 

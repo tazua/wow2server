@@ -15,6 +15,7 @@ import atexit
 import datetime
 import json
 import secrets
+import signal
 import socket
 import struct
 import time
@@ -29,6 +30,7 @@ import potbank
 import store
 
 import natrelay
+import lobbyboard
 import serverconfig
 
 ROOT = Path(__file__).resolve().parent.parent
@@ -813,9 +815,11 @@ def sessions_create_result(dec: dict, peer_ip: str = "", host_key: str = ""):
         settled = potbank.settle_unresolved(old_sid)
         if settled:
             log(f"  POT: {settled}")
+        lobbyboard.BOARD.closed(old_sid)
     sid = _next_session_id[0]
     _next_session_id[0] += 1
     rec["id"] = sid
+    rec["created"] = int(time.time())
     SESSIONS[sid] = rec
     secret = (b"WOW2SESS" + sid.to_bytes(SESSION_ID_BYTES, "little"))[:SESSION_SECRET_BYTES]
     rec["secret"] = secret
@@ -838,6 +842,8 @@ def sessions_create_result(dec: dict, peer_ip: str = "", host_key: str = ""):
         potbank.open_pot(sid, rec["name"])
         log(f"  POT opened for ranked session 0x{sid:x} -- each console will pay "
             f"10% of board {statsdb.RATING_BOARD} when the match starts")
+    lobbyboard.BOARD.opened(rec)
+    lobbyboard.BOARD.refresh(SESSIONS)
     return 1, emit
 
 
@@ -1023,6 +1029,9 @@ def sessions_host_gone(host_key: str) -> None:
         settled = potbank.settle_unresolved(sid)
         if settled:
             log(f"  POT: {settled}")
+        lobbyboard.BOARD.closed(sid)
+    if doomed:
+        lobbyboard.BOARD.refresh(SESSIONS)
 
 
 def sessions_update(dec: dict, peer_ip: str = "", host_key: str = ""):
@@ -1083,6 +1092,7 @@ def sessions_update(dec: dict, peer_ip: str = "", host_key: str = ""):
         log(f"  *** SESSION HOST CHANGED: {was_name!r}@{was_ip} -> "
             f"{rec['name']!r}@{rec['host_ip']} -- this is what a HOST MIGRATION "
             f"would look like from here. Write it down (netrecon Phase 23).")
+    lobbyboard.BOARD.refresh(SESSIONS)
     return 0, None
 
 
@@ -1117,6 +1127,9 @@ def sessions_delete(dec: dict, host_key: str = ""):
     settled = potbank.settle_unresolved(sid)
     if settled:
         log(f"  POT: {settled}")
+    if gone:
+        lobbyboard.BOARD.closed(sid)
+        lobbyboard.BOARD.refresh(SESSIONS)
     return 0, None
 
 
@@ -3938,12 +3951,23 @@ async def main():
     natrelay.set_logger(log)
     await natrelay.RELAY.start(bind)
     await start_nat_type_sockets(loop, bind)
+    lobbyboard.set_logger(log)
+    for problem in lobbyboard.BOARD.configure(serverconfig.DISCORD_LOBBY_WEBHOOK,
+                                              serverconfig.DISCORD_ANNOUNCE_WEBHOOK,
+                                              serverconfig.DISCORD_MENTION,
+                                              serverconfig.DISCORD_TITLE):
+        log(f"!! {problem} -- ignored")
+    lobbyboard.BOARD.start(store.path())
     log(f"WOW2 server up: TCP+UDP {bind}:{port}")
     for line in serverconfig.describe().split("\n"):
         log(line)
     log(f"logging to {SESSION_LOG.name}")
-    async with server:
-        await server.serve_forever()
+    stop = asyncio.Event()
+    for sig in (signal.SIGTERM, signal.SIGINT):
+        loop.add_signal_handler(sig, stop.set)
+    await stop.wait()
+    log("WOW2 server stopping")
+    server.close()      # not wait_closed(): on 3.12+ that waits for every console to hang up
 
 
 def cli() -> None:
@@ -3952,6 +3976,8 @@ def cli() -> None:
         asyncio.run(main())
     except KeyboardInterrupt:
         pass
+    finally:
+        lobbyboard.BOARD.stop(timeout=3.0)
 
 
 if __name__ == "__main__":

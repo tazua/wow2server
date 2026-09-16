@@ -63,6 +63,12 @@ DEFAULTS: dict[str, dict] = {
     "storage": {
         "data_dir": str(_DEFAULT_DATA),
     },
+    "discord": {
+        "lobby_webhook": "",
+        "announce_webhook": "",
+        "mention": "",
+        "title": "Open lobbies",
+    },
 }
 
 
@@ -120,6 +126,9 @@ _ENV = {
                           lambda v: v in ("0", "false", "no", "off")),
     ("nat", "nat_type_alt_port"): ("WOW2_NAT_TYPE_ALT_PORT", int),
     ("nat", "nat_type_alt_address"): ("WOW2_NAT_TYPE_ALT_ADDRESS", str),
+    ("discord", "lobby_webhook"): ("WOW2_DISCORD_LOBBY_WEBHOOK", str),
+    ("discord", "announce_webhook"): ("WOW2_DISCORD_ANNOUNCE_WEBHOOK", str),
+    ("discord", "mention"): ("WOW2_DISCORD_MENTION", str),
 }
 for (_sec, _key), (_env, _cast) in _ENV.items():
     _raw = os.environ.get(_env)
@@ -150,6 +159,10 @@ NAT_TYPE = bool(get("nat", "nat_type"))
 NAT_TYPE_ALT_PORT = int(get("nat", "nat_type_alt_port"))
 NAT_TYPE_ALT_ADDRESS = str(get("nat", "nat_type_alt_address"))
 STARTING_RATING = int(get("stats", "starting_rating"))
+DISCORD_LOBBY_WEBHOOK = str(get("discord", "lobby_webhook") or "")
+DISCORD_ANNOUNCE_WEBHOOK = str(get("discord", "announce_webhook") or "")
+DISCORD_MENTION = str(get("discord", "mention") or "")
+DISCORD_TITLE = str(get("discord", "title") or "Open lobbies")
 
 
 def _nat_type_line() -> str:
@@ -167,6 +180,24 @@ def _nat_line() -> str:
     n = int(get("nat", "relay_ports"))
     return (f"  nat: relay ON, UDP {base}-{base + n - 1} "
             f"-- OPEN THESE IN THE FIREWALL\n")
+
+
+def _discord_line() -> str:
+    if not DISCORD_LOBBY_WEBHOOK and not DISCORD_ANNOUNCE_WEBHOOK:
+        return "  discord: off\n"
+    parts = []
+    if DISCORD_LOBBY_WEBHOOK:
+        parts.append(f"lobby board -> webhook {_webhook_id(DISCORD_LOBBY_WEBHOOK)}")
+    if DISCORD_ANNOUNCE_WEBHOOK:
+        parts.append(f"announcements -> webhook {_webhook_id(DISCORD_ANNOUNCE_WEBHOOK)}"
+                     + (f" (mention {DISCORD_MENTION})" if DISCORD_MENTION else ""))
+    return "  discord: " + ", ".join(parts) + "\n"
+
+
+def _webhook_id(url: str) -> str:
+    """The numeric id out of a webhook URL, never the token beside it."""
+    parts = url.rstrip("/").split("/")
+    return parts[-2] if len(parts) >= 2 and parts[-2].isdigit() else "(malformed URL)"
 
 
 def describe() -> str:
@@ -188,7 +219,8 @@ def describe() -> str:
             f"{STARTING_RATING} (stakes {max(1, STARTING_RATING // 10)})\n"
             + f"  limits: {MAX_MSGS_PER_SEC} msg/s per conn, "
             f"{MAX_CONNS_PER_IP} conns per address, "
-            f"{MAX_STREAM_BYTES // 1024} KB per conn")
+            f"{MAX_STREAM_BYTES // 1024} KB per conn\n"
+            + _discord_line().rstrip("\n"))
 
 
 if __name__ == "__main__":

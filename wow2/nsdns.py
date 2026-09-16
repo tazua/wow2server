@@ -12,7 +12,9 @@ import struct
 import sys
 from pathlib import Path
 
-DEFAULT_NAMES = ("worms-180.auth.mmp3.demonware.net",
+DEFAULT_NAMES = ("worms.stun.us.demonware.net",
+                 "worms.stun.eu.demonware.net",
+                 "worms-180.auth.mmp3.demonware.net",
                  "worms-180.lsg.mmp3.demonware.net")
 
 

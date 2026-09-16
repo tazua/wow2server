@@ -15,7 +15,7 @@ Python 3.11 or newer, nothing else.
 ## Install
 
 A deployment is two processes: the game server, and a DNS responder that
-answers the eight `demonware.net` names the game looks up. A real PSP cannot
+answers the four `demonware.net` names the game looks up. A real PSP cannot
 reach the server without the responder; an emulator on the same machine can
 use `/etc/hosts` instead.
 
@@ -62,7 +62,7 @@ Containerfile.
 On a PSP, set the connection's DNS server to `<SERVER_IP>`: Settings,
 Network Settings, your connection, Address Settings, Custom, DNS Setting,
 Manual. The PSP's own connection test will say there is no internet, because
-the responder answers nothing but the eight names; the game works. Without
+the responder answers nothing but the four names; the game works. Without
 the responder the game says "Unable to connect to WormNet" before it has sent
 the server a single packet.
 
@@ -70,10 +70,18 @@ On an emulator, either do the same in the emulator's network settings, or
 put the names in `/etc/hosts`, all pointing at the server:
 
 ```
-<SERVER_IP> worms-180.auth.mmp3.demonware.net worms-180.lsg.mmp3.demonware.net
-<SERVER_IP> stun.us.demonware.net stun.eu.demonware.net stun.jp.demonware.net stun.au.demonware.net
 <SERVER_IP> worms.stun.us.demonware.net worms.stun.eu.demonware.net
+<SERVER_IP> worms-180.auth.mmp3.demonware.net worms-180.lsg.mmp3.demonware.net
 ```
+
+Those four are the whole list, and all four are needed: the game resolves
+the two `worms.stun` names before anything else and gives up if they fail.
+The generic `stun.<region>.demonware.net` names also present in the binary
+are the SDK's compiled-in defaults, which the game replaces with the
+`worms.stun` pair before it starts networking -- no console has ever asked
+for one, so a DNS operator who already serves another Demonware title on
+those names can leave them where they are. PPSSPP resolves each name once
+per launch, so after changing the list restart it.
 
 Ports: TCP 3074, UDP 3074, UDP 3078, UDP 53 for the responder, and UDP
 40000-40031 if the relay is on.
@@ -87,6 +95,10 @@ makes the server carry the match instead. Accounts are created by the game
 itself the first time a player signs in; `wow2-account` is the operator's
 tool for the credential store, and `wow2-db` (`check`, `backup`, `export`)
 for the SQLite file that holds every store.
+
+**Discord.** With two webhook URLs in the `[discord]` section the server
+keeps a channel showing the open lobbies, edited in place as they come and
+go, and pings a role when somebody hosts. No bot; DOCS.md has the details.
 
 ## Documentation
 

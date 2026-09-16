@@ -1,16 +1,14 @@
 # Names tools/nsdns.py answers for a namespaced console, one per line.
 # Re-read on every query, so editing this needs no restart and no root.
 #
-# This list must mirror the demonware block in the HOST's /etc/hosts, so a
-# namespaced console resolves exactly what console 1 resolves. The game looks
-# up the STUN names FIRST and gives up with "Unable to connect to WormNet."
-# without ever asking for the auth server if they come back NXDOMAIN -- so
-# leaving them out here stalls sign-in before a single packet is sent.
-worms-180.auth.mmp3.demonware.net
-worms-180.lsg.mmp3.demonware.net
-stun.us.demonware.net
-stun.eu.demonware.net
-stun.jp.demonware.net
-stun.au.demonware.net
+# The game looks up exactly these four (netrecon §70): the two WORMS.STUN
+# names first -- and gives up with "Unable to connect to WormNet." without
+# ever asking for the auth server if they come back NXDOMAIN -- then auth,
+# then lsg. The generic stun.{us,eu,jp,au}.demonware.net strings in the binary
+# are the bd SDK's compiled-in defaults, which the game empties and replaces
+# with the WORMS pair before it starts networking; no console has ever queried
+# them, so they are not listed and a query for one is logged as NXDOMAIN.
 worms.stun.us.demonware.net
 worms.stun.eu.demonware.net
+worms-180.auth.mmp3.demonware.net
+worms-180.lsg.mmp3.demonware.net

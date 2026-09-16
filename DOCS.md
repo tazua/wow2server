@@ -255,6 +255,7 @@ older behaviour and must fail.
 .venv/bin/python -m wow2.lsgauth      # the credential path, 22 checks
 .venv/bin/python -m wow2.blocktest    # a block stops all three invites, 7 checks
 .venv/bin/python -m wow2.ownertest    # identity, ownership, UDP and relay bounds, 32 checks
+.venv/bin/python -m wow2.loadtest --consoles 32 --lifetime 200   # capacity, see below
 ```
 
 ## Limits and what has been tested
@@ -284,9 +285,18 @@ security review, and the sensible assumption is that a second careful
 reader finds one or two more of the same kind, none reachable from a retail
 console.
 
-Scale is tens of players, not hundreds. It is one asyncio process and the
-stores are JSON re-read per request. That is what keeps them editable while
-the server runs, and it is not a backend for a large population.
+Scale was measured with synthetic consoles (`python -m wow2.loadtest`), on a
+workstation; a small VPS is slower by its CPU. Players online at once is not
+the limit: 128 consoles signing in at the same instant all finish within
+3.4 s and the process sustains about 850 RPCs a second, against a sign-in of
+some 20 RPCs, a match start of 5 and a signed-in console that is otherwise
+nearly silent. The limit is the number of accounts the server has ever seen,
+because every store is a JSON file re-read per request: at 200 lifetime
+accounts a sign-in under load is a quarter of a second, at 2,000 it is two
+seconds, at 10,000 sign-ins time out. Watch `wow2-account list | wc -l`; a
+deployment approaching a thousand accounts wants the parsed-store cache
+described in the tool's own notes. One asyncio process, JSON on disk: that
+is what keeps the stores editable while the server runs.
 
 This repository holds the server alone. The rig that produced it, which
 drives the emulator over its debugger protocol and reads the game's screen,

@@ -178,7 +178,10 @@ if [ "$SYSTEM" = 1 ]; then
         install -m 644 "$HERE/packaging/wow2-nsdns@.service" /etc/systemd/system/
         if [ -d /run/systemd/system ]; then
             systemctl daemon-reload
-            systemctl enable --now wow2-server
+            # restart, not `enable --now`: a re-run after a `git pull` is an
+            # upgrade, and the unit that is already running is the OLD code.
+            systemctl enable wow2-server
+            systemctl restart wow2-server
             sleep 1
             if systemctl is-active --quiet wow2-server; then
                 note "wow2-server is running"
@@ -187,7 +190,8 @@ if [ "$SYSTEM" = 1 ]; then
                 die "wow2-server did not start; the log is above"
             fi
             if [ -n "$DNS_ADDR" ]; then
-                systemctl enable --now "wow2-nsdns@$DNS_ADDR"
+                systemctl enable "wow2-nsdns@$DNS_ADDR"
+                systemctl restart "wow2-nsdns@$DNS_ADDR"
                 sleep 1
                 if systemctl is-active --quiet "wow2-nsdns@$DNS_ADDR"; then
                     note "wow2-nsdns@$DNS_ADDR is running (UDP 53 on $DNS_ADDR)"

@@ -51,8 +51,11 @@ sudo .venv/bin/wow2-nsdns --bind <SERVER_IP> --answer <SERVER_IP>
 ```
 
 Nothing is opened in the firewall in this mode. Both forms can be re-run
-after a `git pull`; an existing config file is kept. `packaging/` has the
-units and a Containerfile.
+after a `git pull` to upgrade: an existing config file and data directory
+are kept, the service form restarts the units, and a data directory from a
+version before 0.3 has its JSON stores imported into `wow2.sqlite3` at that
+first start (one log line per file). `packaging/` has the units and a
+Containerfile.
 
 ## Point the game at it
 

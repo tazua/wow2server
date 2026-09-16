@@ -1,0 +1,291 @@
+# wow2-server documentation
+
+What the game speaks, what the server does with it, and how to run it.
+[RPCS.md](RPCS.md) is the per-opcode reference for the lobby; this file is
+everything around it.
+
+Contents: [Protocol](#protocol) · [Configuration](#configuration) ·
+[Accounts](#accounts) · [What the server stores](#what-the-server-stores) ·
+[NAT and the relay](#nat-and-the-relay) · [Checks](#checks) ·
+[Limits and what has been tested](#limits-and-what-has-been-tested)
+
+## Protocol
+
+The game uses four channels. Three are the server's job; the fourth is peer
+to peer unless the relay is on.
+
+| channel | carries | server |
+|---|---|---|
+| TCP 3074, auth | create account, login, change password | answers |
+| TCP 3074, LSG | the lobby: sessions, stats, friends, clans, storage, profiles, messaging, pushes | answers every RPC the client can make |
+| UDP 3074, bdDiscovery | address discovery, the NAT type probe, the bdNAT introduction | answers and relays |
+| UDP 3075, peer | the match itself | not involved, or carries it through the relay |
+
+### Framing and encryption
+
+Every TCP message is `[u32 LE length][body]`. A zero length is a keepalive
+ping, answered with a zero length. A length of 180 is not a length: it is
+the buffer-size announcement `[u32 180][u32 free]` the lobby client sends
+first, which is how the server knows a connection is the LSG and not the
+auth port.
+
+The body starts with a flag byte. `0` means the rest is a plain bd bit
+stream: a service byte, then typed fields, each carrying a 5-bit type tag
+before its bits (`wow2/bdproto.py` is the codec). `1` means encrypted:
+`[u8 1][u32 seed]` then 3DES-CBC ciphertext under a 24-byte key with the IV
+`Tiger192(seed as LE u32)[:8]`. Server replies open with the signature
+`0xDEADBEEF` in the plaintext, which is the client's check that the key was
+right; a reply that fails it closes the connection.
+
+Tiger192 is the hash under everything: the account id, the IVs, the keys.
+It is implemented in `wow2/tiger.py`.
+
+### The auth port
+
+| type | message | reply |
+|---:|---|---|
+| `0x00` | create account: `[seed][title id][64 zero bits][96 bytes ciphertext]` under a constant key the client ships; plaintext is `[magic][username, 64 bytes][Tiger192(password), 24 bytes]` | `0x01` with a code |
+| `0x0a` | login: `[seed][title id][64-bit handle]`, the handle being `Tiger192(username)[:8]` | `0x0b`: `[seed]`, a 128-byte ticket encrypted under `Tiger192(password)`, and a 128-byte proof in clear |
+| `0x02` | change password: `[seed][title id][64-bit handle]` and 32 bytes encrypted under the current `Tiger192(password)`, holding the new digest | `0x03` with a code; the server verifies the current password by decrypting and finding the magic |
+
+The codes are the client's own: 700 no error, 707 name exists, 704 bad
+account, 716 incorrect password; the full list is in `wow2/authserver.py`.
+
+Authentication runs the other way from what you might expect. The login
+request carries no password proof. It names the account, and the server
+proves it holds the credential by encrypting the ticket with it. The ticket
+holds the 24-byte session key; the clear proof beside it holds an opaque
+handle. The lobby connection presents the proof and is bound provisionally;
+the first RPC that decrypts under the ticket's key completes the binding. So
+a connection that has only seen the reply, and not opened the ticket, is
+served nothing. A refused login is answered with a key the sender cannot
+have, and it is indistinguishable on the wire from a wrong password.
+
+### The lobby
+
+The LSG connection presents the proof in its first message (service 7). After
+that every message is an encrypted RPC: `[u32 0][u8 service][tc bit][u8 op]`
+and the request's typed fields. The server answers each one with a TaskReply,
+type 1: `[u64 transaction][u32 error][u8 op]`, then for most ops
+`[u32 count]` and the result rows. The client blocks on every RPC with no
+timeout, so an unanswered request parks the game at "Signing in..." for ever.
+
+Type 2 is a push: a message the server sends unprompted (a buddy invite
+arriving, a clan event, "signed in elsewhere"). Type 4 carries the connection
+id at connect.
+
+There are seven services and 45 opcodes the client can fire. Each one is in
+[RPCS.md](RPCS.md) with its request layout as measured off the wire, its
+reply shape, the screen that fires it and notes on the handling. Two facts
+the table depends on:
+
+- A reply row's shape decides everything. A malformed row drops the
+  connection; a well-formed row with a wrong value is applied silently, and
+  a reply that omits a count the client reads, or adds one it does not, puts
+  every field one place late.
+- Identity is the account, never the address. The 64-bit account id in
+  every friends, clan, stats and storage row is `Tiger192(name)[:8]`; the
+  server derives it from the bound connection's name and takes it from no
+  request field.
+
+The server enforces what the client does not: a session can be updated or
+deleted only by the connection that created it; clan invites, cancels,
+removals, promotions and transfers need the rank the game shows them for; an
+invite to someone who has blocked the sender is dropped; an account signing
+in a second time signs the first console out; a duplicate account name is
+refused rather than overwritten.
+
+### UDP
+
+`bdDiscovery` on UDP 3074 answers three things, all small:
+
+| request | reply | purpose |
+|---|---|---|
+| `1e 02 00` | `1f 02 00` + 6-byte address | tells the console its public address (with the relay on: its mailbox) |
+| `14 02 00` + flags | `15 02 00` + two addresses, from the main port or the alternate one | the three-test NAT type probe |
+| 29-byte bdNAT packet, type `0x0a` | the same 29 bytes, type `0x0b`, sent to the console it names | the introduction: "tell that host I want to talk to it" |
+
+Keepalives (type `0x0e`) arrive every 15 s and are how the server learns
+where each console's socket really is. Nothing inside a bdNAT packet is ever
+rewritten: a 10-byte HMAC covers it under a key only the originator holds,
+so the server changes the transport, never the bytes.
+
+## Configuration
+
+`wow2-server.toml`, found at `$WOW2_CONFIG`, `./wow2-server.toml`, the
+checkout's own, or `/etc/wow2-server.toml`, in that order. The environment
+wins over the file (`WOW2_PORT`, `WOW2_DATA_DIR`, ...). Every key in the
+example file is its default; no file at all gives the same values. The
+server prints what is in force at startup.
+
+| key | default | what |
+|---|---|---|
+| `server.bind`, `server.port` | `0.0.0.0`, `3074` | auth TCP, LSG TCP and discovery UDP all use the one port |
+| `accounts.shared_password_fallback` | `false` | let an account with no stored credential sign in on one shared password. A migration stopgap; see Accounts |
+| `accounts.create_mode` | `refuse_duplicates` | answer 707 to a create for a name that already has a credential |
+| `logging.level` | `info` | `debug` logs every message body |
+| `logging.hexdumps` | `false` | dump every packet to the session log; hundreds of MB per session |
+| `limits.*` | 100 msg/s, 16 connections per address, 4 MB per connection | per-connection caps |
+| `nat.relay` | `false` | carry matches through the server; see below |
+| `nat.relay_port_base`, `nat.relay_ports` | `40000`, `32` | one UDP port per console, so 32 is 16 two-player matches |
+| `nat.relay_idle_timeout` | `600` | seconds before an idle mailbox is reclaimed |
+| `nat.public_address` | unset | what to tell consoles the server's address is; set it behind a NAT or on a multi-homed host |
+| `nat.nat_type`, `nat.nat_type_alt_port` | `true`, `3078` | answer the NAT type probe; test 3's reply leaves from the alternate port |
+| `nat.nat_type_alt_address` | unset | a second public address, if there really is one |
+| `stats.starting_rating` | `400` | what a player with no ranked row is served, so their first stake is 40 |
+| `storage.data_dir` | `wow2-data/` beside the checkout, `/var/lib/wow2-server` as a service | where everything below lives |
+
+The `WOW2_*` environment variables beyond those are not configuration. Each
+switches one behaviour back to an older one so a protocol failure can be
+bisected; they are documented in the source and nothing should be deployed
+with one set.
+
+## Accounts
+
+The game creates the account itself. The first time a profile signs in, the
+console sends a create-account message with the profile's name and
+`Tiger192(password)`, and that digest is what the server stores; it is also
+the key the login reply is encrypted with, so the store holds no passwords
+and reading it teaches nothing. Changing the password from the game's
+User profile edit screen rewrites the digest.
+
+The online name is the local player profile's name, and nothing is typed for
+it. Two players who both call a profile `lukas1` are asking for one account;
+the second create is refused with 707, the game retries it as a sign-in
+under the second player's password, that fails, and the console shows
+"Online profile name lukas1 is already in use". The first player is
+untouched.
+
+After the create, a console never sends its name again: every later message
+carries the one-way handle. So a server that lost its store, or never saw
+the create, cannot recover the name on its own; the player sees "The online
+profile name or password is incorrect" and the log says `login handle <hex>
+is not an account we know` or `has no stored credential`. Only the operator
+can fix it:
+
+```bash
+wow2-account list              # every account, and whether it has a credential
+wow2-account handle <name>     # the handle a name produces, to match against the log
+wow2-account set <name>        # prompts for the password, stores the digest
+wow2-account remove <name>     # forget a credential
+```
+
+`shared_password_fallback = true` is the stopgap for exactly that migration:
+every account without a credential may sign in on one shared password
+(`WOW2_PASSWORD`, default `123456`, which is in this repository). With it on,
+anyone who knows a name is in. Leave it off.
+
+Back up `accounts.json` before deleting anything. It is the only copy of
+every credential.
+
+## What the server stores
+
+Everything is in the data directory, as JSON re-read per request, so a file
+can be edited while the server runs and the change shows on the next screen.
+
+| file | holds |
+|---|---|
+| `accounts.json` | name, credential digest, handle, user id |
+| `stats-db.json`, `stats-uploads.jsonl` | leaderboards as `board:entity` rows of `[score, rank, name]`, and every upload as received |
+| `pot.json` | ranked wagers: open pots, stakes, payouts |
+| `teams-db.json` | clans, members, ranks, outstanding invites |
+| `friends-db.json` | buddies, invites, blocks, the mailbox, and every name seen |
+| `profile-db.json` | player profiles, keyed by account id |
+| `storage-db.json`, `storage/` | uploaded files (flags, shared schemes and landscapes, leaderboard snapshots) and their bytes |
+| `request-census.json` | diagnostic: every typed field the client has sent, per RPC, and whether a handler read it |
+| `session-*.log` | one log per server run |
+
+Three things about the stores that are not obvious:
+
+- Rank is computed on read from the score order; the rank written in a row
+  is for readability and ignored. Board 5 is the ranked rating, boards 2 and
+  3 weekly and monthly, board 1 games started, 9 to 24 the daily awards.
+  Board 1 rows carry a fourth element the client round-trips (its
+  completion history); deleting it rewrites a player's percentage.
+- A storage row's owner is a 16-hex-digit account id. If you edit the file,
+  keep it hex; a decimal id makes the file invisible to the screen meant to
+  show it. Two rows must never share an id.
+- A console asks to *create* its profile at every sign-in. The server
+  answers "already exists" once it holds one, which makes the console
+  download the server's copy instead of uploading over it, so a profile
+  edited on the server survives, except longitude, latitude and six bits of
+  two fields the console always supplies itself.
+
+Writes are atomic (a temp file renamed over the target). A store that exists
+and does not parse is kept aside as `<name>.corrupt-<timestamp>` and every
+later write to it is refused for the life of the process, so a bad file
+costs an empty screen and a loud log line, never the data.
+
+## NAT and the relay
+
+Consoles on two different domestic connections find each other through the
+introduction on UDP 3074 and then talk directly. Behind carrier-grade NAT,
+which is most mobile data, the introduction relays correctly and the punch
+still fails: each console's mapping was created by talking to the server,
+and the other console's packet arrives from somewhere else.
+
+```toml
+[nat]
+relay = true
+```
+
+With the relay on, every console is handed a UDP socket on the server and
+told that socket is its own public address. Both consoles then only ever
+exchange packets with the server, which works behind any NAT, including
+symmetric. It costs about 7 datagrams per second each way per pair, roughly
+50 KB/s for four players. It is all-or-nothing per deployment, because the
+address a console publishes is decided at sign-in, before anyone knows
+whether a punch would have worked. The relay ports must be open in the
+firewall, and nothing warns you if they are not: sign-in, hosting and the
+browser all work and only the join fails.
+
+The NAT type probe needs no firewall rule of its own. All three tests arrive
+at the main port; the alternate port is only an address to answer from.
+
+## Checks
+
+Three suites ship with the server. Each starts its own server on a spare
+port with a scratch data directory, so they can run on an installed copy
+without touching its data, and each has a `--revert` that runs against the
+older behaviour and must fail.
+
+```bash
+.venv/bin/python -m wow2.lsgauth      # the credential path, 22 checks
+.venv/bin/python -m wow2.blocktest    # a block stops all three invites, 7 checks
+.venv/bin/python -m wow2.ownertest    # identity, ownership, UDP and relay bounds, 32 checks
+```
+
+## Limits and what has been tested
+
+Everything in the game's Infrastructure mode has been played, not inferred:
+two consoles sign in as separate players, host, browse, join, play a full
+match through the results and awards screens and into the next one, and the
+leaderboards, daily awards, ranked wager and payout, clans, buddies, match
+invites, storage, host migration and the relay have each been driven end to
+end. A five-console lobby was measured refusing its fifth joiner (the host
+does that, over the peer channel). The development rig was eight PPSSPP
+instances; retail hardware is one PSP on 6.61 ARK-4 for one evening,
+which signed in, browsed, hosted and created ranked lobbies against a server
+on a VPS.
+
+Every one of the client's 45 lobby RPCs is answered, and the reply layouts
+were bisected on the wire against the real client. The parsers have taken
+24 million mutated messages without a crash. Two things cannot be produced by
+playing and are recorded as such: a drawn match (the game deals a drawn
+round again) and the client's UPnP path (needs a real router).
+
+The credential and authorization paths have been checked from the side a
+console cannot take, and one outside code review (2026-09-16) has been worked
+through; its six real findings, all in the class of a handler trusting a
+request field, are fixed and each has a check. It has not had a full
+security review, and the sensible assumption is that a second careful
+reader finds one or two more of the same kind, none reachable from a retail
+console.
+
+Scale is tens of players, not hundreds. It is one asyncio process and the
+stores are JSON re-read per request. That is what keeps them editable while
+the server runs, and it is not a backend for a large population.
+
+This repository holds the server alone. The rig that produced it, which
+drives the emulator over its debugger protocol and reads the game's screen,
+and the reverse-engineering notes are kept separately.

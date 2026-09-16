@@ -1,0 +1,59 @@
+# systemd unit for the WOW2 revival server.
+#
+#   sudo ./setup.sh --system          # does everything below, and installs
+#                                     # the server under /opt/wow2-server
+#
+#   sudo useradd --system --home /var/lib/wow2-server --create-home wow2
+#   sudo cp wow2-server.example.toml /etc/wow2-server.toml    # and EDIT it
+#   sudo cp packaging/wow2-server.service /etc/systemd/system/
+#   sudo systemctl enable --now wow2-server
+#
+# ExecStart names /opt/wow2-server/bin/wow2-server, the venv setup.sh makes.
+# A `pip install .` into the system Python puts it at /usr/local/bin instead;
+# edit the line.
+#
+# The game talks to ONE port for everything -- auth TCP, the LSG TCP connection
+# and bdDiscovery UDP -- and it is 3074. Above 1024, so this does not run as root.
+#
+# The config file is optional. With none the server runs on its built-in
+# defaults, which are a deployment's: the shared-password fallback off, hexdumps
+# off, one log line per RPC. Copy the example and edit it when you need the
+# relay, a public address or a different port. `setup.sh --system` does all of
+# the above in one go.
+
+[Unit]
+Description=WOW2 revival server (Demonware auth/lobby for Worms Open Warfare 2)
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=wow2
+Group=wow2
+WorkingDirectory=/var/lib/wow2-server
+Environment=WOW2_CONFIG=/etc/wow2-server.toml
+ExecStart=/opt/wow2-server/bin/wow2-server
+Restart=on-failure
+RestartSec=5
+
+# The server writes JSON databases and uploaded blobs under storage.data_dir, and
+# nothing else. Everything below is what it does not need.
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=strict
+ProtectHome=true
+ReadWritePaths=/var/lib/wow2-server
+ProtectKernelTunables=true
+ProtectKernelModules=true
+ProtectControlGroups=true
+RestrictAddressFamilies=AF_INET AF_INET6 AF_UNIX
+RestrictNamespaces=true
+LockPersonality=true
+
+# NOTE: no MemoryDenyWriteExecute -- CPython's own allocator trips it on some
+# builds, and a unit that refuses to start is worse than one hardening flag short.
+SystemCallFilter=@system-service
+SystemCallErrorNumber=EPERM
+
+[Install]
+WantedBy=multi-user.target

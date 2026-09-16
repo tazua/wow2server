@@ -1,0 +1,166 @@
+# WOW2 server -- deployment configuration.
+#
+# Copy to `wow2-server.toml` (next to this file, or anywhere and point
+# WOW2_CONFIG at it) and edit. Every value below is the built-in default, so an
+# empty file and no file at all behave identically.
+#
+#   WOW2_CONFIG=/etc/wow2-server.toml wow2-server
+#
+# Precedence: environment > this file > built-in defaults. The environment wins
+# so that existing WOW2_* invocations keep working unchanged.
+#
+# ONLY DEPLOYMENT SETTINGS LIVE HERE. The ~40 other WOW2_* switches
+# (WOW2_NO_PUSH, WOW2_LSG_HOLD, WOW2_FRIEND_ROWS, ...) are research tools for
+# bisecting a protocol failure -- they are deliberately NOT config, because a
+# config file invites someone to deploy with one of them set.
+#
+# TOML has no bare words: every string needs quotes. `level = info` is a parse
+# error and the server refuses to start rather than quietly using defaults you
+# did not choose.
+
+[server]
+# The game resolves *.demonware.net to this machine and talks to ONE port: auth
+# TCP, the LSG TCP connection and bdDiscovery UDP all live on it.
+bind = "0.0.0.0"
+port = 3074
+
+[accounts]
+# When an account has no stored credential, accept the shared password.
+#
+# FALSE is the default and what a deployment wants: only an account that
+# actually created itself (auth 0x00, which stores Tiger192(password)) can sign
+# in. A known name with no credential, an unknown handle and a login too short
+# to decode are all answered with a key the sender cannot hold, so the console
+# draws "The online profile name or password is incorrect" and never connects.
+#
+# TRUE lets an account with NO stored credential sign in on one shared password
+# (`WOW2_PASSWORD`, default 123456 -- and that default is in the public
+# source). It exists for a development rig whose accounts predate the store,
+# and for one migration case: a console that already believes it has an
+# account only ever sends a sign-in, never a create, so a server that lost its
+# store cannot learn that account's credential from the console. The fix is
+# `wow2-account set <name>`; turning this on is the stopgap while you do that.
+shared_password_fallback = false
+
+# How to answer a create-account request.
+#
+#   "refuse_duplicates"  (default, and what you want) 707 if that name already
+#                        has a credential, 700 otherwise. The client does not
+#                        show 707 as an error -- it silently re-issues as a
+#                        sign-in -- so the returning owner walks straight in and
+#                        only a real collision fails, with the game's own
+#                        "Online profile name %ACCOUNT% is already in use".
+#   "success"            700 to everyone, and the request overwrites whatever
+#                        credential that name had. THAT IS AN ACCOUNT TAKEOVER:
+#                        the online account name is the local player profile's
+#                        name, nothing is typed for it, and two players who pick
+#                        the same one are one account. Bisect switch only.
+#   "name_exists"        707 to everyone, so nobody can ever register.
+create_mode = "refuse_duplicates"
+
+[logging]
+# A full hexdump of every message. This is how the protocol was reversed and it
+# is the single biggest reason a session log grows without bound. Off unless
+# you are reading the wire.
+hexdumps = false
+
+# "info" keeps one line per RPC. "debug" logs every read, every message body
+# and every reply -- ten times the volume, and what a bug report wants.
+level = "info"
+
+[nat]
+# Carry the peer session through the server instead of relying on a NAT punch.
+#
+# FALSE is right on a LAN and on any network where hole punching works: the
+# direct path is free and always faster. Measured (Phase 35), the introduction
+# broker relays correctly in both directions and CARRIER-GRADE NAT DEFEATS IT
+# ANYWAY, because each console's mapping was created by talking to the SERVER
+# while the punch arrives from the OTHER CONSOLE.
+#
+# TRUE gives every console a UDP socket here and tells it that socket is its own
+# public address, so both consoles only ever exchange packets with us. That works
+# for every NAT type including symmetric, because every packet a console receives
+# comes from an address it has itself sent to. A full match has been played
+# through it (Phase 36).
+#
+# IT IS ALL-OR-NOTHING per deployment, not per session: the address a console
+# publishes is decided when it signs in, before anyone knows whether a punch
+# would have worked.
+relay = false
+
+# One port per console, so 32 is 16 simultaneous two-player matches.
+#
+# ***OPEN THESE IN THE FIREWALL.*** They are as necessary as the main port and
+# nothing warns you: sign-in, hosting and the browser all work without them and
+# only the join fails. The server logs the range at startup.
+relay_port_base = 40000
+relay_ports = 32
+
+# Seconds a mailbox may sit idle before it can be handed to someone else. Only
+# consulted when the pool is full.
+relay_idle_timeout = 600
+
+# What to tell a console the server's address is. Empty means "ask the routing
+# table", which is right on the rig and on a VPS with one address. Set it when
+# the server is behind its own NAT, or has several addresses and the kernel
+# would pick the wrong one -- a console handed an address it cannot dial fails
+# at the join with nothing in the log to say why.
+# public_address = "203.0.113.10"
+
+# ---- NAT TYPE DISCOVERY ------------------------------------------------
+# The game fires a three-test STUN probe at the `stun.*` names before it does
+# anything else, and until Phase 37 this server ignored all of it -- so every
+# console spent three seconds timing out at sign-in and learned nothing.
+#
+# Answering it costs one extra UDP port. Test 3's reply must leave a DIFFERENT
+# PORT than the one the request arrived on, because the client accepts that
+# reply from any source: answer it from the main port and it always arrives, so
+# every console reports MODERATE whatever its NAT actually is.
+nat_type = true
+nat_type_alt_port = 3078
+
+# A SECOND PUBLIC ADDRESS, if this deployment has one. Test 2 asks for a reply
+# from a different IP; a console that receives one is behind a full-cone NAT and
+# reports BD_NAT_OPEN.
+#
+# LEAVE IT EMPTY unless the address really is a different one. Answering test 2
+# from the address the console already talks to passes the client's check and
+# reports OPEN for a NAT that is only address-restricted -- and OPEN is the one
+# wrong answer that costs something, because it means "the direct path will
+# work". The server checks and refuses rather than over-report.
+# nat_type_alt_address = "203.0.113.11"
+
+[stats]
+# WHAT A PLAYER WITH NO RANKED ROW IS WORTH -- their opening rating on board 5.
+# Nothing in the game decides this: the client reads its own rating from the
+# server and the only constant it carries is a floor of 10, so this is a policy
+# value and always was.
+#
+# It matters more than it looks. The lobby shows each player `rating // 10` as
+# their stake and the client uploads `rating - rating // 10` when the match
+# starts, and those two only agree from 11 upwards:
+#
+#     start   lobby shows   actually paid   losses to reach the floor
+#       0          1           **-10**      already there
+#      10          1              0         already there
+#     400         40             40         40
+#
+# At 400 a first ranked match between two new players is 40 a side for a pot of
+# 80 (winner 440, loser 360), and the floor is a safety net rather than the
+# opening position. Below 11 the wager does not exist: both players are shown a
+# stake of 1, pay nothing, and their board RISES -- which the server reads as a
+# payout and banks the pot early.
+#
+# The row is SERVED, not written: a player joins the leaderboard when they first
+# stake, not when they first sign in.
+# starting_rating = 400
+
+[storage]
+# Where the JSON stores (stats, profiles, friends, teams, accounts) and uploaded
+# blobs live. The server re-reads the JSON stores per request on purpose: you can
+# edit a leaderboard with the server running and see it on the next screen.
+#
+# Left commented out because the default already does the right thing in both
+# places: <repo>/capture when run from a source checkout, ./wow2-data when
+# installed. Set it if you want the data somewhere else, such as /var/lib.
+# data_dir = "/var/lib/wow2-server"

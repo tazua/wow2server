@@ -1,0 +1,37 @@
+# Container image for the WOW2 revival server.
+#
+#   podman build -t wow2-server -f packaging/Containerfile .
+#   podman run --rm \
+#       -p 3074:3074/tcp -p 3074:3074/udp -p 3078:3078/udp \
+#       -v ./wow2-data:/data:Z \
+#       -v ./wow2-server.toml:/etc/wow2-server.toml:ro \
+#       wow2-server
+#
+# PUBLISH BOTH PROTOCOLS ON 3074. The game uses TCP for auth and the lobby and
+# UDP for bdDiscovery and the NAT introduction, on the same port number.
+# Publishing only TCP gives you a sign-in that works and a game browser that
+# never finds anything -- which reads like a matchmaking bug and is not one.
+# UDP 3078 is where the NAT type probe's third reply leaves from; without it
+# every console reports STRICT. Add -p 40000-40031:40000-40031/udp if you turn
+# the relay on. The config file is optional: with none, the defaults are a
+# deployment's (shared-password fallback off, hexdumps off, one line per RPC).
+
+FROM python:3.12-slim
+
+# No system packages: Tiger192, the hash the whole auth path is built on, is
+# pure Python since Phase 64 (wow2/tiger.py), so `pip install` is the install.
+WORKDIR /src
+COPY pyproject.toml README.md ./
+COPY wow2/ ./wow2/
+RUN pip install --no-cache-dir .
+
+RUN useradd --system --home /data --create-home wow2
+USER wow2
+WORKDIR /data
+
+ENV WOW2_CONFIG=/etc/wow2-server.toml \
+    WOW2_DATA_DIR=/data \
+    PYTHONUNBUFFERED=1
+
+EXPOSE 3074/tcp 3074/udp
+ENTRYPOINT ["wow2-server"]

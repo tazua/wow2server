@@ -13,6 +13,9 @@ import struct
 
 _MASK = (1 << 64) - 1
 
+# The four Tiger S-boxes (t1..t4, 256 u64 each) as published with the reference
+# implementation, base85 instead of 1024 literals; sha256 of the 8192 raw bytes
+# 364d73427379144b709fb0565ba1536c2c32ef9b02ab6201b1aefc30857372ea. Not a key.
 _SBOX_B85 = """
 UJU8?e6gwm?5IQH14}}z)BM#9<6F&gI)C~0lbZo;laU|N|9F|r;wgY|$)R&~!-Fc4Ycgc9a9EK9?
 mmb{=IjG;1>>yhTvMY6xM@Mfe8k?3kyPhQ4D=1$-}Isi`o2x47;m=_YOB#&Beu-O|KcxKAz^Y89+

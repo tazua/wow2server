@@ -155,6 +155,8 @@ under that account's own `Tiger192(password)`, the lobby key is random per
 sign-in, and the constant the create-account message is encrypted with
 (`BD_BOOTSTRAP_KEY`) is the game's, read out of its binary: every copy of the
 game holds it, so it is not a secret and cannot be changed on the server.
+The 8 KB constant in `wow2/tiger.py` is the Tiger hash's four published
+S-boxes, the same table every Tiger implementation carries.
 
 ## Accounts
 

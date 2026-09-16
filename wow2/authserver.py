@@ -4229,12 +4229,19 @@ def teams_answer_invite(accept: bool, dec: dict, who=None, peer_ip: str = ""):
     if accept and mine not in rec.setdefault("members", []):
         rec["members"].append(mine)
     team_put(key, rec)
+    # The client deletes the mailbox row it OPENED (Messaging op 4 follows).
+    # An invite cancelled and re-sent while the invitee was online leaves it
+    # holding two rows for one clan, and the one it did not open stayed filed
+    # -- a phantom invite at the next sign-in that C14 then refuses. An
+    # answered invite has no mailbox row left to keep (§66, seen on the rig).
+    pulled = clan_invite_mail_drop(tid, clan_invite_push_type(), [mine])
     log(f"  teams op{8 if accept else 7} ({verb} CLAN INVITE): {name} "
         f"0x{mine} {'joins' if accept else 'declines'} {rec.get('name')!r} "
         f"0x{key} (invited by 0x{inviter:016x}"
         + ("" if had else ", but no proposal was on file")
         + f") -- {len(rec['members'])} member(s), "
-        f"{len(rec['proposals'])} proposal(s) left")
+        f"{len(rec['proposals'])} proposal(s) left"
+        + (f", {pulled} mailbox row(s) withdrawn" if pulled else ""))
     # TELL THE INVITER. Without this their roster is stale until they sign in
     # again: `Teams op 21` fires at sign-in and nothing else re-reads it, so the
     # console that sent the invite goes on showing a clan of one. Types 14 and

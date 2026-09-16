@@ -134,11 +134,27 @@ server prints what is in force at startup.
 | `nat.nat_type_alt_address` | unset | a second public address, if there really is one |
 | `stats.starting_rating` | `400` | what a player with no ranked row is served, so their first stake is 40 |
 | `storage.data_dir` | `wow2-data/` beside the checkout, `/var/lib/wow2-server` as a service | where everything below lives |
+| `discord.lobby_webhook` | unset | a Discord webhook URL; the channel gets one message that always shows the open lobbies. See Discord |
+| `discord.announce_webhook`, `discord.mention` | unset | a webhook URL that gets a message when a lobby opens, and what to put in front of it (`<@&ROLE_ID>` or `@here`) |
+| `discord.title` | `Open lobbies` | the board's heading |
 
 The `WOW2_*` environment variables beyond those are not configuration. Each
 switches one behaviour back to an older one so a protocol failure can be
-bisected; they are documented in the source and nothing should be deployed
-with one set.
+bisected, and nothing should be deployed with one set. The ones a reader of
+the source will trip over, because a constant sits behind each:
+
+| switch | what it puts back |
+|---|---|
+| `WOW2_FIXED_SESSION_KEY=1` | one constant lobby session key for every sign-in, `rigconfig.SESSION_KEY` (`0x42` x 24). Off, every sign-in gets 24 random bytes from `secrets`, the constant is never issued, and a connection presenting it is refused like any key the server did not issue. |
+| `WOW2_SHARED_PASSWORD_FALLBACK=1` | `accounts.shared_password_fallback` from the environment: an account with no stored credential signs in on `rigconfig.ACCOUNT_PASSWORD` (`123456`, in this repository). Off by default; see Accounts. |
+| `WOW2_CREATE_MODE=success` | the takeover: 700 to every create-account, and the request replaces whatever credential that name had. |
+| `WOW2_LSG_NO_KEY_CHECK=1`, `WOW2_NO_PROOF_HANDLE=1`, `WOW2_NO_EVICT=1` | the lobby credential checks described under Authentication, one at a time; they exist for the suites' negative controls (`lsgauth --revert`). |
+
+There is no server-side master key. The ticket in a login reply is encrypted
+under that account's own `Tiger192(password)`, the lobby key is random per
+sign-in, and the constant the create-account message is encrypted with
+(`BD_BOOTSTRAP_KEY`) is the game's, read out of its binary: every copy of the
+game holds it, so it is not a secret and cannot be changed on the server.
 
 ## Accounts
 
@@ -261,19 +277,52 @@ browser all work and only the join fails.
 The NAT type probe needs no firewall rule of its own. All three tests arrive
 at the main port; the alternate port is only an address to answer from.
 
+## Discord
+
+The server can keep a community Discord informed through webhooks — no bot
+and nothing that has to stay online. A webhook is made in the channel's
+settings (*Integrations → Webhooks → New Webhook → Copy Webhook URL*) and
+pasted into the `[discord]` section of `wow2-server.toml`; leaving the
+section empty turns the feature off.
+
+With `lobby_webhook` set the server posts one message to that channel at
+startup and edits it from then on: one line per live session — host, `N/M`
+players, ranked or friendly, when it opened — with full lobbies last, or
+*No open lobbies*; *Server offline* in red on a clean stop. Every create,
+update, delete and expiry the server sees repaints it, a burst coalesced
+into one edit two seconds later, so a lobby filling up is one edit and not
+four. The message id is kept in the store, so a restart edits the same
+message; a message somebody deleted is re-posted. With `announce_webhook`
+set, each lobby opened is a fresh message (`@role 🎮 **name** opened a
+ranked lobby (1/4)`), struck through when the lobby closes, at most one per
+host every five minutes; `mention` is what goes in front, typically a role
+people give themselves to be pinged.
+
+Discord being down costs nothing: the posting runs on its own thread, a
+request that fails is logged once a minute and the next session change
+repaints the whole board, a rate limit is waited out, and a webhook that
+answers 401 or 403 (deleted, or a wrong URL) turns the feature off for the
+run with one line in the log. A webhook URL is a secret — whoever holds it
+can post to the channel — so keep the config file to the operator.
+
+`lobbyboardtest.py` is the feature's own suite: 34 checks against a fake
+webhook endpoint in the same process, no Discord needed.
+
 ## Checks
 
-Four suites ship with the server. Three start their own server on a spare
+Five suites ship with the server. Three start their own server on a spare
 port with a scratch data directory, so they can run on an installed copy
 without touching its data, and each of those has a `--revert` that runs
 against the older behaviour and must fail; the fourth exercises the store
-module on a scratch directory.
+module on a scratch directory, the fifth the Discord board against a fake
+webhook endpoint.
 
 ```bash
 .venv/bin/python -m wow2.lsgauth      # the credential path, 22 checks
 .venv/bin/python -m wow2.blocktest    # a block stops all three invites, 7 checks
 .venv/bin/python -m wow2.ownertest    # identity, ownership, clans, storage, profiles, UDP and relay bounds, 57 checks
 .venv/bin/python -m wow2.storetest    # the SQLite store: the import keeps everything, the rules hold, 29 checks
+.venv/bin/python -m wow2.lobbyboardtest   # the Discord board: what it posts, coalescing, Discord down, 34 checks
 .venv/bin/python -m wow2.loadtest --consoles 32 --lifetime 200   # capacity, see below
 .venv/bin/python -m wow2.dbcli roundtrip DIR   # a directory of JSON stores in and out, field by field
 ```

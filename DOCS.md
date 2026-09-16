@@ -160,8 +160,10 @@ After the create, a console never sends its name again: every later message
 carries the one-way handle. So a server that lost its store, or never saw
 the create, cannot recover the name on its own; the player sees "The online
 profile name or password is incorrect" and the log says `login handle <hex>
-is not an account we know` or `has no stored credential`. Only the operator
-can fix it:
+is not an account we know` or `has no stored credential`. This is also what
+a reinstall looks like: a console that made its account against the old
+data directory is refused by the new one until the operator restores
+`accounts.json` or re-creates the account. Only the operator can fix it:
 
 ```bash
 wow2-account list              # every account, and whether it has a credential

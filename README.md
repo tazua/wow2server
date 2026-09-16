@@ -43,10 +43,19 @@ On an emulator, put them in `/etc/hosts`, all pointing at the server:
 <SERVER_IP> worms.stun.us.demonware.net worms.stun.eu.demonware.net
 ```
 
-A PSP has no hosts file, so set its DNS server to the machine running
-`wow2-nsdns` (what `--dns` installs): Settings, Network Settings, your
-connection, Address Settings, Custom, DNS Setting, Manual. The PSP's own
-connection test will say there is no internet; the game works.
+A PSP has no hosts file, so it needs a DNS server that answers those names:
+`wow2-nsdns`, a second process beside the server. `--system --dns` installs
+it as a service; without `--system`, run it yourself as root:
+
+```bash
+sudo .venv/bin/wow2-nsdns --bind <SERVER_IP> --answer <SERVER_IP>
+```
+
+Then set the PSP's DNS server to that address: Settings, Network Settings,
+your connection, Address Settings, Custom, DNS Setting, Manual. The PSP's own
+connection test will say there is no internet; the game works. Without the
+responder the game says "Unable to connect to WormNet" before it has sent
+the server a single packet.
 
 Ports: TCP 3074, UDP 3074, UDP 3078, UDP 53 for the DNS responder, and UDP
 40000-40031 if the relay is on.

@@ -93,7 +93,10 @@ relay = false
 # players signed in at once. A console that arrives when every port is taken is
 # handed its real address instead and plays direct, i.e. a symmetric-NAT player
 # fails to join exactly as if the relay were off -- so size this to the number
-# of players you expect online together, with room; an idle port costs nothing.
+# of players you expect online together, with room; an idle port costs nothing
+# (a few KB, bound once at startup). Anything up to a few thousand is fine
+# under the shipped unit, which raises the descriptor limit; the real ceiling
+# is the server's bandwidth, about 50 KB/s per four players in a match.
 #
 # ***OPEN THESE IN THE FIREWALL.*** They are as necessary as the main port and
 # nothing warns you: sign-in, hosting and the browser all work without them and

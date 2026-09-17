@@ -35,6 +35,11 @@ Environment=WOW2_CONFIG=/etc/wow2-server.toml
 ExecStart=/opt/wow2-server/bin/wow2-server
 Restart=on-failure
 RestartSec=5
+# Every signed-in console is two TCP sockets and, with the relay on, one UDP
+# socket held for ten minutes after its last packet; systemd's default soft
+# limit of 1024 descriptors would cap a relay pool near 900 and the
+# population near 300.
+LimitNOFILE=65536
 
 # The server writes JSON databases and uploaded blobs under storage.data_dir, and
 # nothing else. Everything below is what it does not need.

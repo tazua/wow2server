@@ -896,25 +896,33 @@ def relay_endpoint_for_host(rec: dict, joiner_ip: str = ""):
     """Where to tell a joiner the host is, when the relay is carrying the match."""
     if not natrelay.RELAY.enabled:
         return None
-    advertised = None
+    advertised = public = None
     for t, v in rec.get("info", []):
         if t == bd.BD_BLOB and isinstance(v, bytes) and len(v) == BD_COMMON_ADDR_SIZE:
             advertised = (socket.inet_ntoa(v[0:4]),
                           int.from_bytes(v[4:6], "little"))
+            public = (socket.inet_ntoa(v[18:22]),
+                      int.from_bytes(v[22:24], "little"))
             break
-    c = natrelay.RELAY.owner_of_advertised(advertised)
+    host_ip = rec.get("host_ip", "")
+    c = None
+    if public and public[0] == server_address_for(host_ip):    # what our discovery reply told the host it is
+        c = natrelay.RELAY.owner_of_advertised(public)
+        if c is not None and c.key[0] != host_ip:
+            c = None
     if c is None:
-        host_ip = rec.get("host_ip", "")
+        c = natrelay.RELAY.owner_of_advertised(advertised)
+    if c is None:
         hits = [x for x in natrelay.RELAY.consoles.values()
                 if x.key[0] == host_ip and x.mailbox]
         if len(hits) == 1:
             c = hits[0]
-            log(f"  (relay: host advertised {advertised}, which is not a "
+            log(f"  (relay: host advertised {advertised} / {public}, which is not a "
                 f"mailbox -- matched it to {c} by address instead)")
     if c is None or c.mailbox is None:
         log(f"  !! relay is ON but session 0x{rec.get('id', 0):x}'s host has no "
-            f"mailbox (it advertised {advertised}); the joiner will be given an "
-            f"address the relay does not serve")
+            f"mailbox (it advertised {advertised} / {public}); the joiner will be "
+            f"given an address the relay does not serve")
         return None
     return server_address_for(joiner_ip or rec.get("host_ip", "")), c.mailbox.port
 

@@ -949,6 +949,53 @@ def run_server_checks(tmp: Path, srv: Server, check: Checks) -> None:
         c.close()
 
 
+def run_search_relay_checks(check: Checks) -> None:
+    """In-process: the address a search reply hands a joiner when the relay
+    carries the match and several consoles share one public IP (§71c)."""
+    import authserver
+    import natrelay
+    print("\n-- search: the host's relay address when three consoles share one public IP")
+    rl = natrelay.RELAY
+    was_enabled, was_log = rl.enabled, natrelay._log
+    natrelay._log = lambda *_a, **_k: None
+    rl.enabled = True
+    for port in range(40200, 40208):
+        mb = natrelay.Mailbox(rl, port)
+        rl.mailboxes.append(mb)
+        rl.by_port[port] = mb
+    ip = "91.0.0.1"
+    consoles = [rl.mailbox_for((ip, p)).owner for p in (3074, 61256, 46927)]
+    host = consoles[1]
+    ours = authserver.server_address_for(ip)
+    blob = (socket.inet_aton("10.42.0.2") + (3074).to_bytes(2, "little") + bytes(12)
+            + socket.inet_aton(ours) + host.mailbox.port.to_bytes(2, "little") + b"\x01")
+    rec = {"id": 0x5705, "host_ip": ip, "secret": b"WOW2SESS" + bytes(8),
+           "info": [(bd.BD_BLOB, bytes(8)), (bd.BD_BLOB, bytes(16)), (bd.BD_BLOB, blob),
+                    (bd.BD_STR, "testuser")]}
+    got = authserver.relay_endpoint_for_host(rec, ip)
+    check(got == (ours, host.mailbox.port),
+          f"the host is found by the public part of its own address, the mailbox our "
+          f"discovery reply gave it, not guessed among the three from its IP (got {got})")
+    out = [v for t, v in authserver.info_with_session_id(rec, ip) if isinstance(v, bytes) and len(v) == 25][0]
+    check(out[0:4] == out[18:22] == socket.inet_aton(ours)
+          and int.from_bytes(out[22:24], "little") == host.mailbox.port,
+          "...and the joiner is handed SERVER:mailbox in both endpoints, never its own "
+          "public IP with the mailbox port")
+    other = rl.mailbox_for(("91.0.0.2", 5000)).owner
+    forged = blob[:18] + socket.inet_aton(ours) + other.mailbox.port.to_bytes(2, "little") + b"\x01"
+    got = authserver.relay_endpoint_for_host({**rec, "info": [(bd.BD_BLOB, forged)]}, ip)
+    check(got is None,
+          "a host naming ANOTHER address's mailbox as its own is not matched to it "
+          "(and three consoles on its IP leave nothing to guess)")
+    for c in list(rl.consoles.values()):
+        rl.forget(c)
+    rl.consoles.clear()
+    for port in range(40200, 40208):
+        mb = rl.by_port.pop(port)
+        rl.mailboxes.remove(mb)
+    rl.enabled, natrelay._log = was_enabled, was_log
+
+
 def run_relay_checks(check: Checks) -> None:
     """In-process: the relay's own tables, no sockets bound."""
     import natrelay
@@ -1028,6 +1075,7 @@ def main() -> int:
         finally:
             srv.stop()
     run_relay_checks(check)
+    run_search_relay_checks(check)
     print(f"\n{'REVERTED -- ' if a.revert else ''}"
           f"{check.total - check.failed}/{check.total} checks passed")
     if a.keep:

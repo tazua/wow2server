@@ -375,7 +375,7 @@ webhook endpoint.
 ```bash
 .venv/bin/python -m wow2.lsgauth      # the credential path, 22 checks
 .venv/bin/python -m wow2.blocktest    # a block stops all three invites, 7 checks
-.venv/bin/python -m wow2.ownertest    # identity, ownership, clans, storage, profiles, UDP, relay and login-table bounds, the create limit, 69 checks
+.venv/bin/python -m wow2.ownertest    # identity, ownership, clans, storage, profiles, UDP, relay and login-table bounds, the create limit, 72 checks
 .venv/bin/python -m wow2.storetest    # the SQLite store: the import keeps everything, the rules hold, 29 checks
 .venv/bin/python -m wow2.lobbyboardtest   # the Discord board: what it posts, coalescing, Discord down, 43 checks
 .venv/bin/python -m wow2.loadtest --consoles 32 --lifetime 200   # capacity, see below

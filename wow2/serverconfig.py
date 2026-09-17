@@ -84,7 +84,11 @@ def _read_file() -> tuple[dict, str | None]:
         if not cand:
             continue
         p = Path(cand)
-        if p.is_file():
+        try:
+            found = p.is_file()
+        except OSError:    # a cwd the service user cannot read (sudo -u from /root)
+            found = False
+        if found:
             try:
                 with open(p, "rb") as f:
                     return tomllib.load(f), str(p)

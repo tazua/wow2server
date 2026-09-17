@@ -245,3 +245,10 @@ announce_text = ""
 closed_text = ""
 empty_text = ""
 offline_text = ""
+
+# Seconds after a host's ping before the same host name pings again. Inside
+# the window a new lobby from that host EDITS the previous announcement back
+# from closed to open (with the new lobby's mode and count; an edit notifies
+# nobody), so a host who opens a friendly lobby, quits and opens a ranked one
+# pages the role once and the message still reads as open. 0 pings every time.
+announce_cooldown = 300

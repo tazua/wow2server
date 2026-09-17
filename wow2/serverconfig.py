@@ -73,6 +73,7 @@ DEFAULTS: dict[str, dict] = {
         "closed_text": "",
         "empty_text": "",
         "offline_text": "",
+        "announce_cooldown": 300,
     },
 }
 
@@ -192,6 +193,7 @@ DISCORD_MENTION = str(get("discord", "mention") or "")
 DISCORD_TITLE = str(get("discord", "title") or "Open lobbies")
 DISCORD_TEXT = {k: str(get("discord", k) or "")
                 for k in ("announce_text", "closed_text", "empty_text", "offline_text")}
+DISCORD_COOLDOWN = float(get("discord", "announce_cooldown"))
 
 
 def _nat_type_line() -> str:

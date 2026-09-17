@@ -162,6 +162,7 @@ server prints what is in force at startup.
 | `discord.announce_webhook`, `discord.mention` | unset | a webhook URL that gets a message when a lobby opens, and what to put in front of it (`<@&ROLE_ID>` or `@here`) |
 | `discord.title` | `Open lobbies` | the board's heading |
 | `discord.announce_text`, `closed_text`, `empty_text`, `offline_text` | built-in wording | templates for what the poster says; the example file lists each one's fields |
+| `discord.announce_cooldown` | `300` | seconds before the same host name pings again; inside it a new lobby edits the previous announcement back to open |
 
 The `WOW2_*` environment variables beyond those are not configuration. Each
 switches one behaviour back to an older one so a protocol failure can be
@@ -338,9 +339,12 @@ into one edit two seconds later, so a lobby filling up is one edit and not
 four. The message id is kept in the store, so a restart edits the same
 message; a message somebody deleted is re-posted. With `announce_webhook`
 set, each lobby opened is a fresh message (`@role 🎮 **name** opened a
-ranked lobby (1/4)`), struck through when the lobby closes, at most one per
-host every five minutes; `mention` is what goes in front, typically a role
-people give themselves to be pinged. All four texts are templates in the
+ranked lobby (1/4)`), struck through when the lobby closes; `mention` is
+what goes in front, typically a role people give themselves to be pinged.
+A host name pings at most once per `announce_cooldown` (five minutes);
+inside that window a new lobby from the same host edits the struck-through
+announcement back to open, with the new lobby's mode and count, and an edit
+notifies nobody. All four texts are templates in the
 config (`announce_text`, `closed_text`, `empty_text`, `offline_text`), so a
 server whose webhook is a character can give it lines; a template with a
 field that does not exist is named at startup and the built-in wording is
@@ -373,7 +377,7 @@ webhook endpoint.
 .venv/bin/python -m wow2.blocktest    # a block stops all three invites, 7 checks
 .venv/bin/python -m wow2.ownertest    # identity, ownership, clans, storage, profiles, UDP, relay and login-table bounds, the create limit, 69 checks
 .venv/bin/python -m wow2.storetest    # the SQLite store: the import keeps everything, the rules hold, 29 checks
-.venv/bin/python -m wow2.lobbyboardtest   # the Discord board: what it posts, coalescing, Discord down, 38 checks
+.venv/bin/python -m wow2.lobbyboardtest   # the Discord board: what it posts, coalescing, Discord down, 43 checks
 .venv/bin/python -m wow2.loadtest --consoles 32 --lifetime 200   # capacity, see below
 .venv/bin/python -m wow2.dbcli roundtrip DIR   # a directory of JSON stores in and out, field by field
 ```

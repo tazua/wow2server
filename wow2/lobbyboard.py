@@ -176,14 +176,18 @@ class LobbyBoard:
         self._board_id: str | None = None
         self._notes: dict[int, tuple[str, str, bool, int, int]] = {}
         self._last_open: dict[str, float] = {}
+        self._last_sid: dict[str, int] = {}
         self._muted_until = 0.0
         self.posted = 0
 
     # ------------------------------------------------------------ the server side
     def configure(self, lobby_url: str = "", announce_url: str = "", mention: str = "",
-                  title: str = "Open lobbies", text: dict | None = None) -> list[str]:
+                  title: str = "Open lobbies", text: dict | None = None,
+                  cooldown: float | None = None) -> list[str]:
         """Take the settings; returns the problems (an empty list is good)."""
         self.text, bad = check_text(text)
+        if cooldown is not None:
+            self.cooldown = max(0.0, float(cooldown))
         for what, url in (("lobby_webhook", lobby_url), ("announce_webhook", announce_url)):
             if url and not webhook_id(url):
                 bad.append(f"discord.{what} is not a webhook URL "
@@ -214,24 +218,31 @@ class LobbyBoard:
         self._offer(snapshot(sessions))
 
     def opened(self, rec: dict) -> None:
-        """A session was created: announce it, unless this host did so recently."""
+        """A session was created: a fresh ping, or, inside the host's cooldown, the
+        host's last announcement edited back to open (an edit pings nobody)."""
         if not self.enabled or not self.announce_url:
             return
         name = str(rec.get("name") or "?")
-        now = time.time()
-        if now - self._last_open.get(name, 0.0) < self.cooldown:
-            return
-        self._last_open[name] = now
+        sid = int(rec.get("id") or 0)
         ranked = bool(rec.get("points"))
         n, mx = int(rec.get("players") or 0), int(rec.get("max_players") or 0)
         text = render_announcement(self.mention, name, ranked, n, mx, self.text)
-        self._queue(("open", int(rec.get("id") or 0), name, ranked, text, n, mx))
+        now = time.time()
+        if now - self._last_open.get(name, 0.0) < self.cooldown:
+            prev = self._last_sid.get(name)
+            if prev is not None:
+                self._queue(("reopen", sid, name, ranked, text, n, mx, prev))
+                self._last_sid[name] = sid
+            return
+        self._last_open[name] = now
+        self._last_sid[name] = sid
+        self._queue(("open", sid, name, ranked, text, n, mx, None))
 
     def closed(self, sid: int) -> None:
         """A session went away: strike its announcement through."""
         if not self.enabled or not self.announce_url:
             return
-        self._queue(("close", int(sid), "", False, "", 0, 0))
+        self._queue(("close", int(sid), "", False, "", 0, 0, None))
 
     def stop(self, timeout: float = 5.0) -> None:
         """Mark the board offline and wait (bounded) for the worker to say so."""
@@ -321,7 +332,7 @@ class LobbyBoard:
             self._cv.notify_all()
 
     def _do_event(self, ev: tuple) -> None:
-        kind, sid, name, ranked, text, n, mx = ev
+        kind, sid, name, ranked, text, n, mx, prev = ev
         if kind == "open":
             mid = self._send(self.announce_url,
                              {"content": text, "allowed_mentions": ALL_PINGS})
@@ -329,8 +340,16 @@ class LobbyBoard:
                 self._notes[sid] = (mid, name, ranked, n, mx)
                 while len(self._notes) > MAX_NOTES:
                     self._notes.pop(next(iter(self._notes)))
+        elif kind == "reopen":
+            note = self._notes.pop(prev, None) or self._notes.pop(sid, None)
+            if note is None:
+                return
+            mid = note[0]
+            if self._edit(self.announce_url, mid,
+                          {"content": text, "allowed_mentions": NO_PINGS}) == 200:
+                self._notes[sid] = (mid, name, ranked, n, mx)
         elif kind == "close":
-            note = self._notes.pop(sid, None)
+            note = self._notes.get(sid)       # kept: a re-host inside the cooldown edits it back
             if note:
                 mid, name, ranked, n, mx = note
                 self._edit(self.announce_url, mid,

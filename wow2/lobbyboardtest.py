@@ -148,6 +148,10 @@ def embed_of(call) -> dict:
     return call[2]["embeds"][0]
 
 
+def render_open(b, name, ranked, n, mx) -> str:
+    return lobbyboard.render_announcement(b.mention, name, ranked, n, mx, b.text)
+
+
 def run(keep: bool) -> int:
     lobbyboard.set_logger(capture_log)
     root = Path(tempfile.mkdtemp(prefix="wow2-lobbyboardtest-"))
@@ -241,13 +245,34 @@ def run(keep: bool) -> int:
               and posts[0][2]["allowed_mentions"]["parse"] == ["roles", "users", "everyone"],
               "a new lobby is announced with the mention first and pings allowed")
         note_id = str(fake.next_id)
+        fake.reset()
+        b.closed(0x5701)
+        b.flush(3)
+        again = dict(sessions[0x5701], id=0x5799, players=1)
+        b.opened(again)
+        b.flush(3)
+        edits = fake.of("PATCH", LFG_HOOK)
+        check(fake.of("POST", LFG_HOOK) == [] and len(edits) == 2
+              and edits[0][1].endswith(f"/messages/{note_id}") and "closed" in edits[0][2]["content"]
+              and edits[1][1].endswith(f"/messages/{note_id}")
+              and edits[1][2]["content"] == render_open(b, "player1", True, 1, 4)
+              and edits[1][2]["allowed_mentions"] == {"parse": []},
+              "the same host again inside the cooldown: no second ping, the struck-through "
+              "announcement is edited back to open, and the edit pings nobody")
+        fake.reset()
+        b.closed(0x5799)
+        b.flush(3)
+        edits = fake.of("PATCH", LFG_HOOK)
+        check(len(edits) == 1 and edits[0][1].endswith(f"/messages/{note_id}")
+              and "closed" in edits[0][2]["content"],
+              "...and closing the second lobby strikes that same message through again")
         b.opened(sessions[0x5701])
         b.flush(3)
-        check(len(fake.of("POST", LFG_HOOK)) == 1, "the same host again inside the cooldown: no second ping")
+        check(len(fake.of("POST", LFG_HOOK)) == 0, "still inside the cooldown: still no new ping")
         b.opened(sessions[0x5702])
         b.flush(3)
-        check(len(fake.of("POST", LFG_HOOK)) == 2
-              and "friendly lobby (2/4)" in fake.of("POST", LFG_HOOK)[1][2]["content"],
+        check(len(fake.of("POST", LFG_HOOK)) == 1
+              and "friendly lobby (2/4)" in fake.of("POST", LFG_HOOK)[0][2]["content"],
               "a different host is announced (friendly, 2/4)")
         fake.reset()
         b.closed(0x5701)
@@ -267,6 +292,17 @@ def run(keep: bool) -> int:
         b.opened(sessions[0x5701])
         b.flush(3)
         check(len(fake.of("POST", LFG_HOOK)) == 1, "after the cooldown the same host is announced again")
+        b7 = lobbyboard.LobbyBoard()
+        b7.debounce = 0.1
+        b7.configure("", fake.url(LFG_HOOK), "", "", None, 0)
+        b7.start(None)
+        fake.reset()
+        for i in range(3):
+            b7.opened(dict(sessions[0x5701], id=0x6000 + i))
+        b7.flush(3)
+        check(b7.cooldown == 0 and len(fake.of("POST", LFG_HOOK)) == 3,
+              "announce_cooldown = 0 pings every time")
+        b7.stop(2)
 
         print("-- the message survives a restart")
         b.stop(timeout=3)

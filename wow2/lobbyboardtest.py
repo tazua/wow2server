@@ -344,6 +344,37 @@ def run(keep: bool) -> int:
               and any("refused us (401)" in m for m in LOGGED),
               "a webhook that answers 401 turns the board off after one call and one line")
 
+        print("-- the poster's voice")
+        sarge = {"announce_text": "{mention} Listen up! {name} opened a {mode} lobby, {count}. Move it!",
+                 "closed_text": "At ease. {name}'s {mode} lobby closed {when}.",
+                 "empty_text": "Nothing on the board. Host one, recruit.",
+                 "offline_text": "Server down since {when}. Stand by."}
+        b5 = lobbyboard.LobbyBoard()
+        bad = b5.configure(fake.url(BOARD_HOOK), fake.url(LFG_HOOK), "<@&7>", "Sitrep", sarge)
+        check(bad == [] and b5.text == {**lobbyboard.DEFAULT_TEXT, **sarge},
+              "four templates from the config replace the defaults")
+        a = lobbyboard.render_announcement("<@&7>", "player1", True, 1, 4, b5.text)
+        c = lobbyboard.render_closed("player1", False, 1_700_000_000, 2, 4, b5.text)
+        e = lobbyboard.render_board("Sitrep", (), "up", 1_700_000_000, b5.text)["description"]
+        o = lobbyboard.render_board("Sitrep", (), "offline", 1_700_000_000, b5.text)["description"]
+        check(a == "<@&7> Listen up! player1 opened a ranked lobby, 1/4. Move it!"
+              and c == "At ease. player1's friendly lobby closed <t:1700000000:R>."
+              and e.startswith("Nothing on the board. Host one, recruit.")
+              and o == "Server down since <t:1700000000:R>. Stand by.",
+              "...and every field fills in: mention, name, mode, count, when")
+        check(lobbyboard.render_announcement("", "player1", False, 1, 4, b5.text)
+              == "Listen up! player1 opened a friendly lobby, 1/4. Move it!",
+              "an empty mention leaves no leading space")
+        b6 = lobbyboard.LobbyBoard()
+        bad = b6.configure(fake.url(BOARD_HOOK), "", "", "", {"announce_text": "{name} did {thing}",
+                                                            "closed_text": "", "offline_text": "{when"})
+        check(len(bad) == 2 and all("using the default" in m for m in bad)
+              and "{thing}" not in b6.text["announce_text"] and "{mention}" in bad[0]
+              and b6.text["closed_text"] == lobbyboard.DEFAULT_TEXT["closed_text"]
+              and b6.text["offline_text"] == lobbyboard.DEFAULT_TEXT["offline_text"],
+              "a template with an unknown field or a broken brace is named, with the fields "
+              "it may use, and the default stands; an empty one is the default too")
+
         print("-- the server's half")
         import authserver
         s = {"id": 0x5710, "name": "player9", "players": 1, "max_players": 4, "points": 0,

@@ -1433,7 +1433,29 @@ def account_by_handle(handle: bytes) -> dict | None:
             "src": "store" if not cfg else "config+store"}
 
 
-ISSUED_SESSION_KEYS: dict[str, set[bytes]] = {}
+ISSUED_SESSION_KEYS: dict[tuple[bytes, str], float] = {}
+PROOF_HANDLES: dict[bytes, tuple[str, bytes, float]] = {}
+PROOF_TTL = float(os.environ.get("WOW2_PROOF_TTL", "120"))
+PROOFS_MAX = int(os.environ.get("WOW2_PROOFS_MAX", "65536"))
+_proofs_swept = 0.0
+
+
+def proofs_sweep(now: float | None = None, force: bool = False) -> None:
+    """Drop the keys and handles no console will present any more: older
+    than PROOF_TTL, and the oldest past PROOFS_MAX. At most once a second.
+    """
+    global _proofs_swept
+    now = time.time() if now is None else now
+    for table in (ISSUED_SESSION_KEYS, PROOF_HANDLES):
+        while len(table) > PROOFS_MAX:
+            del table[next(iter(table))]    # a dict keeps issue order
+    if now - _proofs_swept < 1.0 and not force:
+        return
+    _proofs_swept = now
+    for k in [k for k, t in ISSUED_SESSION_KEYS.items() if now - t > PROOF_TTL]:
+        del ISSUED_SESSION_KEYS[k]
+    for k in [k for k, v in PROOF_HANDLES.items() if now - v[2] > PROOF_TTL]:
+        del PROOF_HANDLES[k]
 
 
 def new_session_key(username: str, register: bool = True) -> bytes:
@@ -1446,18 +1468,19 @@ def new_session_key(username: str, register: bool = True) -> bytes:
             if key[0:8] != key[8:16] and key[8:16] != key[16:24]:
                 break
     if register:
-        ISSUED_SESSION_KEYS.setdefault(username, set()).add(key)
+        ISSUED_SESSION_KEYS[key, username] = time.time()
+        proofs_sweep()
     return key
 
 
 def session_key_is_ours(username: str, key: bytes) -> bool:
-    return key in ISSUED_SESSION_KEYS.get(username, ())
+    issued = ISSUED_SESSION_KEYS.get((key, username))
+    return issued is not None and time.time() - issued <= PROOF_TTL
 
 
 LSG_NO_KEY_CHECK = os.environ.get("WOW2_LSG_NO_KEY_CHECK") == "1"
 
 PROOF_HANDLE = os.environ.get("WOW2_NO_PROOF_HANDLE") != "1"
-PROOF_HANDLES: dict[bytes, tuple[str, bytes]] = {}
 
 
 def lsg_message_readable(dec: dict, strict: bool = False) -> bool:
@@ -3320,7 +3343,15 @@ class AuthConnection(asyncio.Protocol):
         proof = parse_lsg_connect(payload)
         self.proof_handle = None
         if proof is not None and PROOF_HANDLE and proof["session_key"] in PROOF_HANDLES:
-            acct, key = PROOF_HANDLES[proof["session_key"]]
+            acct, key, issued = PROOF_HANDLES[proof["session_key"]]
+            if time.time() - issued > PROOF_TTL:
+                log(f"  (!! LSG connect for {proof['username']!r} presents a handle "
+                    f"issued {time.time() - issued:.0f} s ago, past PROOF_TTL "
+                    f"({PROOF_TTL:.0f} s) -- "
+                    + ("keeping it on the source address, because "
+                       "WOW2_LSG_NO_KEY_CHECK=1)" if LSG_NO_KEY_CHECK
+                       else "closing the connection)"))
+                return LSG_NO_KEY_CHECK
             if acct == proof["username"]:
                 self.proof_handle = proof["session_key"]
                 proof["session_key"] = key
@@ -3542,7 +3573,7 @@ class AuthConnection(asyncio.Protocol):
             handle = None
             if PROOF_HANDLE and not refused:
                 handle = secrets.token_bytes(24)
-                PROOF_HANDLES[handle] = (uname, session_key)
+                PROOF_HANDLES[handle] = (uname, session_key, time.time())
             reply = build_login_reply(session_key, kc, username=uname,
                                       user_id=uid, license_id=uid,
                                       proof_key=handle)
@@ -3955,7 +3986,8 @@ async def main():
     for problem in lobbyboard.BOARD.configure(serverconfig.DISCORD_LOBBY_WEBHOOK,
                                               serverconfig.DISCORD_ANNOUNCE_WEBHOOK,
                                               serverconfig.DISCORD_MENTION,
-                                              serverconfig.DISCORD_TITLE):
+                                              serverconfig.DISCORD_TITLE,
+                                              serverconfig.DISCORD_TEXT):
         log(f"!! {problem} -- ignored")
     lobbyboard.BOARD.start(store.path())
     log(f"WOW2 server up: TCP+UDP {bind}:{port}")

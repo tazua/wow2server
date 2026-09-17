@@ -204,3 +204,26 @@ lobby_webhook = ""
 announce_webhook = ""
 mention = ""
 title = "Open lobbies"
+
+# What the poster says. Each is a template; leave one empty for the built-in
+# wording. The fields, in braces:
+#   announce_text  {mention} {name} {mode} {count} {players} {max}
+#                  -- mode is "ranked" or "friendly", count is "1/4"
+#   closed_text    {name} {mode} {count} {when}
+#                  -- the announcement is EDITED into this when the lobby closes
+#   empty_text     {when}       -- the board with no lobby open
+#   offline_text   {when}       -- the board after a clean stop
+# {when} is a Discord timestamp that reads "3 minutes ago" and keeps counting.
+# A template with a field that does not exist is named at startup and the
+# built-in wording is used instead. Discord markdown works (**bold**, ~~struck~~).
+#
+# The built-in wording is neutral. A server whose webhook is a character can
+# give it lines -- Wormhole's drill sergeant, for instance:
+#   announce_text = "{mention} Listen up, recruits! **{name}** just opened a {mode} lobby ({count}). Fall in from Find Game. Move it!"
+#   closed_text = "At ease. **{name}**'s {mode} lobby stood down {when}."
+#   empty_text = "*Nothing on the board, recruit. Host a game from the Infrastructure menu and I'll post it here.*"
+#   offline_text = "\U0001F534 *The server is down since {when}. Stand by for orders.*"
+announce_text = ""
+closed_text = ""
+empty_text = ""
+offline_text = ""

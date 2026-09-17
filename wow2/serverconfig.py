@@ -68,6 +68,10 @@ DEFAULTS: dict[str, dict] = {
         "announce_webhook": "",
         "mention": "",
         "title": "Open lobbies",
+        "announce_text": "",
+        "closed_text": "",
+        "empty_text": "",
+        "offline_text": "",
     },
 }
 
@@ -183,6 +187,8 @@ DISCORD_LOBBY_WEBHOOK = str(get("discord", "lobby_webhook") or "")
 DISCORD_ANNOUNCE_WEBHOOK = str(get("discord", "announce_webhook") or "")
 DISCORD_MENTION = str(get("discord", "mention") or "")
 DISCORD_TITLE = str(get("discord", "title") or "Open lobbies")
+DISCORD_TEXT = {k: str(get("discord", k) or "")
+                for k in ("announce_text", "closed_text", "empty_text", "offline_text")}
 
 
 def _nat_type_line() -> str:

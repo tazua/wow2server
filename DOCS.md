@@ -59,7 +59,20 @@ handle. The lobby connection presents the proof and is bound provisionally;
 the first RPC that decrypts under the ticket's key completes the binding. So
 a connection that has only seen the reply, and not opened the ticket, is
 served nothing. A refused login is answered with a key the sender cannot
-have, and it is indistinguishable on the wire from a wrong password.
+have, and it is indistinguishable on the wire from a wrong password. A
+handle and its key are honoured for 120 s after the login reply (a console
+presents its handle within a few seconds) and the tables that hold them are
+bounded at 65,536 entries, so a flood of sign-ins costs memory only up to
+that bound.
+
+There is no lockout, and there cannot be one on this protocol: the server
+never sees a wrong password. Whoever names an account gets its ticket, and
+a wrong guess is discovered by the client, offline, so a password can be
+attacked on the attacker's own machine at whatever speed it has (one
+Tiger192 and one 3DES block per candidate, against a known first block).
+The password's length is the defence. The game allows 6 to 12 characters;
+six digits fall in well under a second, twelve mixed characters do not
+fall. Tell your players.
 
 ### The lobby
 
@@ -125,7 +138,7 @@ server prints what is in force at startup.
 | `accounts.create_mode` | `refuse_duplicates` | answer 707 to a create for a name that already has a credential |
 | `logging.level` | `info` | `debug` logs every message body |
 | `logging.hexdumps` | `false` | dump every packet to the session log; hundreds of MB per session |
-| `limits.*` | 100 msg/s, 16 connections per address, 4 MB per connection | per-connection caps |
+| `limits.*` | 100 msg/s, 16 connections per address, 4 MB per connection | per-connection caps; flood protection, not a lockout (see Authentication) |
 | `nat.relay` | `false` | carry matches through the server; see below |
 | `nat.relay_port_base`, `nat.relay_ports` | `40000`, `32` | one UDP port per console ONLINE (held until `relay_idle_timeout` of silence); a console that arrives when all are taken plays direct instead, so size it to the players you expect online together |
 | `nat.relay_idle_timeout` | `600` | seconds before an idle mailbox is reclaimed |
@@ -137,6 +150,7 @@ server prints what is in force at startup.
 | `discord.lobby_webhook` | unset | a Discord webhook URL; the channel gets one message that always shows the open lobbies. See Discord |
 | `discord.announce_webhook`, `discord.mention` | unset | a webhook URL that gets a message when a lobby opens, and what to put in front of it (`<@&ROLE_ID>` or `@here`) |
 | `discord.title` | `Open lobbies` | the board's heading |
+| `discord.announce_text`, `closed_text`, `empty_text`, `offline_text` | built-in wording | templates for what the poster says; the example file lists each one's fields |
 
 The `WOW2_*` environment variables beyond those are not configuration. Each
 switches one behaviour back to an older one so a protocol failure can be
@@ -304,7 +318,11 @@ message; a message somebody deleted is re-posted. With `announce_webhook`
 set, each lobby opened is a fresh message (`@role 🎮 **name** opened a
 ranked lobby (1/4)`), struck through when the lobby closes, at most one per
 host every five minutes; `mention` is what goes in front, typically a role
-people give themselves to be pinged.
+people give themselves to be pinged. All four texts are templates in the
+config (`announce_text`, `closed_text`, `empty_text`, `offline_text`), so a
+server whose webhook is a character can give it lines; a template with a
+field that does not exist is named at startup and the built-in wording is
+used.
 
 Discord being down costs nothing: the posting runs on its own thread, a
 request that fails is logged once a minute and the next session change
@@ -313,7 +331,7 @@ answers 401 or 403 (deleted, or a wrong URL) turns the feature off for the
 run with one line in the log. A webhook URL is a secret — whoever holds it
 can post to the channel — so keep the config file to the operator.
 
-`lobbyboardtest.py` is the feature's own suite: 34 checks against a fake
+`lobbyboardtest.py` is the feature's own suite: 38 checks against a fake
 webhook endpoint in the same process, no Discord needed.
 
 ## Checks
@@ -328,9 +346,9 @@ webhook endpoint.
 ```bash
 .venv/bin/python -m wow2.lsgauth      # the credential path, 22 checks
 .venv/bin/python -m wow2.blocktest    # a block stops all three invites, 7 checks
-.venv/bin/python -m wow2.ownertest    # identity, ownership, clans, storage, profiles, UDP and relay bounds, 57 checks
+.venv/bin/python -m wow2.ownertest    # identity, ownership, clans, storage, profiles, UDP, relay and login-table bounds, 63 checks
 .venv/bin/python -m wow2.storetest    # the SQLite store: the import keeps everything, the rules hold, 29 checks
-.venv/bin/python -m wow2.lobbyboardtest   # the Discord board: what it posts, coalescing, Discord down, 34 checks
+.venv/bin/python -m wow2.lobbyboardtest   # the Discord board: what it posts, coalescing, Discord down, 38 checks
 .venv/bin/python -m wow2.loadtest --consoles 32 --lifetime 200   # capacity, see below
 .venv/bin/python -m wow2.dbcli roundtrip DIR   # a directory of JSON stores in and out, field by field
 ```

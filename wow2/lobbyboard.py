@@ -42,6 +42,42 @@ LOG_INTERVAL = 60.0
 NO_PINGS = {"parse": []}
 ALL_PINGS = {"parse": ["roles", "users", "everyone"]}
 
+# What the board says, as templates; a deployment gives the poster a voice in
+# [discord] (wow2-server.example.toml lists the fields each one may use).
+DEFAULT_TEXT = {
+    "announce_text": "{mention} \U0001F3AE **{name}** opened a {mode} lobby ({count}) "
+                     "— sign in and join it from Find Game!",
+    "closed_text": "~~\U0001F3AE **{name}** opened a {mode} lobby~~ — closed {when}",
+    "empty_text": "*No open lobbies. Host one from the Infrastructure menu and it "
+                  "appears here.*",
+    "offline_text": "\U0001F534 *Server offline since {when}.*",
+}
+TEXT_FIELDS = {
+    "announce_text": {"mention": "<@&1>", "name": "x", "mode": "ranked", "count": "1/4",
+                      "players": 1, "max": 4},
+    "closed_text": {"name": "x", "mode": "ranked", "count": "1/4", "when": "<t:0:R>"},
+    "empty_text": {"when": "<t:0:R>"},
+    "offline_text": {"when": "<t:0:R>"},
+}
+
+
+def check_text(text: dict) -> tuple[dict, list[str]]:
+    """The templates a deployment set, each tried once; a broken one is replaced
+    by the default and named."""
+    out, bad = dict(DEFAULT_TEXT), []
+    for key, tmpl in (text or {}).items():
+        if key not in DEFAULT_TEXT:
+            continue
+        try:
+            str(tmpl).format(**TEXT_FIELDS[key])
+        except (KeyError, IndexError, ValueError) as e:
+            bad.append(f"discord.{key} cannot be filled in ({e!r}; the fields are "
+                       f"{', '.join('{' + f + '}' for f in TEXT_FIELDS[key])}) -- using the default")
+            continue
+        if str(tmpl).strip():
+            out[key] = str(tmpl)
+    return out, bad
+
 
 def webhook_id(url: str) -> str:
     """The id of a well-formed webhook URL, else "" (what configure() checks)."""
@@ -71,11 +107,14 @@ def snapshot(sessions: dict) -> tuple:
                  for full, _neg, name, n, mx, ranked, created in rows)
 
 
-def render_board(title: str, rows: tuple, state: str, now: float) -> dict:
+def render_board(title: str, rows: tuple, state: str, now: float,
+                 text: dict | None = None) -> dict:
     """The embed for a snapshot. `state` is "up" or "offline"."""
+    text = text or DEFAULT_TEXT
+    when = f"<t:{int(now)}:R>"
     if state == "offline":
         return {"title": title, "color": COLOR_OFFLINE,
-                "description": f"\U0001F534 *Server offline since <t:{int(now)}:R>.*"}
+                "description": text["offline_text"].format(when=when)}
     lines = []
     for name, n, mx, ranked, created, full in rows[:MAX_ROWS]:
         dot = "\U0001F534" if full else "\U0001F7E2"
@@ -88,23 +127,29 @@ def render_board(title: str, rows: tuple, state: str, now: float) -> dict:
     if len(rows) > MAX_ROWS:
         lines.append(f"*…and {len(rows) - MAX_ROWS} more*")
     if not lines:
-        lines.append("*No open lobbies. Host one from the Infrastructure menu "
-                     "and it appears here.*")
-    lines += ["", f"Updated <t:{int(now)}:R>"]
+        lines.append(text["empty_text"].format(when=when))
+    lines += ["", f"Updated {when}"]
     return {"title": title, "color": COLOR_OPEN if rows else COLOR_EMPTY,
             "description": "\n".join(lines)}
 
 
-def render_announcement(mention: str, name: str, ranked: bool, n: int, mx: int) -> str:
-    count = f" ({n}/{mx})" if mx else ""
-    return ((mention + " ") if mention else "") + \
-        f"\U0001F3AE **{name}** opened a {'ranked' if ranked else 'friendly'} lobby" \
-        f"{count} — sign in and join it from Find Game!"
+def count_text(n: int, mx: int) -> str:
+    return f"{n}/{mx}" if mx else f"{n} player{'s' if n != 1 else ''}"
 
 
-def render_closed(name: str, ranked: bool, now: float) -> str:
-    return (f"~~\U0001F3AE **{name}** opened a {'ranked' if ranked else 'friendly'} "
-            f"lobby~~ — closed <t:{int(now)}:R>")
+def render_announcement(mention: str, name: str, ranked: bool, n: int, mx: int,
+                        text: dict | None = None) -> str:
+    tmpl = (text or DEFAULT_TEXT)["announce_text"]
+    return tmpl.format(mention=mention or "", name=name,
+                       mode="ranked" if ranked else "friendly",
+                       count=count_text(n, mx), players=n, max=mx).strip()
+
+
+def render_closed(name: str, ranked: bool, now: float, n: int = 0, mx: int = 0,
+                  text: dict | None = None) -> str:
+    tmpl = (text or DEFAULT_TEXT)["closed_text"]
+    return tmpl.format(name=name, mode="ranked" if ranked else "friendly",
+                       count=count_text(n, mx), when=f"<t:{int(now)}:R>").strip()
 
 
 class LobbyBoard:
@@ -116,6 +161,7 @@ class LobbyBoard:
         self.announce_url = ""
         self.mention = ""
         self.title = "Open lobbies"
+        self.text = dict(DEFAULT_TEXT)
         self.debounce = DEBOUNCE
         self.cooldown = ANNOUNCE_COOLDOWN
         self.retry_delay = RETRY_DELAY
@@ -128,16 +174,16 @@ class LobbyBoard:
         self._state = "up"
         self._thread: threading.Thread | None = None
         self._board_id: str | None = None
-        self._notes: dict[int, tuple[str, str, bool]] = {}
+        self._notes: dict[int, tuple[str, str, bool, int, int]] = {}
         self._last_open: dict[str, float] = {}
         self._muted_until = 0.0
         self.posted = 0
 
     # ------------------------------------------------------------ the server side
     def configure(self, lobby_url: str = "", announce_url: str = "", mention: str = "",
-                  title: str = "Open lobbies") -> list[str]:
+                  title: str = "Open lobbies", text: dict | None = None) -> list[str]:
         """Take the settings; returns the problems (an empty list is good)."""
-        bad = []
+        self.text, bad = check_text(text)
         for what, url in (("lobby_webhook", lobby_url), ("announce_webhook", announce_url)):
             if url and not webhook_id(url):
                 bad.append(f"discord.{what} is not a webhook URL "
@@ -177,16 +223,15 @@ class LobbyBoard:
             return
         self._last_open[name] = now
         ranked = bool(rec.get("points"))
-        text = render_announcement(self.mention, name, ranked,
-                                   int(rec.get("players") or 0),
-                                   int(rec.get("max_players") or 0))
-        self._queue(("open", int(rec.get("id") or 0), name, ranked, text))
+        n, mx = int(rec.get("players") or 0), int(rec.get("max_players") or 0)
+        text = render_announcement(self.mention, name, ranked, n, mx, self.text)
+        self._queue(("open", int(rec.get("id") or 0), name, ranked, text, n, mx))
 
     def closed(self, sid: int) -> None:
         """A session went away: strike its announcement through."""
         if not self.enabled or not self.announce_url:
             return
-        self._queue(("close", int(sid), "", False, ""))
+        self._queue(("close", int(sid), "", False, "", 0, 0))
 
     def stop(self, timeout: float = 5.0) -> None:
         """Mark the board offline and wait (bounded) for the worker to say so."""
@@ -274,24 +319,25 @@ class LobbyBoard:
             self._cv.notify_all()
 
     def _do_event(self, ev: tuple) -> None:
-        kind, sid, name, ranked, text = ev
+        kind, sid, name, ranked, text, n, mx = ev
         if kind == "open":
             mid = self._send(self.announce_url,
                              {"content": text, "allowed_mentions": ALL_PINGS})
             if mid:
-                self._notes[sid] = (mid, name, ranked)
+                self._notes[sid] = (mid, name, ranked, n, mx)
                 while len(self._notes) > MAX_NOTES:
                     self._notes.pop(next(iter(self._notes)))
         elif kind == "close":
             note = self._notes.pop(sid, None)
             if note:
-                mid, name, ranked = note
+                mid, name, ranked, n, mx = note
                 self._edit(self.announce_url, mid,
-                           {"content": render_closed(name, ranked, time.time()),
+                           {"content": render_closed(name, ranked, time.time(), n, mx,
+                                                     self.text),
                             "allowed_mentions": NO_PINGS})
 
     def _post_board(self, snap: tuple) -> bool:
-        embed = render_board(self.title, snap, self._state, time.time())
+        embed = render_board(self.title, snap, self._state, time.time(), self.text)
         body = {"content": "", "embeds": [embed], "allowed_mentions": NO_PINGS}
         if self._board_id:
             status = self._edit(self.lobby_url, self._board_id, body)

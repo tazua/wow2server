@@ -26,7 +26,7 @@ HERE = Path(__file__).resolve().parent
 sys.path.insert(0, str(HERE))
 
 import bdproto as bd                                                # noqa: E402
-from lsgauth import Peer, bufsize_announce, lsg_connect, login, tiger192  # noqa: E402
+from lsgauth import Peer, bufsize_announce, lsg_connect, login, present, tiger192  # noqa: E402
 from blocktest import (Console as _Console, _rpc, encrypt_rpc,      # noqa: E402
                        req_buddy_invite, req_clan_invite, PASSWORD)
 
@@ -388,7 +388,8 @@ class Server:
                    WOW2_LOG_LEVEL="info",
                    WOW2_SHARED_PASSWORD_FALLBACK="false",
                    WOW2_NO_NAT_TYPE="1",
-                   WOW2_NAT_RELAY="0")
+                   WOW2_NAT_RELAY="0",
+                   WOW2_PROOFS_MAX="50")
         if revert:
             env["WOW2_LEARN_ACCOUNT_ID"] = "1"
             env["WOW2_NO_SESSION_OWNER"] = "1"
@@ -857,6 +858,47 @@ def run_server_checks(tmp: Path, srv: Server, check: Checks) -> None:
     check(len(authserver.NAT_PEERS) == cap,
           f"...and past the cap the oldest go ({len(authserver.NAT_PEERS)} kept)")
     authserver.NAT_PEERS.clear()
+
+    # ------------------------------------------------------------ logins
+    print("\n-- logins: a flood of sign-ins for a real account, and what it leaves behind")
+    proofs = [login("127.0.0.1", PORT, "alice1")[1] for _ in range(80)]
+    closed, replies = present("127.0.0.1", PORT, proofs[0])
+    check(closed and not replies,
+          "after 80 logins with WOW2_PROOFS_MAX=50 the FIRST handle is gone: "
+          "presenting it is refused")
+    closed, replies = present("127.0.0.1", PORT, proofs[-1])
+    check(bool(replies) and not closed,
+          "...and the LAST one still signs in (provisional bind)")
+    now = time.time()
+    authserver.ISSUED_SESSION_KEYS.clear()
+    authserver.PROOF_HANDLES.clear()
+    for i in range(300):
+        k = i.to_bytes(24, "little")
+        authserver.ISSUED_SESSION_KEYS[k, "alice1"] = now - authserver.PROOF_TTL - 1
+        authserver.PROOF_HANDLES[k] = ("alice1", k, now - authserver.PROOF_TTL - 1)
+    live = b"\xaa" * 24
+    authserver.ISSUED_SESSION_KEYS[live, "alice1"] = now
+    authserver.PROOF_HANDLES[live] = ("alice1", live, now)
+    authserver.proofs_sweep(now, force=True)
+    check(list(authserver.ISSUED_SESSION_KEYS) == [(live, "alice1")]
+          and list(authserver.PROOF_HANDLES) == [live],
+          f"the sweep drops every key and handle older than PROOF_TTL "
+          f"({authserver.PROOF_TTL:.0f} s) and keeps the live pair")
+    check(authserver.session_key_is_ours("alice1", live)
+          and not authserver.session_key_is_ours("bob222", live),
+          "...and a live key is ours only for the account it was issued to")
+    authserver.ISSUED_SESSION_KEYS[live, "alice1"] = now - authserver.PROOF_TTL - 1
+    check(not authserver.session_key_is_ours("alice1", live),
+          "...and an expired key is refused at the bind even before a sweep")
+    cap = authserver.PROOFS_MAX
+    for i in range(cap + 10):
+        authserver.PROOF_HANDLES[i.to_bytes(24, "big")] = ("alice1", live, now)
+    authserver.proofs_sweep(now, force=True)
+    check(len(authserver.PROOF_HANDLES) == cap
+          and (cap + 9).to_bytes(24, "big") in authserver.PROOF_HANDLES,
+          f"past PROOFS_MAX={cap} the oldest handles go and the newest stay")
+    authserver.ISSUED_SESSION_KEYS.clear()
+    authserver.PROOF_HANDLES.clear()
 
     for c in (alice, bob, carol):
         c.close()

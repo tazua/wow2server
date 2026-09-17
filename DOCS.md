@@ -349,11 +349,14 @@ used.
 Discord being down costs nothing: the posting runs on its own thread, a
 request that fails is logged once a minute and the next session change
 repaints the whole board, a rate limit is waited out, and a webhook that
-answers 401 or 403 (deleted, or a wrong URL) turns the feature off for the
-run with one line in the log. A webhook URL is a secret — whoever holds it
-can post to the channel — so keep the config file to the operator.
+answers 401 or 403 (a wrong URL) or 404 (deleted on Discord's side; the
+pings webhook is checked at start, the board's at its first post) turns the
+feature off for the run with one line in the log that says which. Make a
+new webhook in the channel's *Integrations*, put its URL in `[discord]` and
+restart. A webhook URL is a secret — whoever holds it can post to the
+channel — so keep the config file to the operator.
 
-`lobbyboardtest.py` is the feature's own suite: 38 checks against a fake
+`lobbyboardtest.py` is the feature's own suite: 40 checks against a fake
 webhook endpoint in the same process, no Discord needed.
 
 ## Checks

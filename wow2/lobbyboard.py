@@ -274,6 +274,8 @@ class LobbyBoard:
 
     def _run(self) -> None:
         self._load_ids()
+        if self.announce_url:
+            self._call("GET", self.announce_url, None)    # a deleted webhook answers 404 now, not at the first lobby
         failed: tuple | None = None
         retry_at = 0.0
         while True:
@@ -370,7 +372,8 @@ class LobbyBoard:
     def _call(self, method: str, url: str, body: dict, retried: bool = False):
         if not self.enabled:
             return 0, None
-        req = urllib.request.Request(url, data=json.dumps(body).encode(), method=method,
+        req = urllib.request.Request(url, method=method,
+                                     data=None if body is None else json.dumps(body).encode(),
                                      headers={"Content-Type": "application/json",
                                               "User-Agent": "wow2-server lobbyboard"})
         try:
@@ -396,6 +399,12 @@ class LobbyBoard:
                 _log(f"!! discord: webhook {_id_in(url)} refused us ({e.code}); "
                      f"the URL is wrong or the webhook was deleted -- board off "
                      f"until restart")
+                self.enabled = False
+            elif e.code == 404 and method != "PATCH":
+                _log(f"!! discord: webhook {_id_in(url)} does not exist any more "
+                     f"(404 on {method}); it was deleted on Discord's side -- make a "
+                     f"new one, put its URL in [discord], restart. Board and pings "
+                     f"off until then")
                 self.enabled = False
             elif e.code != 404:
                 self._complain(f"discord: {method} to webhook {_id_in(url)} "

@@ -27,7 +27,7 @@ import store                                                    # noqa: E402
 RESULTS: list[tuple[bool, str]] = []
 LOGGED: list[str] = []
 
-BOARD_HOOK, LFG_HOOK, BAD_HOOK = "100100100", "200200200", "300300300"
+BOARD_HOOK, LFG_HOOK, BAD_HOOK, DEAD_HOOK = "100100100", "200200200", "300300300", "400400400"
 
 
 def check(cond: bool, what: str) -> bool:
@@ -49,6 +49,7 @@ class FakeDiscord:
         self.gone: set[str] = set()
         self.answer: list[int] = []
         self.refuse: set[str] = set()
+        self.dead: set[str] = set()
         self.delay = 0.0
         self.lock = threading.Lock()
         fake = self
@@ -69,6 +70,10 @@ class FakeDiscord:
                 hook = path.split("/api/webhooks/")[1].split("/")[0]
                 if hook in fake.refuse:
                     return self._reply(401, {"message": "401: Unauthorized", "code": 0})
+                if hook in fake.dead:
+                    return self._reply(404, {"message": "Unknown Webhook", "code": 10015})
+                if method == "GET":
+                    return self._reply(200, {"id": hook, "name": "Drill Sergeant"})
                 if forced == 429:
                     return self._reply(429, {"message": "You are being rate limited.",
                                              "retry_after": 0.2, "global": False})
@@ -97,6 +102,9 @@ class FakeDiscord:
 
             def do_PATCH(self):
                 self._serve("PATCH")
+
+            def do_GET(self):
+                self._serve("GET")
 
         self.srv = ThreadingHTTPServer(("127.0.0.1", 0), H)
         self.port = self.srv.server_address[1]
@@ -343,6 +351,26 @@ def run(keep: bool) -> int:
         check(not b4.enabled and len(fake.calls) == 1
               and any("refused us (401)" in m for m in LOGGED),
               "a webhook that answers 401 turns the board off after one call and one line")
+
+        fake.reset()
+        LOGGED.clear()
+        fake.dead.add(DEAD_HOOK)
+        b4 = board(fake, None, lobby=DEAD_HOOK, announce=None)
+        b4.flush(3)
+        b4.refresh(sessions)
+        b4.flush(3)
+        check(not b4.enabled and len(fake.calls) == 1
+              and any("does not exist any more (404 on POST)" in m for m in LOGGED),
+              "a board webhook deleted on Discord's side (404 on POST) turns the board "
+              "off after one call, with a line that says so")
+        fake.reset()
+        LOGGED.clear()
+        b4 = board(fake, None, lobby=BOARD_HOOK, announce=DEAD_HOOK)
+        b4.flush(3)
+        check(not b4.enabled and fake.of("GET", DEAD_HOOK) and not fake.of("POST")
+              and any("does not exist any more (404 on GET)" in m for m in LOGGED),
+              "...and a deleted PINGS webhook is found by a GET at start, before any lobby")
+        b4.stop(timeout=2)
 
         print("-- the poster's voice")
         sarge = {"announce_text": "{mention} Listen up! {name} opened a {mode} lobby, {count}. Move it!",

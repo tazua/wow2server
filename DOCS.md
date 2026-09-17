@@ -221,7 +221,18 @@ every account without a credential may sign in on one shared password
 anyone who knows a name is in. Leave it off.
 
 Back up the database (`wow2-db backup PATH`, safe while the server runs)
-before deleting anything. It is the only copy of every credential.
+before deleting anything. It is the only copy of every credential. On a
+system install run it as root (`sudo /opt/wow2-server/bin/wow2-db backup
+/var/backups/wow2.sqlite3`): the CLI hands the store's files back to the
+service user afterwards, and `/var/backups` is not writable by that user.
+
+To start over, stop the server and remove `wow2.sqlite3` (with its `-wal`
+and `-shm` files) and the `storage/` directory from the data directory; the
+next start makes an empty database. Every profile that has already been
+online then fails to sign in until `wow2-account set NAME` gives it a
+credential again, because the game creates an online account once and
+never again for that profile. To wipe the game and keep the accounts,
+delete from every table except `accounts`, `names` and `meta` instead.
 
 ## What the server stores
 

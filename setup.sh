@@ -252,7 +252,7 @@ if [ "$SYSTEM" = 1 ]; then
     note "data     $STATE"
     note "log      journalctl -u wow2-server -f"
     note "accounts sudo -u $SVC_USER $VENV/bin/wow2-account list"
-    note "backup   sudo -u $SVC_USER $VENV/bin/wow2-db backup /var/backups/wow2.sqlite3"
+    note "backup   sudo $VENV/bin/wow2-db backup /var/backups/wow2.sqlite3   (as root: /var/backups is not the service user's)"
     if [ -z "$DNS_ADDR" ]; then
         note "a retail PSP needs the DNS responder too:  sudo $0 --system --dns <this machine's public address>"
     fi

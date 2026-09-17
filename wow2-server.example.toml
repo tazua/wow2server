@@ -88,7 +88,12 @@ level = "info"
 # would have worked.
 relay = false
 
-# One port per console, so 32 is 16 simultaneous two-player matches.
+# One port per console ONLINE, not per match: a console holds its port from its
+# first packet until it has been silent for relay_idle_timeout, so 32 is 32
+# players signed in at once. A console that arrives when every port is taken is
+# handed its real address instead and plays direct, i.e. a symmetric-NAT player
+# fails to join exactly as if the relay were off -- so size this to the number
+# of players you expect online together, with room; an idle port costs nothing.
 #
 # ***OPEN THESE IN THE FIREWALL.*** They are as necessary as the main port and
 # nothing warns you: sign-in, hosting and the browser all work without them and

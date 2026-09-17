@@ -127,7 +127,7 @@ server prints what is in force at startup.
 | `logging.hexdumps` | `false` | dump every packet to the session log; hundreds of MB per session |
 | `limits.*` | 100 msg/s, 16 connections per address, 4 MB per connection | per-connection caps |
 | `nat.relay` | `false` | carry matches through the server; see below |
-| `nat.relay_port_base`, `nat.relay_ports` | `40000`, `32` | one UDP port per console, so 32 is 16 two-player matches |
+| `nat.relay_port_base`, `nat.relay_ports` | `40000`, `32` | one UDP port per console ONLINE (held until `relay_idle_timeout` of silence); a console that arrives when all are taken plays direct instead, so size it to the players you expect online together |
 | `nat.relay_idle_timeout` | `600` | seconds before an idle mailbox is reclaimed |
 | `nat.public_address` | unset | what to tell consoles the server's address is; set it behind a NAT or on a multi-homed host |
 | `nat.nat_type`, `nat.nat_type_alt_port` | `true`, `3078` | answer the NAT type probe; test 3's reply leaves from the alternate port |
@@ -274,7 +274,13 @@ symmetric. It costs about 7 datagrams per second each way per pair, roughly
 address a console publishes is decided at sign-in, before anyone knows
 whether a punch would have worked. The relay ports must be open in the
 firewall, and nothing warns you if they are not: sign-in, hosting and the
-browser all work and only the join fails.
+browser all work and only the join fails. `setup.sh --open-firewall` opens
+the range the config declares when it sees `relay = true`.
+
+What it costs: the match's own traffic, on the server, for every match. That
+is little bandwidth but it is the server's latency instead of the direct
+path's, and it makes the server part of the match: with the relay off a
+running match survives the server going away, with it on it does not.
 
 The NAT type probe needs no firewall rule of its own. All three tests arrive
 at the main port; the alternate port is only an address to answer from.

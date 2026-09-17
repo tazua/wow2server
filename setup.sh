@@ -223,7 +223,11 @@ fi
 PORTS="3074/tcp 3074/udp 3078/udp"
 [ -n "$DNS_ADDR" ] && PORTS="$PORTS 53/udp"
 if [ -f "${CONF}" ] && [ "$SYSTEM" = 1 ] && grep -qE '^\s*relay\s*=\s*true' "$CONF"; then
-    PORTS="$PORTS 40000-40031/udp"
+    # one UDP port per console online; the range follows the config's own values
+    RELAY_BASE=$(sed -nE 's/^\s*relay_port_base\s*=\s*([0-9]+).*/\1/p' "$CONF" | tail -1)
+    RELAY_N=$(sed -nE 's/^\s*relay_ports\s*=\s*([0-9]+).*/\1/p' "$CONF" | tail -1)
+    RELAY_BASE=${RELAY_BASE:-40000}; RELAY_N=${RELAY_N:-32}
+    PORTS="$PORTS ${RELAY_BASE}-$((RELAY_BASE + RELAY_N - 1))/udp"
 fi
 say "firewall"
 if [ "$OPEN_FW" = 1 ] && [ "$(id -u)" = 0 ]; then

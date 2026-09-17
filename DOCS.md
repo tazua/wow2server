@@ -74,6 +74,16 @@ The password's length is the defence. The game allows 6 to 12 characters;
 six digits fall in well under a second, twelve mixed characters do not
 fall. Tell your players.
 
+Names are first come, first served, and nothing needs a console to claim
+one: the create-account request is encrypted under a constant the game
+ships, this package carries it because the server decrypts with it, and
+`wow2.lsgauth` sends creates by script. A squatted name costs its owner a
+different profile name, and a script could otherwise file names as fast as
+the message caps allow, so `limits.max_creates_per_ip_per_hour` (20) holds
+each address to that many. A squatting run is visible after the fact in
+the `accounts` table (`first_seen`, `last_ip`), and `wow2-account remove
+NAME` frees a name.
+
 ### The lobby
 
 The LSG connection presents the proof in its first message (service 7). After
@@ -139,6 +149,7 @@ server prints what is in force at startup.
 | `logging.level` | `info` | `debug` logs every message body |
 | `logging.hexdumps` | `false` | dump every packet to the session log; hundreds of MB per session |
 | `limits.*` | 100 msg/s, 16 connections per address, 4 MB per connection | per-connection caps; flood protection, not a lockout (see Authentication) |
+| `limits.max_creates_per_ip_per_hour` | `20` | the next create-account from that address is answered 710 (*Unable to create online profile*) until the hour turns; `0` turns it off. A create for a name that already has a credential is answered 707 first, so a sign-in is never blocked by it |
 | `nat.relay` | `false` | carry matches through the server; see below |
 | `nat.relay_port_base`, `nat.relay_ports` | `40000`, `32` | one UDP port per console ONLINE (held until `relay_idle_timeout` of silence); a console that arrives when all are taken plays direct instead, so size it to the players you expect online together |
 | `nat.relay_idle_timeout` | `600` | seconds before an idle mailbox is reclaimed |
@@ -346,7 +357,7 @@ webhook endpoint.
 ```bash
 .venv/bin/python -m wow2.lsgauth      # the credential path, 22 checks
 .venv/bin/python -m wow2.blocktest    # a block stops all three invites, 7 checks
-.venv/bin/python -m wow2.ownertest    # identity, ownership, clans, storage, profiles, UDP, relay and login-table bounds, 63 checks
+.venv/bin/python -m wow2.ownertest    # identity, ownership, clans, storage, profiles, UDP, relay and login-table bounds, the create limit, 69 checks
 .venv/bin/python -m wow2.storetest    # the SQLite store: the import keeps everything, the rules hold, 29 checks
 .venv/bin/python -m wow2.lobbyboardtest   # the Discord board: what it posts, coalescing, Discord down, 38 checks
 .venv/bin/python -m wow2.loadtest --consoles 32 --lifetime 200   # capacity, see below

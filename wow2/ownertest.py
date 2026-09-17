@@ -26,7 +26,8 @@ HERE = Path(__file__).resolve().parent
 sys.path.insert(0, str(HERE))
 
 import bdproto as bd                                                # noqa: E402
-from lsgauth import Peer, bufsize_announce, lsg_connect, login, present, tiger192  # noqa: E402
+from lsgauth import (Peer, bufsize_announce, create_account, lsg_connect,  # noqa: E402
+                     login, present, tiger192)
 from blocktest import (Console as _Console, _rpc, encrypt_rpc,      # noqa: E402
                        req_buddy_invite, req_clan_invite, PASSWORD)
 
@@ -389,7 +390,8 @@ class Server:
                    WOW2_SHARED_PASSWORD_FALLBACK="false",
                    WOW2_NO_NAT_TYPE="1",
                    WOW2_NAT_RELAY="0",
-                   WOW2_PROOFS_MAX="50")
+                   WOW2_PROOFS_MAX="50",
+                   WOW2_MAX_CREATES_PER_IP_PER_HOUR="3")
         if revert:
             env["WOW2_LEARN_ACCOUNT_ID"] = "1"
             env["WOW2_NO_SESSION_OWNER"] = "1"
@@ -475,6 +477,15 @@ def store_row(tmp: Path, sql: str, args=()):
     conn = store.connect(tmp / store.DB_NAME)
     try:
         return conn.execute(sql, args).fetchone()
+    finally:
+        conn.close()
+
+
+def store_rows(tmp: Path, sql: str, args=()) -> list:
+    import store
+    conn = store.connect(tmp / store.DB_NAME)
+    try:
+        return conn.execute(sql, args).fetchall()
     finally:
         conn.close()
 
@@ -899,6 +910,40 @@ def run_server_checks(tmp: Path, srv: Server, check: Checks) -> None:
           f"past PROOFS_MAX={cap} the oldest handles go and the newest stay")
     authserver.ISSUED_SESSION_KEYS.clear()
     authserver.PROOF_HANDLES.clear()
+
+    # ------------------------------------------------------------ creates
+    print("\n-- creates: one address registering names by script")
+    codes = [create_account("127.0.0.1", PORT, f"squat0{i}", PASSWORD) for i in range(1, 5)]
+    check(codes == [700, 700, 700, 710],
+          "with WOW2_MAX_CREATES_PER_IP_PER_HOUR=3 the fourth create in an hour is "
+          "answered 710 (the client draws 'Unable to create online profile')",
+          f"codes={codes}")
+    names = {r[0] for r in store_rows(tmp, "SELECT name FROM accounts WHERE name LIKE 'squat%'")}
+    check(names == {"squat01", "squat02", "squat03"},
+          "...and the store holds the three that were allowed", f"names={sorted(names)}")
+    code = create_account("127.0.0.1", PORT, "alice1", PASSWORD)
+    check(code == 707,
+          "...while a create for a name that already has a credential is still 707, "
+          "so the limit never blocks the sign-in it re-issues as", f"code={code}")
+    now = time.time()
+    authserver.CREATES_PER_IP.clear()
+    authserver.serverconfig.MAX_CREATES_PER_IP_PER_HOUR = 3
+    authserver.CREATES_PER_IP["10.9.9.9"] = [now - 3599, now - 1800, now - 10]
+    check(not authserver.create_allowed("10.9.9.9", now)
+          and authserver.create_allowed("10.9.9.9", now + 2),
+          "in-process: three creates inside the hour refuse a fourth; the oldest "
+          "leaving the window allows it")
+    authserver.CREATES_PER_IP.clear()
+    for i in range(authserver.CREATES_ADDRESSES_MAX + 5):
+        authserver.CREATES_PER_IP[f"10.0.{i >> 8}.{i & 255}"] = [now - 3700]
+    authserver.create_allowed("10.255.255.255", now)
+    check(len(authserver.CREATES_PER_IP) == 1,
+          f"...and past {authserver.CREATES_ADDRESSES_MAX} addresses the ones with "
+          f"nothing inside the hour are dropped ({len(authserver.CREATES_PER_IP)} kept)")
+    authserver.serverconfig.MAX_CREATES_PER_IP_PER_HOUR = 0
+    check(authserver.create_allowed("10.9.9.9", now) and not authserver.CREATES_PER_IP.get("10.9.9.9"),
+          "...and 0 turns the limit off without counting")
+    authserver.CREATES_PER_IP.clear()
 
     for c in (alice, bob, carol):
         c.close()

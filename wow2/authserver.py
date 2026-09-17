@@ -1353,6 +1353,32 @@ def stored_credential(username: str) -> bytes | None:
     return None
 
 
+CREATES_PER_IP: dict[str, list[float]] = {}
+CREATES_WINDOW = 3600.0
+CREATES_ADDRESSES_MAX = 65536
+
+
+def create_allowed(peer_ip: str, now: float | None = None) -> bool:
+    """May this address create one more account? Counted only when it does."""
+    limit = serverconfig.MAX_CREATES_PER_IP_PER_HOUR
+    if limit <= 0:
+        return True
+    now = time.time() if now is None else now
+    recent = [t for t in CREATES_PER_IP.get(peer_ip, ()) if now - t < CREATES_WINDOW]
+    if len(recent) >= limit:
+        CREATES_PER_IP[peer_ip] = recent
+        return False
+    recent.append(now)
+    CREATES_PER_IP.pop(peer_ip, None)    # re-insert: the dict's order is last-create order
+    CREATES_PER_IP[peer_ip] = recent
+    if len(CREATES_PER_IP) > CREATES_ADDRESSES_MAX:
+        for ip in [ip for ip, ts in CREATES_PER_IP.items() if now - ts[-1] >= CREATES_WINDOW]:
+            del CREATES_PER_IP[ip]
+        while len(CREATES_PER_IP) > CREATES_ADDRESSES_MAX:
+            del CREATES_PER_IP[next(iter(CREATES_PER_IP))]
+    return True
+
+
 def note_account(username: str, password_hash: bytes, peer_ip: str) -> None:
     """Record an account the client just created."""
     if os.environ.get("WOW2_NO_ACCOUNT_STORE") == "1":
@@ -3560,6 +3586,13 @@ class AuthConnection(asyncio.Protocol):
                 if taken:
                     log(f"     ({name!r} will now be retried as a sign-in; it "
                         f"succeeds only for whoever set that password)")
+            elif name and not create_allowed(self.peer_ip):
+                reply = build_auth_reply(AUTH_CREATE_ACCOUNT_REPLY,
+                                         BD_AUTH_CREATE_MAX_ACC_EXCEEDED)
+                log(f"  -> send CreateAccountReply (0x01, error 710 max-accounts; "
+                    f"{self.peer_ip} has already created "
+                    f"{serverconfig.MAX_CREATES_PER_IP_PER_HOUR} online profiles "
+                    f"this hour, limits.max_creates_per_ip_per_hour) {len(reply)}B")
             else:
                 if name:
                     note_account(name, req["password_hash"], self.peer_ip)

@@ -45,6 +45,7 @@ DEFAULTS: dict[str, dict] = {
         "max_msgs_per_sec": 100,
         "max_conns_per_ip": 16,
         "max_stream_bytes": 4 * 1024 * 1024,
+        "max_creates_per_ip_per_hour": 20,
     },
     "nat": {
         "relay": False,
@@ -142,6 +143,7 @@ _ENV = {
     ("limits", "max_msgs_per_sec"): ("WOW2_MAX_MSGS_PER_SEC", int),
     ("limits", "max_conns_per_ip"): ("WOW2_MAX_CONNS_PER_IP", int),
     ("limits", "max_stream_bytes"): ("WOW2_MAX_STREAM_BYTES", int),
+    ("limits", "max_creates_per_ip_per_hour"): ("WOW2_MAX_CREATES_PER_IP_PER_HOUR", int),
     ("nat", "relay"): ("WOW2_NAT_RELAY", lambda v: v not in ("0", "false", "no", "off")),
     ("nat", "public_address"): ("WOW2_RELAY_PUBLIC_ADDRESS", str),
     ("nat", "relay_port_base"): ("WOW2_RELAY_PORT_BASE", int),
@@ -178,6 +180,7 @@ DATA_DIR = Path(get("storage", "data_dir"))
 MAX_MSGS_PER_SEC = int(get("limits", "max_msgs_per_sec"))
 MAX_CONNS_PER_IP = int(get("limits", "max_conns_per_ip"))
 MAX_STREAM_BYTES = int(get("limits", "max_stream_bytes"))
+MAX_CREATES_PER_IP_PER_HOUR = int(get("limits", "max_creates_per_ip_per_hour"))
 NAT_RELAY = bool(get("nat", "relay"))
 NAT_TYPE = bool(get("nat", "nat_type"))
 NAT_TYPE_ALT_PORT = int(get("nat", "nat_type_alt_port"))
@@ -245,7 +248,9 @@ def describe() -> str:
             f"{STARTING_RATING} (stakes {max(1, STARTING_RATING // 10)})\n"
             + f"  limits: {MAX_MSGS_PER_SEC} msg/s per conn, "
             f"{MAX_CONNS_PER_IP} conns per address, "
-            f"{MAX_STREAM_BYTES // 1024} KB per conn\n"
+            f"{MAX_STREAM_BYTES // 1024} KB per conn, "
+            + (f"{MAX_CREATES_PER_IP_PER_HOUR} new accounts per address per hour\n"
+               if MAX_CREATES_PER_IP_PER_HOUR else "new accounts per address unlimited\n")
             + _discord_line().rstrip("\n")
             + "".join(f"\n  !! config: unknown key {k} -- ignored"
                       for k in unknown_keys()))

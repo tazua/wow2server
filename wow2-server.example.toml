@@ -68,6 +68,24 @@ hexdumps = false
 # and every reply -- ten times the volume, and what a bug report wants.
 level = "info"
 
+[limits]
+# The caps a peer runs into, each per connection or per address, and each
+# closing only the offender's own connection: messages a second on one
+# connection, open connections from one address, bytes over one connection's
+# life. They are flood protection. They are not a lockout, and none is
+# possible: the server never sees a wrong password (DOCS.md, Authentication).
+# max_msgs_per_sec = 100
+# max_conns_per_ip = 16
+# max_stream_bytes = 4194304
+#
+# Anyone with this package can send a create-account by script, and names are
+# first come, first served. After this many new accounts from one address in
+# a sliding hour the next one is answered 710, which the game draws as
+# "Unable to create online profile". A create for a name that already has a
+# credential is answered 707 first, so a sign-in is never blocked by it.
+# 0 turns it off.
+# max_creates_per_ip_per_hour = 20
+
 [nat]
 # Carry the peer session through the server instead of relying on a NAT punch.
 #

@@ -105,6 +105,26 @@ def _merged() -> dict[str, dict]:
 
 _CFG = _merged()
 
+
+def unknown_keys() -> list[str]:
+    """Keys in the config file that no setting reads, each with its nearest
+    real name; a misspelt key is otherwise a setting silently left at default."""
+    import difflib
+    out = []
+    for section, values in _FILE.items():
+        if not isinstance(values, dict):
+            out.append(f"{section} (not a section)")
+            continue
+        known = DEFAULTS.get(section)
+        if known is None:
+            out.append(f"[{section}] (not a section this server reads)")
+            continue
+        for key in values:
+            if key not in known:
+                near = difflib.get_close_matches(key, list(known), n=1, cutoff=0.6)
+                out.append(f"{section}.{key}" + (f" (did you mean {near[0]}?)" if near else ""))
+    return out
+
 _ENV = {
     ("server", "bind"): ("WOW2_BIND", str),
     ("server", "port"): ("WOW2_PORT", int),
@@ -220,7 +240,9 @@ def describe() -> str:
             + f"  limits: {MAX_MSGS_PER_SEC} msg/s per conn, "
             f"{MAX_CONNS_PER_IP} conns per address, "
             f"{MAX_STREAM_BYTES // 1024} KB per conn\n"
-            + _discord_line().rstrip("\n"))
+            + _discord_line().rstrip("\n")
+            + "".join(f"\n  !! config: unknown key {k} -- ignored"
+                      for k in unknown_keys()))
 
 
 if __name__ == "__main__":

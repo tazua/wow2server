@@ -23,7 +23,7 @@ import serverconfig                                             # noqa: E402
 from tiger import tiger192                                      # noqa: E402
 
 DB_NAME = "wow2.sqlite3"
-SCHEMA_VERSION = 1
+SCHEMA_VERSION = 2
 
 STORES: dict[str, str] = {
     "accounts": "accounts.json",
@@ -220,9 +220,38 @@ def connect(db_path: Path | str) -> sqlite3.Connection:
     with tx(conn):
         for statement in _statements(SCHEMA):
             conn.execute(statement)
+        if 0 < version < 2:
+            _rehandle(conn)
         if version < SCHEMA_VERSION:
             meta_set(conn, "schema_version", str(SCHEMA_VERSION))
     return conn
+
+
+def _rehandle(conn: sqlite3.Connection) -> None:
+    """Schema 1 -> 2: handles were Tiger192 of the name AS TYPED; the client
+    hashes it lowercased, so a name with a capital letter could never sign in.
+    Recompute every handle; where two rows differ only by case, the one whose
+    old handle already matched the derivation is the one that ever worked.
+    """
+    rows = conn.execute("SELECT name, handle FROM accounts").fetchall()
+    by_new: dict[str, list] = {}
+    for r in rows:
+        by_new.setdefault(account_handle(r["name"]), []).append(r)
+    for new, group in by_new.items():
+        if len(group) > 1:
+            keep = next((r for r in group if r["handle"] == new), group[0])
+            for r in group:
+                if r is not keep:
+                    conn.execute("DELETE FROM accounts WHERE name = ?", (r["name"],))
+                    print(f"  !! store: accounts {r['name']!r} and {keep['name']!r} are one "
+                          f"account to the client (same lowercased name); {r['name']!r} "
+                          f"could never sign in and is dropped", flush=True)
+            group = [keep]
+        r = group[0]
+        if r["handle"] != new:
+            conn.execute("UPDATE accounts SET handle = ? WHERE name = ?", (new, r["name"]))
+            print(f"  store: account {r['name']!r} handle {r['handle']} -> {new} "
+                  f"(the client hashes the lowercased name)", flush=True)
 
 
 def _statements(script: str) -> list[str]:
@@ -321,9 +350,14 @@ def entity_hex(entity: int) -> str:
     return f"{int(entity):016x}"
 
 
+def canonical_name(name: str) -> str:
+    """The name as the client hashes it: ASCII-lowercased (§71d)."""
+    return name.encode().lower().decode()
+
+
 def account_handle(name: str) -> str:
-    """Tiger192(name)[:8], hex -- the 8 bytes a login request carries."""
-    return tiger192(name.encode())[:8].hex()
+    """Tiger192(lowercased name)[:8], hex -- the 8 bytes a login request carries."""
+    return tiger192(canonical_name(name).encode())[:8].hex()
 
 
 def now_iso() -> str:

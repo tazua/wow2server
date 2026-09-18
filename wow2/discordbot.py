@@ -14,17 +14,17 @@ steps to sign in and change it, pictures included. A name that already has a
 password is refused unless the same Discord user set it through this bot;
 `/recover NAME PASSWORD` is for a password the game will not take any more
 (one changed in the game to more than 12 characters, which the game allows
-and then refuses at sign-in, or a mistyped one): the password on file, or
-the one before it within seven days, proves the account and earns a fresh
-one. `/reset NAME @player` (staff) resets any name and sends the kit to
-that player; `/account NAME` (staff) says what the store holds. DOCS.md
-"Discord" is the operator's side, discord/README.md step 9 the setup.
+and then refuses at sign-in): the password on file proves the account and
+earns a fresh one -- no more than the game's own change screen lets whoever
+knows it do. A mistyped one is staff's: `/reset NAME @player` resets any
+name and sends the kit to that player; `/account NAME` (staff) says what
+the store holds. DOCS.md "Discord" is the operator's side,
+discord/README.md step 9 the setup.
 """
 from __future__ import annotations
 
 import argparse
 import concurrent.futures
-import datetime
 import enum
 import functools
 import os
@@ -51,7 +51,6 @@ PASSWORD_LENGTH = 8
 NAME_RE = re.compile(r"^[A-Za-z0-9]{6,12}$")
 LOOSE_NAME_RE = re.compile(r"^[A-Za-z0-9]{1,16}$")
 DAY = 86400.0
-RECOVER_WINDOW = 7 * DAY      # how long the password before the last change still proves the account
 RECOVER_TRIES_PER_HOUR = 5
 
 DEFAULT_TEXT = """\
@@ -84,8 +83,8 @@ for a password and goes straight to that error, it has an old one saved: Edit \
 profile → *Save password* → Off, *Apply Changes and Exit*, and try again. Lost \
 the new password? `/claim {name}` again. Set one in the game that it now \
 refuses (13 characters or more: the game lets you set it, then will not take \
-it)? `/recover {name}` with that password, or with the one before it within \
-7 days. Anything else: {help}.
+it)? `/recover {name}` with that password. Mistyped the new one? Ask staff in \
+{help}. Anything else: {help}.
 
 The pictures, in order: the Infrastructure menu, the password prompt, Edit \
 profile, Change password.
@@ -178,8 +177,8 @@ class Desk:
     def holder(handle: str):
         """(accounts row, discord_claims row) for a handle, either None."""
         conn = store.db()
-        acct = conn.execute("SELECT name, pwhash, user_id, last_seen, prev_pwhash, prev_at "
-                            "FROM accounts WHERE handle = ?", (handle,)).fetchone()
+        acct = conn.execute("SELECT name, pwhash, user_id, last_seen FROM accounts "
+                            "WHERE handle = ?", (handle,)).fetchone()
         bound = conn.execute("SELECT user_id, name, at FROM discord_claims WHERE handle = ?",
                              (handle,)).fetchone()
         return acct, bound
@@ -231,8 +230,7 @@ class Desk:
         return self._issue(name, str(user_id), kind)
 
     def recover(self, name: str, user_id, password: str) -> Result:
-        """A player proves the account with its password -- the one on file, or
-        the one before it if that changed within RECOVER_WINDOW -- and gets a
+        """A player proves the account with the password on file and gets a
         fresh one. Every try counts against RECOVER_TRIES_PER_HOUR."""
         name = name.strip()
         user_id = str(user_id)
@@ -248,15 +246,7 @@ class Desk:
         if len(tries) >= RECOVER_TRIES_PER_HOUR:
             return Result(Outcome.TOO_MANY, name, detail="tries")
         tries.append(now)
-        digest = srv.tiger192(password.encode()).hex()
-        ok = digest == acct["pwhash"]
-        if not ok and acct["prev_pwhash"] and acct["prev_at"]:
-            try:
-                since = datetime.datetime.fromisoformat(acct["prev_at"]).timestamp()
-            except ValueError:
-                since = 0.0
-            ok = digest == acct["prev_pwhash"] and now - since < RECOVER_WINDOW
-        if not ok:
+        if srv.tiger192(password.encode()).hex() != acct["pwhash"]:
             return Result(Outcome.WRONG, acct["name"])
         return self._issue(name, user_id, Outcome.RESET)
 
@@ -342,9 +332,9 @@ async def do_recover(desk: Desk, ctx: Ctx, name: str, password: str) -> str:
     if r.outcome is Outcome.RESET:
         return await _hand_over(ctx, r, to=ctx.user_id)
     if r.outcome is Outcome.WRONG:
-        text = (f"That is not the password on file for **{r.name}**, nor the one before it "
-                f"from the last 7 days. {RECOVER_TRIES_PER_HOUR} tries an hour; if it is "
-                f"your profile and the password is gone, ask in {ctx.help_mention}.")
+        text = (f"That is not the password on file for **{r.name}**. {RECOVER_TRIES_PER_HOUR} "
+                f"tries an hour; if it is your profile and the password is gone, ask staff "
+                f"in {ctx.help_mention}.")
     elif r.outcome is Outcome.UNREGISTERED:
         text = f"**{r.name}** has no password on {ctx.server} yet; `/claim {r.name}` is the way in."
     elif r.outcome is Outcome.TOO_MANY:
@@ -515,7 +505,7 @@ def run_bot(token: str, guild_id: int, desk: Desk, admin_roles: list[str],
     @tree.command(name="recover", description="The game refuses the password you set? "
                                               "Prove it here and get a fresh one by DM")
     @app_commands.describe(name="your profile name",
-                           password="the password on file, or the one before it (last 7 days)")
+                           password="the password on file, the one the game refuses")
     async def recover(interaction, name: str, password: str):
         await interaction.response.defer(ephemeral=True, thinking=True)
         await do_recover(desk, InteractionCtx(interaction), name, password)

@@ -197,35 +197,17 @@ def run(keep: bool) -> int:
     print("recover: a password the game will not take any more")
     srv.set_account_password("changed1", srv.tiger192(b"oldpass1"))
     srv.set_account_password("changed1", srv.tiger192(b"abcdefghijklmn"))    # the in-game change to 14
-    row = store.db().execute("SELECT pwhash, prev_pwhash, prev_at FROM accounts WHERE name = 'changed1'").fetchone()
-    check(row["pwhash"] == digest("abcdefghijklmn") and row["prev_pwhash"] == digest("oldpass1")
-          and row["prev_at"], "a password change keeps the digest before it, with when")
-    srv.set_account_password("changed1", srv.tiger192(b"abcdefghijklmn"))
-    row2 = store.db().execute("SELECT prev_pwhash, prev_at FROM accounts WHERE name = 'changed1'").fetchone()
-    check(tuple(row2) == (row["prev_pwhash"], row["prev_at"]),
-          "...and writing the same digest again does not move it")
     r = desk.recover("changed1", P, "nope1234")
     check(r.outcome is bot.Outcome.WRONG and pwhash("changed1") == digest("abcdefghijklmn")
           and bound_to("changed1") is None, "a wrong password: refused, nothing changes")
+    r = desk.recover("changed1", P, "oldpass1")
+    check(r.outcome is bot.Outcome.WRONG and pwhash("changed1") == digest("abcdefghijklmn"),
+          "the password BEFORE the change proves nothing: a change is a change")
     r = desk.recover("CHANGED1", P, "abcdefghijklmn")
     check(r.outcome is bot.Outcome.RESET and r.password and pwhash("changed1") == digest(r.password)
           and bound_to("changed1") == P and len(r.password) == 8,
           "the 14-character password the game refuses proves the account: a fresh 8-character "
           "one, the name bound to the player")
-    srv.set_account_password("changed2", srv.tiger192(b"oldpass2"))
-    srv.set_account_password("changed2", srv.tiger192(b"typo"))
-    r = desk.recover("changed2", P, "oldpass2")
-    check(r.outcome is bot.Outcome.RESET and pwhash("changed2") == digest(r.password),
-          "the password BEFORE a mistyped change proves it too, within the window")
-    srv.set_account_password("changed3", srv.tiger192(b"oldpass3"))
-    srv.set_account_password("changed3", srv.tiger192(b"typo"))
-    with store.tx() as conn:
-        conn.execute("UPDATE accounts SET prev_at = '2020-01-01T00:00:00' WHERE name = 'changed3'")
-    r = desk.recover("changed3", P, "oldpass3")
-    check(r.outcome is bot.Outcome.WRONG and pwhash("changed3") == digest("typo"),
-          "...but not once the change is older than a week")
-    check(desk.recover("changed3", P, "typo").outcome is bot.Outcome.RESET,
-          "...while the password on file always does")
     check(desk.recover("nobody99", P, "whatever").outcome is bot.Outcome.UNREGISTERED,
           "a name with no password on file is pointed at /claim, and the try is free")
     fresh = bot.Desk(claims_per_day=0, rng=random.Random(3), clock=clock)
@@ -259,7 +241,7 @@ def run(keep: bool) -> int:
     check("not a profile name" in text and "6 to 12" in text, "/claim on a bad name says the rule")
 
     ctx = FakeCtx(Q)
-    text = asyncio.run(bot.do_recover(desk, ctx, "changed2", "wrong"))
+    text = asyncio.run(bot.do_recover(desk, ctx, "changed1", "wrong"))
     check("not the password on file" in text and "<#555>" in text and not ctx.dms,
           "/recover with a wrong password: refused, pointed at the help channel")
     ctx = FakeCtx(Q)

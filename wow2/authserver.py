@@ -1408,10 +1408,13 @@ def _write_credential(conn, username: str, password_hash: bytes, peer_ip: str) -
     handle = account_handle(username).hex()
     have = conn.execute("SELECT name FROM accounts WHERE handle = ?", (handle,)).fetchone()
     name = have["name"] if have else username    # the case it was first registered in is what others see
+    changed = "accounts.pwhash IS NOT NULL AND accounts.pwhash IS NOT excluded.pwhash"
     conn.execute(
         "INSERT INTO accounts (name, pwhash, handle, user_id, first_seen, last_seen, last_ip) "
         "VALUES (?, ?, ?, ?, ?, ?, ?) "
         "ON CONFLICT (name) DO UPDATE SET pwhash = excluded.pwhash, "
+        f"prev_pwhash = CASE WHEN {changed} THEN accounts.pwhash ELSE accounts.prev_pwhash END, "
+        f"prev_at = CASE WHEN {changed} THEN excluded.last_seen ELSE accounts.prev_at END, "
         "handle = excluded.handle, last_seen = excluded.last_seen, "
         "last_ip = COALESCE(excluded.last_ip, accounts.last_ip), "
         "user_id = COALESCE(accounts.user_id, excluded.user_id)",

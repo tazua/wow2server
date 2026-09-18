@@ -181,6 +181,15 @@ CREATE TABLE IF NOT EXISTS pots (
     doc     TEXT NOT NULL);
 CREATE UNIQUE INDEX IF NOT EXISTS pots_live ON pots (session) WHERE state != 'settled';
 CREATE INDEX IF NOT EXISTS pots_state ON pots (state);
+
+-- Which Discord user set a name's password through the bot (discordbot.py),
+-- so that the same person may reset it again. Additive: a server that
+-- predates it ignores the table, so the schema version did not move.
+CREATE TABLE IF NOT EXISTS discord_claims (
+    handle  TEXT PRIMARY KEY,
+    user_id TEXT NOT NULL,
+    name    TEXT NOT NULL,
+    at      TEXT NOT NULL);
 """
 
 

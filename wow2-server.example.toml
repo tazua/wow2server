@@ -252,3 +252,35 @@ offline_text = ""
 # nobody), so a host who opens a friendly lobby, quits and opens a ranked one
 # pages the role once and the message still reads as open. 0 pings every time.
 announce_cooldown = 300
+
+# ---- THE PASSWORD BOT (wow2-discordbot) ----
+# A profile that has ever been online sends a sign-in and never a create, and
+# a sign-in carries a hash of the name and nothing else -- so a server that
+# never saw the create (a memory stick from the original servers, a profile
+# from before a wipe) holds no credential for it and cannot make one; the
+# player sees "The online profile name or password is incorrect". The bot is
+# the counter for that: `/claim NAME` in the community Discord sets a random
+# password for a name the server does not hold and sends it to the player by
+# DM with the steps to sign in and change it, pictures included. A name that
+# has a password is refused unless the same person set it through the bot;
+# `/reset NAME @player` (staff) resets any name and DMs that player;
+# `/account NAME` (staff) says what the store holds.
+#
+# It is a separate process (`wow2-discordbot`, its own systemd unit) that
+# shares the data directory; it needs the setup bot's token in the environment
+# as DISCORD_BOT_TOKEN (never here: /etc/wow2-server.env on a system install)
+# and the application added to the server with the `applications.commands`
+# scope (discord/README.md step 9 in the source repository). 0 turns it off.
+#
+# bot_guild:          the server's id (Developer Mode > right-click the server > Copy Server ID)
+# bot_admin_roles:    who may /reset and /account (by role name; Manage Server always may)
+# bot_help_channel:   where a refused player is sent (a channel name; the
+#                     emoji a setup put in front of it does not matter)
+# bot_claims_per_day: passwords one person may be given per day; 0 = no limit
+# bot_text:           the DM, as a template with {name} {password} {server}
+#                     {help}; empty for the built-in wording. Discord markdown.
+bot_guild = 0
+bot_admin_roles = ["Admin", "Moderator"]
+bot_help_channel = "connection-help"
+bot_claims_per_day = 3
+bot_text = ""

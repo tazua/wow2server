@@ -24,6 +24,11 @@ classifiers = [
 # there is no system dependency at all.
 dependencies = ["pycryptodome>=3.19"]
 
+[project.optional-dependencies]
+# The password bot (wow2-discordbot) talks to Discord's gateway; the server
+# itself needs none of it.
+bot = ["discord.py>=2.4"]
+
 [project.urls]
 Homepage = "https://github.com/tazua/wow2server"
 
@@ -40,6 +45,9 @@ wow2-account = "wow2.accountcli:main"
 # The SQLite store's door (§66): integrity check, JSON import/export, a
 # consistent backup while the server runs, and the import/export round trip.
 wow2-db = "wow2.dbcli:main"
+# The Discord bot that hands a player a password for a profile the server has
+# never seen (an old memory stick, a wipe); a name-hash is all a sign-in carries.
+wow2-discordbot = "wow2.discordbot:cli"
 
 # The modules live in tools/ and import each other flatly (each one puts its own
 # directory on sys.path first), so they install as a package directory without
@@ -53,4 +61,4 @@ wow2-db = "wow2.dbcli:main"
 packages = ["wow2"]
 
 [tool.setuptools.package-data]
-wow2 = ["nsdns-names"]
+wow2 = ["nsdns-names", "guide/*.png"]

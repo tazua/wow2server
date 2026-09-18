@@ -192,6 +192,8 @@ server prints what is in force at startup.
 | `discord.title` | `Open lobbies` | the board's heading |
 | `discord.announce_text`, `closed_text`, `empty_text`, `offline_text` | built-in wording | templates for what the poster says; the example file lists each one's fields |
 | `discord.announce_cooldown` | `300` | seconds before the same host name pings again; inside it a new lobby edits the previous announcement back to open |
+| `discord.bot_guild` | `0` (off) | the Discord server id the password bot (`wow2-discordbot`) serves; the token comes from the environment. See Discord |
+| `discord.bot_admin_roles`, `bot_help_channel`, `bot_claims_per_day`, `bot_text` | `["Admin", "Moderator"]`, `connection-help`, `3`, built-in wording | who may `/reset`, where a refused player is sent, passwords per person per day (`0` = no limit), the DM as a template (`{name} {password} {server} {help}`) |
 
 The `WOW2_*` environment variables beyond those are not configuration. Each
 switches one behaviour back to an older one so a protocol failure can be
@@ -244,6 +246,14 @@ wow2-account handle <name>     # the handle a name produces, to match against th
 wow2-account set <name>        # prompts for the password, stores the digest
 wow2-account remove <name>     # forget a credential
 ```
+
+A profile from the **original Demonware servers** is the same case: it
+has been online, so it sends a sign-in and never a create, and this server
+has never seen its name. The player sees the same "incorrect" dialog and the
+log the same `is not an account we know`. The operator's way in is the
+command above; the way that needs no operator is the Discord password bot
+below, which does the same `set` on request and sends the player the
+password.
 
 `shared_password_fallback = true` is the stopgap for exactly that migration:
 every account without a credential may sign in on one shared password
@@ -389,17 +399,71 @@ new webhook in the channel's *Integrations*, put its URL in `[discord]` and
 restart. A webhook URL is a secret — whoever holds it can post to the
 channel — so keep the config file to the operator.
 
-`lobbyboardtest.py` is the feature's own suite: 40 checks against a fake
+`lobbyboardtest.py` is the feature's own suite: 43 checks against a fake
 webhook endpoint in the same process, no Discord needed.
+
+### The password bot
+
+A profile that has ever been online never sends its name again, only a
+hash of it (see Accounts), so a server that did not see that profile's
+create — a memory stick from the original servers, or a profile from
+before a wipe — cannot let it in on its own. `wow2-discordbot` is the
+counter for that: a bot in the community Discord that hands a player a
+temporary password for a profile name the server does not hold.
+
+- `/claim NAME` — anyone. If the server has no password for that name,
+  a random one is set (8 characters, letters and digits that cannot be
+  misread, typeable on the PSP keyboard) and sent to the player **by DM**
+  with the steps to sign in and change it and four pictures of the
+  screens; if their privacy settings refuse DMs, the same comes back in a
+  reply only they can see. The name is then bound to that Discord user:
+  a second `/claim` from them resets it again, a `/claim` from anyone
+  else is refused. A name registered from a console is nobody's to claim.
+  The game's own rule for a name applies (6 to 12 letters and digits) and
+  each person gets `bot_claims_per_day` passwords a day. A one-word DM to
+  the bot does the same as `/claim`.
+- `/reset NAME @player` — staff (a role named in `bot_admin_roles`, or
+  Manage Server): a new password for any name, sent to that player by DM
+  and bound to them; the name-length rule is waived, for a name an edited
+  savedata carries. Discord hides the command from members; a Moderator
+  without Manage Server sees it once you allow it under *Server Settings →
+  Integrations → the application*.
+- `/account NAME` — staff: registered or not, the handle the log prints,
+  the user id, last seen, who set the password through the bot and when.
+
+It is a separate process that shares the data directory with the server
+(the row it writes is the one `wow2-account set` writes, read at the next
+sign-in) and needs three things: `pip install .[bot]` (discord.py;
+`setup.sh` does it), the setup bot's token in the environment as
+`DISCORD_BOT_TOKEN` — never in the config file — and `bot_guild` in
+`[discord]`, the Discord server's id. On a system install the token goes
+in `/etc/wow2-server.env`, one line, mode 600:
+
+```bash
+sudo sh -c 'umask 077; printf "DISCORD_BOT_TOKEN=%s\n" "PASTE-THE-TOKEN" > /etc/wow2-server.env'
+sudo ./setup.sh --system        # installs and starts wow2-discordbot once that file exists
+journalctl -u wow2-discordbot -f
+```
+
+The application must have been added to the server with the
+`applications.commands` scope as well as `bot`; one added with `bot`
+alone gets a line in the log with the URL to open once (signed in to
+Discord, pick the server — it adds the scope and removes nothing), then
+restart the unit. Without the env file the unit does not start at all,
+so an install that has no Discord needs nothing. The bot never logs a
+password. `bot_text` replaces the DM's wording with a template
+(`{name}`, `{password}`, `{server}`, `{help}`), checked at start like the
+board's texts. `discordbottest.py` is its suite: 42 checks, no Discord.
 
 ## Checks
 
-Five suites ship with the server. Three start their own server on a spare
+Six suites ship with the server. Three start their own server on a spare
 port with a scratch data directory, so they can run on an installed copy
 without touching its data, and each of those has a `--revert` that runs
 against the older behaviour and must fail; the fourth exercises the store
 module on a scratch directory, the fifth the Discord board against a fake
-webhook endpoint.
+webhook endpoint, the sixth the password bot's desk and commands with no
+Discord at all.
 
 ```bash
 .venv/bin/python -m wow2.lsgauth      # the credential path, 27 checks
@@ -407,6 +471,7 @@ webhook endpoint.
 .venv/bin/python -m wow2.ownertest    # identity, ownership, clans, storage, profiles, UDP, relay and login-table bounds, the create limit, 72 checks
 .venv/bin/python -m wow2.storetest    # the SQLite store: the import keeps everything, the rules hold, 33 checks
 .venv/bin/python -m wow2.lobbyboardtest   # the Discord board: what it posts, coalescing, Discord down, 43 checks
+.venv/bin/python -m wow2.discordbottest   # the password bot: who gets a password for which name, the DM, 42 checks
 .venv/bin/python -m wow2.loadtest --consoles 32 --lifetime 200   # capacity, see below
 .venv/bin/python -m wow2.dbcli roundtrip DIR   # a directory of JSON stores in and out, field by field
 ```

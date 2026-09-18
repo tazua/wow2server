@@ -74,6 +74,12 @@ DEFAULTS: dict[str, dict] = {
         "empty_text": "",
         "offline_text": "",
         "announce_cooldown": 300,
+        # ---- THE PASSWORD BOT (wow2-discordbot; DOCS.md "Discord") ----
+        "bot_guild": 0,
+        "bot_admin_roles": ["Admin", "Moderator"],
+        "bot_help_channel": "connection-help",
+        "bot_claims_per_day": 3,
+        "bot_text": "",
     },
 }
 
@@ -160,6 +166,8 @@ _ENV = {
     ("discord", "lobby_webhook"): ("WOW2_DISCORD_LOBBY_WEBHOOK", str),
     ("discord", "announce_webhook"): ("WOW2_DISCORD_ANNOUNCE_WEBHOOK", str),
     ("discord", "mention"): ("WOW2_DISCORD_MENTION", str),
+    ("discord", "bot_guild"): ("WOW2_DISCORD_BOT_GUILD", int),
+    ("discord", "bot_claims_per_day"): ("WOW2_DISCORD_BOT_CLAIMS_PER_DAY", int),
 }
 for (_sec, _key), (_env, _cast) in _ENV.items():
     _raw = os.environ.get(_env)
@@ -198,6 +206,11 @@ DISCORD_TITLE = str(get("discord", "title") or "Open lobbies")
 DISCORD_TEXT = {k: str(get("discord", k) or "")
                 for k in ("announce_text", "closed_text", "empty_text", "offline_text")}
 DISCORD_COOLDOWN = float(get("discord", "announce_cooldown"))
+DISCORD_BOT_GUILD = int(get("discord", "bot_guild") or 0)
+DISCORD_BOT_ADMIN_ROLES = [str(r) for r in (get("discord", "bot_admin_roles") or [])]
+DISCORD_BOT_HELP_CHANNEL = str(get("discord", "bot_help_channel") or "connection-help").lstrip("#")
+DISCORD_BOT_CLAIMS_PER_DAY = int(get("discord", "bot_claims_per_day"))
+DISCORD_BOT_TEXT = str(get("discord", "bot_text") or "")
 
 
 def _nat_type_line() -> str:

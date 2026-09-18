@@ -433,9 +433,10 @@ temporary password for a profile name the server does not hold.
   reply only they can see. The name is then bound to that Discord user:
   a second `/claim` from them resets it again, a `/claim` from anyone
   else is refused. A name registered from a console is nobody's to claim.
-  The game's own rule for a name applies (6 to 12 letters and digits) and
-  each person gets `bot_claims_per_day` passwords a day. A one-word DM to
-  the bot does the same as `/claim`.
+  A name is 1 to 16 printable ASCII characters: the game says 6 to 12
+  letters and digits and does not hold itself to it. Each person gets
+  `bot_claims_per_day` passwords a day. A one-word DM to the bot does the
+  same as `/claim`.
 - `/recover NAME PASSWORD` — anyone. For a password the game will not
   take any more: one changed in the game to more than 12 characters,
   which the game allows and then refuses at sign-in. The password on
@@ -448,8 +449,7 @@ temporary password for a profile name the server does not hold.
   Discord's interaction, visible to nobody else, and is never logged.
 - `/reset NAME @player` — staff (a role named in `bot_admin_roles`, or
   Manage Server): a new password for any name, sent to that player by DM
-  and bound to them; the name-length rule is waived, for a name an edited
-  savedata carries. Discord hides the command from members; a Moderator
+  and bound to them. Discord hides the command from members; a Moderator
   without Manage Server sees it once you allow it under *Server Settings →
   Integrations → the application*.
 - `/account NAME` — staff: registered or not, the handle the log prints,

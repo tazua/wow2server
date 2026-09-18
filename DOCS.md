@@ -247,6 +247,14 @@ wow2-account set <name>        # prompts for the password, stores the digest
 wow2-account remove <name>     # forget a credential
 ```
 
+A password is 6 to 12 characters. That is the game's rule, not the
+server's: the console's keyboard takes up to 16, but *Finish* on anything
+outside 6 to 12 draws *Passwords must be between 6 and 12 characters long*
+and sends nothing, at the sign-in prompt as much as at the change-password
+one. So a longer password stored with `set` locks the account out until
+`set` is run again, and `set` refuses one (and a non-ASCII one) for that
+reason. The Discord bot's passwords are 8.
+
 A profile from the **original Demonware servers** is the same case: it
 has been online, so it sends a sign-in and never a create, and this server
 has never seen its name. The player sees the same "incorrect" dialog and the

@@ -3622,11 +3622,19 @@ class AuthConnection(asyncio.Protocol):
             reply = build_login_reply(session_key, kc, username=uname,
                                       user_id=uid, license_id=uid,
                                       proof_key=handle)
+            if refused:
+                log(f"  -> send LoginReply (0x0b REFUSED for {self.peer_ip}: {how}; a "
+                    f"random key nobody holds, nothing registered. {uname!r} is this "
+                    f"address's placeholder, not a name anyone typed. A login with no "
+                    f"create before it is a profile that has been online before -- an "
+                    f"account from before a wipe, or from another server: "
+                    f"`wow2-account set <their profile name>` lets them in)"
+                    f" {len(reply)}B")
+                self.t.write(reply)
+                return
             log(f"  -> send LoginReply (0x0b proof for {uname!r} id={uid} [{how}], "
                 f"proof key={kc.hex()[:16]}.., "
-                f"session key={session_key.hex()[:16]}.."
-                f"{', NOT registered -- this login is refused' if refused else ''})"
-                f" {len(reply)}B")
+                f"session key={session_key.hex()[:16]}..) {len(reply)}B")
             if handle:
                 log(f"     (the clear proof carries handle {handle.hex()[:16]}.. "
                     f"for that key; the key itself is only in the ticket)")

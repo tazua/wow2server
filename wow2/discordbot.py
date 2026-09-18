@@ -383,6 +383,9 @@ def run_bot(token: str, guild_id: int, desk: Desk, admin_roles: list[str],
     client = Bot(intents=intents)
     tree = app_commands.CommandTree(client)
 
+    def attachments(files) -> dict:
+        return {"files": [discord.File(p) for p in files]} if files else {}
+
     def help_mention(g) -> str:
         ch = next((c for c in g.text_channels if c.name == help_channel
                    or c.name.endswith(help_channel)), None)
@@ -405,8 +408,7 @@ def run_bot(token: str, guild_id: int, desk: Desk, admin_roles: list[str],
             self.template = template
 
         async def reply(self, text, files=()):
-            await self.i.followup.send(text, files=[discord.File(p) for p in files],
-                                       ephemeral=True)
+            await self.i.followup.send(text, ephemeral=True, **attachments(files))
 
         async def dm(self, user_id, text, files=()):
             return await send_dm(user_id, text, files)
@@ -427,12 +429,12 @@ def run_bot(token: str, guild_id: int, desk: Desk, admin_roles: list[str],
             self.template = template
 
         async def reply(self, text, files=()):
-            await self.m.channel.send(text, files=[discord.File(p) for p in files])
+            await self.m.channel.send(text, **attachments(files))
 
     async def send_dm(user_id, text, files) -> bool:
         try:
             user = client.get_user(int(user_id)) or await client.fetch_user(int(user_id))
-            await user.send(text, files=[discord.File(p) for p in files])
+            await user.send(text, **attachments(files))
             return True
         except discord.Forbidden:
             return False

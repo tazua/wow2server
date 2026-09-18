@@ -1,0 +1,53 @@
+# systemd unit for the WOW2 password bot (wow2-discordbot).
+#
+# A profile that has ever been online never sends its name again, only a hash
+# of it, so a server that never saw the profile's create (an old memory stick,
+# a wipe) cannot make it an account. The bot does that on request: `/claim
+# NAME` in the community Discord sets a random password for a name the server
+# does not hold and DMs it with the steps to sign in and change it.
+#
+# It needs the setup bot's token, which is a secret and lives in ONE file that
+# only root reads -- never in wow2-server.toml, never in the repository:
+#
+#   sudo sh -c 'umask 077; printf "DISCORD_BOT_TOKEN=%s\n" "PASTE-THE-TOKEN" > /etc/wow2-server.env'
+#   [discord] bot_guild = <the server id> in /etc/wow2-server.toml
+#   sudo ./setup.sh --system            # installs and starts it once that file exists
+#
+# Without the file the unit does not start (ConditionPathExists), so an install
+# that does not want the bot needs nothing. It shares the data directory with
+# the server: the credential it writes is the same row `wow2-account set`
+# writes, read by the server at the next sign-in.
+
+[Unit]
+Description=WOW2 password bot (Discord; a temporary password for a profile the server never saw)
+After=network-online.target wow2-server.service
+Wants=network-online.target
+ConditionPathExists=/etc/wow2-server.env
+
+[Service]
+Type=simple
+User=wow2
+Group=wow2
+WorkingDirectory=/var/lib/wow2-server
+Environment=WOW2_CONFIG=/etc/wow2-server.toml
+EnvironmentFile=/etc/wow2-server.env
+ExecStart=/opt/wow2-server/bin/wow2-discordbot
+Restart=on-failure
+RestartSec=30
+
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=strict
+ProtectHome=true
+ReadWritePaths=/var/lib/wow2-server
+ProtectKernelTunables=true
+ProtectKernelModules=true
+ProtectControlGroups=true
+RestrictAddressFamilies=AF_INET AF_INET6 AF_UNIX
+RestrictNamespaces=true
+LockPersonality=true
+SystemCallFilter=@system-service
+SystemCallErrorNumber=EPERM
+
+[Install]
+WantedBy=multi-user.target

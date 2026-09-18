@@ -123,7 +123,12 @@ if [ ! -x "$VENV/bin/python" ]; then
     "$PY" -m venv "$VENV"
 fi
 "$VENV/bin/python" -m pip install --quiet --upgrade pip >/dev/null 2>&1 || true
-"$VENV/bin/python" -m pip install --quiet "$HERE"
+# [bot] adds discord.py for the password bot; a platform it will not install on
+# still gets the server.
+if ! "$VENV/bin/python" -m pip install --quiet "$HERE[bot]" 2>/dev/null; then
+    "$VENV/bin/python" -m pip install --quiet "$HERE"
+    note "(discord.py did not install, so wow2-discordbot is not available; the server is)"
+fi
 # -P: do not put the current directory on sys.path, so this imports the
 # INSTALLED package and not the checkout it was installed from.
 "$VENV/bin/python" -P - <<'PY'
@@ -176,6 +181,7 @@ if [ "$SYSTEM" = 1 ]; then
     if [ -d /etc/systemd/system ] && command -v systemctl >/dev/null; then
         install -m 644 "$HERE/packaging/wow2-server.service" /etc/systemd/system/
         install -m 644 "$HERE/packaging/wow2-nsdns@.service" /etc/systemd/system/
+        install -m 644 "$HERE/packaging/wow2-discordbot.service" /etc/systemd/system/
         if [ -d /run/systemd/system ]; then
             systemctl daemon-reload
             # restart, not `enable --now`: a re-run after a `git pull` is an
@@ -199,6 +205,24 @@ if [ "$SYSTEM" = 1 ]; then
                     journalctl -u "wow2-nsdns@$DNS_ADDR" -n 20 --no-pager || true
                     die "the DNS responder did not start; the log is above"
                 fi
+            fi
+            # The password bot runs only where its token file exists (the unit's
+            # ConditionPathExists); the token is the one secret this install has.
+            if [ -f /etc/wow2-server.env ] && [ -x "$VENV/bin/wow2-discordbot" ]; then
+                chmod 600 /etc/wow2-server.env
+                systemctl enable wow2-discordbot
+                systemctl restart wow2-discordbot
+                sleep 3
+                if systemctl is-active --quiet wow2-discordbot; then
+                    note "wow2-discordbot is running (journalctl -u wow2-discordbot -f)"
+                else
+                    journalctl -u wow2-discordbot -n 20 --no-pager || true
+                    note "!! wow2-discordbot did not stay up; the log is above (the token, or"
+                    note "   [discord] bot_guild in $CONF)"
+                fi
+            else
+                note "no /etc/wow2-server.env, so the Discord password bot is not started;"
+                note "DOCS.md 'Discord' says how to set it up"
             fi
         else
             note "units installed; systemd is not running here (a container?), so"

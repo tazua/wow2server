@@ -82,6 +82,14 @@ letter could register and never sign in; the first start on the new code
 recomputes every handle and says so in the log.) `wow2-account` takes a
 name in any case.
 
+A refused login is logged as `LoginReply (0x0b REFUSED for <address>: ...)`;
+the `player<N>` in that line is the server's placeholder for that address,
+not a name anyone typed. A login that arrives with no create-account before
+it is a profile that has been online before, on this server before a wipe
+or on another server; the name behind its handle cannot be recovered from
+the log (it is a hash), so the player tells you their profile name and
+`wow2-account set NAME` lets them in, or they make a new profile.
+
 A player who "cannot sign in, it says the name is already in use" is
 almost always a player whose console types a password other than the one
 the account was created with: the create is answered 707, the sign-in the

@@ -186,6 +186,7 @@ server prints what is in force at startup.
 | `nat.nat_type`, `nat.nat_type_alt_port` | `true`, `3078` | answer the NAT type probe; test 3's reply leaves from the alternate port |
 | `nat.nat_type_alt_address` | unset | a second public address, if there really is one |
 | `stats.starting_rating` | `400` | what a player with no ranked row is served, so their first stake is 40 |
+| `stats.period_boards` | `true` | the Weekly, Monthly and Yearly boards (2, 3, 4) restart from `starting_rating` each ISO week, month and year; `false` keeps them as all-time boards from 0 |
 | `storage.data_dir` | `wow2-data/` beside the checkout, `/var/lib/wow2-server` as a service | where everything below lives |
 | `discord.lobby_webhook` | unset | a Discord webhook URL; the channel gets one message that always shows the open lobbies. See Discord |
 | `discord.announce_webhook`, `discord.mention` | unset | a webhook URL that gets a message when a lobby opens, and what to put in front of it (`<@&ROLE_ID>` or `@here`) |
@@ -300,7 +301,7 @@ per file, and renames each to `<name>.imported-<date>`.
 | what | where |
 |---|---|
 | accounts: name, credential digest, handle, user id | `accounts` |
-| leaderboards: one row per (board, entity) with the score and name; the rank is derived on read | `stats` |
+| leaderboards: one row per (board, entity) with the score and name; the rank is derived on read; a Weekly, Monthly or Yearly row carries the period it was written in and is read only in that period | `stats` |
 | ranked wagers: open pots, stakes, payouts | `pots` |
 | clans, members, ranks, outstanding invites | `teams`, `team_members`, `team_proposals` |
 | buddies, invites, blocks, the mailbox, and every name seen | `friends`, `friend_invites`, `blocks`, `messages`, `names` |

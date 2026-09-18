@@ -15,6 +15,7 @@ import random
 import shutil
 import sys
 import tempfile
+import time
 from pathlib import Path
 
 HERE = Path(__file__).resolve().parent
@@ -55,7 +56,7 @@ def digest(password: str) -> str:
 
 class Clock:
     def __init__(self) -> None:
-        self.t = 1_000_000.0
+        self.t = time.time()
 
     def __call__(self) -> float:
         return self.t
@@ -85,7 +86,7 @@ class FakeCtx(bot.Ctx):
 
 
 def run(keep: bool) -> int:
-    A, B, C, P = "1001", "1002", "1003", "1004"
+    A, B, C, P, Q = "1001", "1002", "1003", "1004", "1005"
     clock = Clock()
     desk = bot.Desk(claims_per_day=3, rng=random.Random(7), clock=clock)
 
@@ -193,6 +194,47 @@ def run(keep: bool) -> int:
     d = desk.lookup("nobody99")
     check(not d["registered"] and d["claimed_by"] is None, "lookup of a name never seen")
 
+    print("recover: a password the game will not take any more")
+    srv.set_account_password("changed1", srv.tiger192(b"oldpass1"))
+    srv.set_account_password("changed1", srv.tiger192(b"abcdefghijklmn"))    # the in-game change to 14
+    row = store.db().execute("SELECT pwhash, prev_pwhash, prev_at FROM accounts WHERE name = 'changed1'").fetchone()
+    check(row["pwhash"] == digest("abcdefghijklmn") and row["prev_pwhash"] == digest("oldpass1")
+          and row["prev_at"], "a password change keeps the digest before it, with when")
+    srv.set_account_password("changed1", srv.tiger192(b"abcdefghijklmn"))
+    row2 = store.db().execute("SELECT prev_pwhash, prev_at FROM accounts WHERE name = 'changed1'").fetchone()
+    check(tuple(row2) == (row["prev_pwhash"], row["prev_at"]),
+          "...and writing the same digest again does not move it")
+    r = desk.recover("changed1", P, "nope1234")
+    check(r.outcome is bot.Outcome.WRONG and pwhash("changed1") == digest("abcdefghijklmn")
+          and bound_to("changed1") is None, "a wrong password: refused, nothing changes")
+    r = desk.recover("CHANGED1", P, "abcdefghijklmn")
+    check(r.outcome is bot.Outcome.RESET and r.password and pwhash("changed1") == digest(r.password)
+          and bound_to("changed1") == P and len(r.password) == 8,
+          "the 14-character password the game refuses proves the account: a fresh 8-character "
+          "one, the name bound to the player")
+    srv.set_account_password("changed2", srv.tiger192(b"oldpass2"))
+    srv.set_account_password("changed2", srv.tiger192(b"typo"))
+    r = desk.recover("changed2", P, "oldpass2")
+    check(r.outcome is bot.Outcome.RESET and pwhash("changed2") == digest(r.password),
+          "the password BEFORE a mistyped change proves it too, within the window")
+    srv.set_account_password("changed3", srv.tiger192(b"oldpass3"))
+    srv.set_account_password("changed3", srv.tiger192(b"typo"))
+    with store.tx() as conn:
+        conn.execute("UPDATE accounts SET prev_at = '2020-01-01T00:00:00' WHERE name = 'changed3'")
+    r = desk.recover("changed3", P, "oldpass3")
+    check(r.outcome is bot.Outcome.WRONG and pwhash("changed3") == digest("typo"),
+          "...but not once the change is older than a week")
+    check(desk.recover("changed3", P, "typo").outcome is bot.Outcome.RESET,
+          "...while the password on file always does")
+    check(desk.recover("nobody99", P, "whatever").outcome is bot.Outcome.UNREGISTERED,
+          "a name with no password on file is pointed at /claim, and the try is free")
+    fresh = bot.Desk(claims_per_day=0, rng=random.Random(3), clock=clock)
+    outs = [fresh.recover("changed1", B, f"guess{i}").outcome for i in range(6)]
+    check(outs[:5] == [bot.Outcome.WRONG] * 5 and outs[5] is bot.Outcome.TOO_MANY,
+          "five wrong tries an hour, the sixth is not even checked")
+    clock.t += 3601
+    check(fresh.recover("changed1", B, "guess7").outcome is bot.Outcome.WRONG, "an hour later, again")
+
     print("the commands")
     files = bot.guide_files()
     ctx = FakeCtx(P)
@@ -207,6 +249,7 @@ def run(keep: bool) -> int:
     check(not ctx.dms and "could not DM" in text and "`" in text
           and pwhash("Recruit01") == digest(text.split("`")[1]) and ctx.replies[0][1] == files,
           "/claim with DMs shut: the kit comes back in the private reply instead, pictures and all")
+    desk_pw_recruit = text.split("`")[1]
     ctx = FakeCtx(B)
     text = asyncio.run(bot.do_claim(desk, ctx, "Recruit01"))
     check(not ctx.dms and "already has a password" in text and "<#555>" in text,
@@ -215,9 +258,27 @@ def run(keep: bool) -> int:
     text = asyncio.run(bot.do_claim(desk, ctx, "x"))
     check("not a profile name" in text and "6 to 12" in text, "/claim on a bad name says the rule")
 
+    ctx = FakeCtx(Q)
+    text = asyncio.run(bot.do_recover(desk, ctx, "changed2", "wrong"))
+    check("not the password on file" in text and "<#555>" in text and not ctx.dms,
+          "/recover with a wrong password: refused, pointed at the help channel")
+    ctx = FakeCtx(Q)
+    text = asyncio.run(bot.do_recover(desk, ctx, "nobody99", "x"))
+    check("/claim nobody99" in text, "/recover on a name with no password says /claim")
+    ctx = FakeCtx(Q)
+    text = asyncio.run(bot.do_recover(desk, ctx, "Recruit01", "z"))
+    check("not the password" in text and pwhash("Recruit01") == digest(desk_pw_recruit),
+          "/recover on somebody's name with a guess changes nothing")
+    ctx = FakeCtx(Q)
+    text = asyncio.run(bot.do_recover(desk, ctx, "Recruit01", desk_pw_recruit))
+    check(len(ctx.dms) == 1 and "`" in ctx.dms[0][1]
+          and pwhash("Recruit01") == digest(ctx.dms[0][1].split("`")[1]) and "DM" in text
+          and bound_to("Recruit01") == Q,
+          "/recover with the password on file: the kit by DM with a fresh password, the name "
+          "now bound to whoever proved it")
     ctx = FakeCtx(B)
     text = asyncio.run(bot.do_reset(desk, ctx, "Recruit01", C, "userC"))
-    check(text == "Staff only." and bound_to("Recruit01") == P, "/reset by a member: refused, untouched")
+    check(text == "Staff only." and bound_to("Recruit01") == Q, "/reset by a member: refused, untouched")
     ctx = FakeCtx(A, admin=True)
     text = asyncio.run(bot.do_reset(desk, ctx, "Recruit01", C, "userC"))
     check(len(ctx.dms) == 1 and ctx.dms[0][0] == C and f"<@{C}>" in text

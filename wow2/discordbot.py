@@ -46,10 +46,10 @@ GUIDE_DIR = Path(__file__).resolve().parent / "guide"
 # Read off a phone screen and typed on the PSP keyboard: no i/l/1, no o/0.
 PASSWORD_ALPHABET = "abcdefghjkmnpqrstuvwxyz23456789"
 PASSWORD_LENGTH = 8
-# The game's own rule for a profile name (IntroWiz.ProfileInvalid); a name the
-# savedata was edited to carry can be shorter, which is what staff's /reset is for.
-NAME_RE = re.compile(r"^[A-Za-z0-9]{6,12}$")
-LOOSE_NAME_RE = re.compile(r"^[A-Za-z0-9]{1,16}$")
+# The game SAYS a profile name is 6 to 12 letters and digits (IntroWiz.ProfileInvalid)
+# and does not hold itself to it -- the user plays as a five-letter name -- so a name
+# is whatever printable ASCII the console's keyboard can hold.
+NAME_RE = re.compile(r"^[!-~][ -~]{0,14}[!-~]$|^[!-~]$")
 DAY = 86400.0
 RECOVER_TRIES_PER_HOUR = 5
 
@@ -118,13 +118,10 @@ def guide_files() -> list[Path]:
     return sorted(GUIDE_DIR.glob("*.png")) if GUIDE_DIR.is_dir() else []
 
 
-def name_error(name: str, strict: bool = True) -> str | None:
+def name_error(name: str) -> str | None:
     """Why `name` cannot be a profile name, or None."""
-    if strict and not NAME_RE.match(name):
-        return ("a profile name is 6 to 12 characters, letters and digits only "
-                "(the game's own rule)")
-    if not strict and not LOOSE_NAME_RE.match(name):
-        return "letters and digits only, at most 16"
+    if not NAME_RE.match(name):
+        return "1 to 16 characters, plain (ASCII) letters, digits and punctuation"
     return None
 
 
@@ -201,7 +198,7 @@ class Desk:
         or if they set it through here before."""
         name = name.strip()
         user_id = str(user_id)
-        err = name_error(name, strict=True)
+        err = name_error(name)
         if err:
             return Result(Outcome.INVALID, name, detail=err)
         acct, bound = self.holder(store.account_handle(name))
@@ -222,7 +219,7 @@ class Desk:
     def reset(self, name: str, user_id) -> Result:
         """Staff: a new password for any name, bound to the player it is for."""
         name = name.strip()
-        err = name_error(name, strict=False)
+        err = name_error(name)
         if err:
             return Result(Outcome.INVALID, name, detail=err)
         acct, _bound = self.holder(store.account_handle(name))
@@ -234,7 +231,7 @@ class Desk:
         fresh one. Every try counts against RECOVER_TRIES_PER_HOUR."""
         name = name.strip()
         user_id = str(user_id)
-        err = name_error(name, strict=False)
+        err = name_error(name)
         if err:
             return Result(Outcome.INVALID, name, detail=err)
         acct, _bound = self.holder(store.account_handle(name))
@@ -299,8 +296,9 @@ async def do_claim(desk: Desk, ctx: Ctx, name: str) -> str:
         return await _hand_over(ctx, r, to=ctx.user_id)
     if r.outcome is Outcome.TAKEN:
         text = (f"**{r.name}** already has a password on {ctx.server}, and it was not set "
-                f"through me by you. If it is your profile and the password is lost, ask in "
-                f"{ctx.help_mention}: staff can reset it for you.")
+                f"through me by you. Yours and you know the password, even one the game "
+                f"refuses? `/recover {r.name}` with it. Lost it? Ask in {ctx.help_mention}: "
+                f"staff can reset it for you.")
     elif r.outcome is Outcome.TOO_MANY:
         text = (f"That would be more than {desk.claims_per_day} passwords in a day. "
                 f"Try again tomorrow, or ask in {ctx.help_mention}.")
@@ -531,7 +529,7 @@ def run_bot(token: str, guild_id: int, desk: Desk, admin_roles: list[str],
         if message.author.bot or message.guild is not None:
             return
         words = message.content.split()
-        if len(words) == 1 and LOOSE_NAME_RE.match(words[0]):
+        if len(words) == 1 and NAME_RE.match(words[0]):
             await do_claim(desk, MessageCtx(message), words[0])
         else:
             await message.channel.send("Send me your profile name and nothing else "

@@ -106,12 +106,12 @@ def run(keep: bool) -> int:
     check(len(longest) < 2000, f"the kit fits a Discord message with the longest name ({len(longest)} chars)")
 
     print("names and passwords")
-    check(bot.name_error("BoggyB") is None and bot.name_error("lukas1") is None
-          and bot.name_error("a1b2c3d4e5f6") is None, "6 to 12 letters and digits pass")
-    check(all(bot.name_error(n) for n in ("abcde", "a" * 13, "has space", "dot.name", "", "fivec")),
-          "too short, too long, a space, punctuation and the empty name are refused")
-    check(bot.name_error("fivec", strict=False) is None and bot.name_error("a b", strict=False),
-          "staff may name a shorter profile (an edited savedata), still letters and digits only")
+    check(all(bot.name_error(n) is None for n in ("BoggyB", "lukas1", "a1b2c3d4e5f6", "fivec",
+                                                  "x", "a" * 16, "dot.name", "two words")),
+          "1 to 16 printable characters pass, a five-letter name included (the game's stated "
+          "6-12 rule is not one it keeps)")
+    check(all(bot.name_error(n) for n in ("", "a" * 17, " lead", "trail ", "h\u00e9llo", "tab\tname")),
+          "empty, 17, an edge space, a non-ASCII letter and a tab are refused")
     pws = {bot.new_password() for _ in range(50)}
     check(len(pws) == 50 and all(len(p) == 8 for p in pws)
           and all(set(p) <= set(bot.PASSWORD_ALPHABET) for p in pws)
@@ -156,12 +156,12 @@ def run(keep: bool) -> int:
           "...who may now reset it alone")
     check(desk.claim("lukas1", A).outcome is bot.Outcome.TAKEN, "...and nobody else may")
 
-    r = desk.reset("fivec", P)
+    r = desk.claim("fivec", P)
     check(r.outcome is bot.Outcome.CLAIMED and pwhash("fivec") == digest(r.password),
-          "staff may set a password for a name shorter than the game allows (an edited savedata)")
-    check(desk.claim("fivec", P).outcome is bot.Outcome.INVALID
-          and desk.claim("has space", P).outcome is bot.Outcome.INVALID,
-          "a player may not: the game's own rule, 6 to 12 letters and digits")
+          "a five-letter name is claimed like any other")
+    check(desk.claim("", P).outcome is bot.Outcome.INVALID
+          and desk.claim("a" * 17, P).outcome is bot.Outcome.INVALID,
+          "the empty name and a 17-character one are not")
 
     with store.tx() as conn:
         conn.execute("INSERT INTO accounts (name, handle) VALUES (?, ?)",
@@ -234,11 +234,12 @@ def run(keep: bool) -> int:
     desk_pw_recruit = text.split("`")[1]
     ctx = FakeCtx(B)
     text = asyncio.run(bot.do_claim(desk, ctx, "Recruit01"))
-    check(not ctx.dms and "already has a password" in text and "<#555>" in text,
-          "/claim on somebody else's name: refused, pointed at the help channel, no DM")
+    check(not ctx.dms and "already has a password" in text and "<#555>" in text
+          and "/recover Recruit01" in text,
+          "/claim on somebody else's name: refused, pointed at /recover and the help channel, no DM")
     ctx = FakeCtx(B)
-    text = asyncio.run(bot.do_claim(desk, ctx, "x"))
-    check("not a profile name" in text and "6 to 12" in text, "/claim on a bad name says the rule")
+    text = asyncio.run(bot.do_claim(desk, ctx, "a" * 17))
+    check("not a profile name" in text and "1 to 16" in text, "/claim on a bad name says the rule")
 
     ctx = FakeCtx(Q)
     text = asyncio.run(bot.do_recover(desk, ctx, "changed1", "wrong"))
@@ -271,7 +272,7 @@ def run(keep: bool) -> int:
     check(f"could not DM <@{C}>" in text and "`" in text,
           "/reset when the player's DMs are shut: staff get the kit to pass on")
     ctx = FakeCtx(A, admin=True)
-    text = asyncio.run(bot.do_reset(desk, ctx, "no way", C, "userC"))
+    text = asyncio.run(bot.do_reset(desk, ctx, "", C, "userC"))
     check("cannot be a profile name" in text and not ctx.dms, "/reset on a bad name")
 
     ctx = FakeCtx(B)

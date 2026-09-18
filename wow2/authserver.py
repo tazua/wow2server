@@ -564,8 +564,8 @@ def account_seen(ident_key: str, entity_id: int, name: str) -> None:
 
 
 def account_id_for(username: str) -> int:
-    """The client's 64-bit account id, DERIVED from the name."""
-    return int.from_bytes(tiger192(username.encode())[:8], "little")
+    """The client's 64-bit account id, DERIVED from the lowercased name (§71d)."""
+    return int.from_bytes(account_handle(username), "little")
 
 
 def account_for(ident_key: str) -> int:
@@ -1350,9 +1350,9 @@ def _jsave(path: Path, data: dict) -> None:
 
 
 def stored_credential(username: str) -> bytes | None:
-    """The digest we hold for `username`, or None."""
-    row = store.db().execute("SELECT pwhash FROM accounts WHERE name = ?",
-                             (username,)).fetchone()
+    """The digest we hold for `username` (in any letter case), or None."""
+    row = store.db().execute("SELECT pwhash FROM accounts WHERE handle = ?",
+                             (account_handle(username).hex(),)).fetchone()
     if row and row["pwhash"]:
         try:
             return bytes.fromhex(row["pwhash"])
@@ -1392,8 +1392,8 @@ def note_account(username: str, password_hash: bytes, peer_ip: str) -> None:
     if os.environ.get("WOW2_NO_ACCOUNT_STORE") == "1":
         return
     with store.tx() as conn:
-        old = conn.execute("SELECT pwhash FROM accounts WHERE name = ?",
-                           (username,)).fetchone()
+        old = conn.execute("SELECT pwhash FROM accounts WHERE handle = ?",
+                           (account_handle(username).hex(),)).fetchone()
         old = old["pwhash"] if old else None
         if old and old != password_hash.hex():
             log(f"    (!!!! account {username!r}: password digest REPLACED by a "
@@ -1405,6 +1405,9 @@ def note_account(username: str, password_hash: bytes, peer_ip: str) -> None:
 def _write_credential(conn, username: str, password_hash: bytes, peer_ip: str) -> None:
     """Upsert one account's credential row; the caller holds the transaction."""
     now = store.now_iso()
+    handle = account_handle(username).hex()
+    have = conn.execute("SELECT name FROM accounts WHERE handle = ?", (handle,)).fetchone()
+    name = have["name"] if have else username    # the case it was first registered in is what others see
     conn.execute(
         "INSERT INTO accounts (name, pwhash, handle, user_id, first_seen, last_seen, last_ip) "
         "VALUES (?, ?, ?, ?, ?, ?, ?) "
@@ -1412,8 +1415,8 @@ def _write_credential(conn, username: str, password_hash: bytes, peer_ip: str) -
         "handle = excluded.handle, last_seen = excluded.last_seen, "
         "last_ip = COALESCE(excluded.last_ip, accounts.last_ip), "
         "user_id = COALESCE(accounts.user_id, excluded.user_id)",
-        (username, password_hash.hex(), account_handle(username).hex(),
-         allocate_user_id(conn, username), now, now, peer_ip or None))
+        (name, password_hash.hex(), handle,
+         allocate_user_id(conn, name), now, now, peer_ip or None))
 
 
 def allocate_user_id(conn, username: str) -> int:
@@ -1438,8 +1441,9 @@ def set_account_password(username: str, password_hash: bytes, peer_ip: str = "")
 
 
 def account_handle(username: str) -> bytes:
-    """The 8 bytes a client puts in its login request to say who it is."""
-    return tiger192(username.encode())[:8]
+    """The 8 bytes a client puts in its login request to say who it is:
+    Tiger192 of the name LOWERCASED (§71d); store.account_handle is the one copy."""
+    return bytes.fromhex(store.account_handle(username))
 
 
 _CONFIG_HANDLES: dict[bytes, dict] = {

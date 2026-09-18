@@ -299,6 +299,40 @@ def run(keep: bool) -> int:
             refused = True
         store.close()
         check(refused, "a damaged database refuses to start, with a StoreError")
+
+        # ------------------------------------------------ schema 1 -> 2 (§71d)
+        print("schema 1 -> 2: handles of the lowercased name")
+        v1 = root / "v1" / store.DB_NAME
+        conn = store.connect(v1)
+        from tiger import tiger192
+        typed = lambda n: tiger192(n.encode())[:8].hex()    # what schema 1 stored
+        with store.tx(conn):
+            for i, name in enumerate(("Wormgamer98", "lukas1", "Lukas1", "player1")):
+                conn.execute("INSERT INTO accounts (name, pwhash, handle, user_id) VALUES (?, ?, ?, ?)",
+                             (name, "aa" * 24, typed(name), 100 + i))
+            store.meta_set(conn, "schema_version", "1")
+        conn.close()
+        printed = []
+        import builtins
+        real_print = builtins.print
+        builtins.print = lambda *a, **k: printed.append(" ".join(str(x) for x in a))
+        try:
+            conn = store.connect(v1)
+        finally:
+            builtins.print = real_print
+        rows = {r["name"]: r["handle"] for r in conn.execute("SELECT name, handle FROM accounts")}
+        check(rows.get("Wormgamer98") == store.account_handle("wormgamer98") == typed("wormgamer98"),
+              "an account registered with a capital letter gets the handle the client "
+              "actually sends, Tiger192 of the lowercased name")
+        check(rows.get("player1") == typed("player1") and rows.get("lukas1") == typed("lukas1"),
+              "...a lowercase name's handle does not change")
+        check("Lukas1" not in rows and "lukas1" in rows,
+              "...and of two rows that differ only by case, the one that could never "
+              "sign in is dropped and the one that worked is kept")
+        check(store.meta_get(conn, "schema_version") == "2"
+              and any("Wormgamer98" in ln for ln in printed) and any("Lukas1" in ln for ln in printed),
+              "...the version is 2 and both changes were said out loud")
+        conn.close()
     finally:
         store.close()
         if keep:

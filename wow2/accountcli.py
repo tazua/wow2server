@@ -64,7 +64,8 @@ def cmd_set(args) -> int:
 
 def cmd_remove(args) -> int:
     with store.tx() as conn:
-        cur = conn.execute("DELETE FROM accounts WHERE name = ?", (args.name,))
+        cur = conn.execute("DELETE FROM accounts WHERE handle = ?",
+                           (srv.account_handle(args.name).hex(),))
     if cur.rowcount == 0:
         print(f"no such account: {args.name}")
         return 1

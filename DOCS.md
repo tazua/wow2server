@@ -74,6 +74,14 @@ The password's length is the defence. The game allows 6 to 12 characters;
 six digits fall in well under a second, twelve mixed characters do not
 fall. Tell your players.
 
+Names are case-insensitive: the game signs in with a hash of the
+lowercased profile name, so `Lukas1` and `lukas1` are one account, stored
+and shown to others in the case it was first registered in. (A server
+from before schema 2 had hashed names as typed, and a name with a capital
+letter could register and never sign in; the first start on the new code
+recomputes every handle and says so in the log.) `wow2-account` takes a
+name in any case.
+
 Names are first come, first served, and nothing needs a console to claim
 one: the create-account request is encrypted under a constant the game
 ships, this package carries it because the server decrypts with it, and
@@ -373,10 +381,10 @@ module on a scratch directory, the fifth the Discord board against a fake
 webhook endpoint.
 
 ```bash
-.venv/bin/python -m wow2.lsgauth      # the credential path, 22 checks
+.venv/bin/python -m wow2.lsgauth      # the credential path, 27 checks
 .venv/bin/python -m wow2.blocktest    # a block stops all three invites, 7 checks
 .venv/bin/python -m wow2.ownertest    # identity, ownership, clans, storage, profiles, UDP, relay and login-table bounds, the create limit, 72 checks
-.venv/bin/python -m wow2.storetest    # the SQLite store: the import keeps everything, the rules hold, 29 checks
+.venv/bin/python -m wow2.storetest    # the SQLite store: the import keeps everything, the rules hold, 33 checks
 .venv/bin/python -m wow2.lobbyboardtest   # the Discord board: what it posts, coalescing, Discord down, 43 checks
 .venv/bin/python -m wow2.loadtest --consoles 32 --lifetime 200   # capacity, see below
 .venv/bin/python -m wow2.dbcli roundtrip DIR   # a directory of JSON stores in and out, field by field

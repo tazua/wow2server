@@ -563,6 +563,26 @@ def main() -> int:
               "...and the impostor's does not, so their console draws "
               "'already in use' instead of signing in")
 
+        # ---- §71d: a capital letter in the name -------------------------------
+        print("\n  -- a name with a capital letter (§71d) --")
+        err = create_account(host, PORT, "Wormgamer98", NEW_PASSWORD)
+        check(err == BD_AUTH_NO_ERROR,
+              f"a create for 'Wormgamer98' is accepted (700), got {err}")
+        mixed_t, mixed_pr = login(host, PORT, "wormgamer98")
+        check(ticket_opens(mixed_t, NEW_PASSWORD),
+              "...and the sign-in the client sends, with the handle of the LOWERCASED "
+              "name, gets a ticket the password opens")
+        closed, replies = present(host, PORT, mixed_pr)
+        check(bool(replies) and not closed,
+              "...whose proof the LSG accepts")
+        err = create_account(host, PORT, "WORMGAMER98", IMPOSTOR_PASSWORD)
+        check(err == BD_AUTH_CREATE_USERNAME_EXISTS,
+              f"a create for the same name in another case is the same account: "
+              f"refused (707), got {err}")
+        owner_t, _pr = login(host, PORT, "wormgamer98")
+        check(ticket_opens(owner_t, NEW_PASSWORD) and not ticket_opens(owner_t, IMPOSTOR_PASSWORD),
+              "...and the original password still opens the ticket, the impostor's does not")
+
         # ---- §64: a login the server cannot DECODE ---------------------------
         print("\n  -- a login that cannot be decoded (§64) --")
         p = Peer(host, PORT)

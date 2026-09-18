@@ -254,10 +254,11 @@ outside 6 to 12 at the **sign-in** prompt draws *Passwords must be between
 **change-password** screen does not check: it takes a 13 to 16 character
 new password, sends its digest, and the account is locked out at the next
 sign-in. The server cannot catch that, because a change carries only the
-new digest, never the password. What it does instead is keep the digest
-that was replaced (`prev_pwhash`, with when) so that the previous password
-still proves the account for seven days; the Discord bot's `/recover` is
-built on it. `wow2-account set` refuses a password outside 6 to 12 (and a
+new digest, never the password, and it cannot forgive it either, because
+the sign-in that follows carries no password at all. A player who knows
+the password they set can prove it to the Discord bot (`/recover`); one
+who mistyped it needs the operator (`wow2-account set`, or the bot's
+`/reset`). `wow2-account set` refuses a password outside 6 to 12 (and a
 non-ASCII one) for the same reason; the bot's passwords are 8.
 
 A profile from the **original Demonware servers** is the same case: it
@@ -436,14 +437,15 @@ temporary password for a profile name the server does not hold.
   each person gets `bot_claims_per_day` passwords a day. A one-word DM to
   the bot does the same as `/claim`.
 - `/recover NAME PASSWORD` — anyone. For a password the game will not
-  take any more: one changed in the game to more than 12 characters (the
-  game allows that and then refuses it at sign-in), or one mistyped at the
-  change screen, which asks only once. The password on file, or the one
-  before it if the change was within seven days, proves the account; the
-  player gets a fresh one by DM and the name is bound to them. Five tries
-  an hour per person; a wrong try changes nothing. The password travels
-  through Discord's interaction, visible to nobody else, and is never
-  logged.
+  take any more: one changed in the game to more than 12 characters,
+  which the game allows and then refuses at sign-in. The password on
+  file proves the account, the player gets a fresh one by DM and the name
+  is bound to them. That is no more than the game's own change screen
+  lets whoever knows the password do; a password that changed, however
+  recently, proves nothing. A new password mistyped at the change screen
+  (it asks once) is therefore staff's to reset. Five tries an hour per
+  person; a wrong try changes nothing. The password travels through
+  Discord's interaction, visible to nobody else, and is never logged.
 - `/reset NAME @player` — staff (a role named in `bot_admin_roles`, or
   Manage Server): a new password for any name, sent to that player by DM
   and bound to them; the name-length rule is waived, for a name an edited
@@ -475,7 +477,7 @@ restart the unit. Without the env file the unit does not start at all,
 so an install that has no Discord needs nothing. The bot never logs a
 password. `bot_text` replaces the DM's wording with a template
 (`{name}`, `{password}`, `{server}`, `{help}`), checked at start like the
-board's texts. `discordbottest.py` is its suite: 56 checks, no Discord.
+board's texts. `discordbottest.py` is its suite: 52 checks, no Discord.
 
 ## Checks
 
@@ -491,9 +493,9 @@ Discord at all.
 .venv/bin/python -m wow2.lsgauth      # the credential path, 27 checks
 .venv/bin/python -m wow2.blocktest    # a block stops all three invites, 7 checks
 .venv/bin/python -m wow2.ownertest    # identity, ownership, clans, storage, profiles, UDP, relay and login-table bounds, the create limit, 72 checks
-.venv/bin/python -m wow2.storetest    # the SQLite store: the import keeps everything, the rules hold, 34 checks
+.venv/bin/python -m wow2.storetest    # the SQLite store: the import keeps everything, the rules hold, 33 checks
 .venv/bin/python -m wow2.lobbyboardtest   # the Discord board: what it posts, coalescing, Discord down, 43 checks
-.venv/bin/python -m wow2.discordbottest   # the password bot: who gets a password for which name, the DM, 56 checks
+.venv/bin/python -m wow2.discordbottest   # the password bot: who gets a password for which name, the DM, 52 checks
 .venv/bin/python -m wow2.loadtest --consoles 32 --lifetime 200   # capacity, see below
 .venv/bin/python -m wow2.dbcli roundtrip DIR   # a directory of JSON stores in and out, field by field
 ```

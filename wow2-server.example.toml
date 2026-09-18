@@ -263,10 +263,10 @@ announce_cooldown = 300
 # password for a name the server does not hold and sends it to the player by
 # DM with the steps to sign in and change it, pictures included. A name that
 # has a password is refused unless the same person set it through the bot;
-# `/recover NAME PASSWORD` turns the password on file (or the one before it,
-# within seven days) into a fresh one, for a password the game will not
-# take any more; `/reset NAME @player` (staff) resets any name and DMs that
-# player; `/account NAME` (staff) says what the store holds.
+# `/recover NAME PASSWORD` turns the password on file into a fresh one, for
+# a password the game will not take any more; `/reset NAME @player` (staff)
+# resets any name and DMs that player; `/account NAME` (staff) says what the
+# store holds.
 #
 # It is a separate process (`wow2-discordbot`, its own systemd unit) that
 # shares the data directory; it needs the setup bot's token in the environment

@@ -60,15 +60,13 @@ CREATE TABLE IF NOT EXISTS meta (
 -- 8 bytes a login request carries, and the unique index is what turns the
 -- login's scan of every account into a lookup.
 CREATE TABLE IF NOT EXISTS accounts (
-    name        TEXT PRIMARY KEY,
-    pwhash      TEXT,
-    handle      TEXT UNIQUE,
-    user_id     INTEGER UNIQUE,
-    first_seen  TEXT,
-    last_seen   TEXT,
-    last_ip     TEXT,
-    prev_pwhash TEXT,
-    prev_at     TEXT);
+    name       TEXT PRIMARY KEY,
+    pwhash     TEXT,
+    handle     TEXT UNIQUE,
+    user_id    INTEGER UNIQUE,
+    first_seen TEXT,
+    last_seen  TEXT,
+    last_ip    TEXT);
 
 -- entity -> display name, for every account any list reply has to label.
 CREATE TABLE IF NOT EXISTS names (
@@ -231,22 +229,11 @@ def connect(db_path: Path | str) -> sqlite3.Connection:
     with tx(conn):
         for statement in _statements(SCHEMA):
             conn.execute(statement)
-        _add_columns(conn, "accounts", ("prev_pwhash", "prev_at"))
         if 0 < version < 2:
             _rehandle(conn)
         if version < SCHEMA_VERSION:
             meta_set(conn, "schema_version", str(SCHEMA_VERSION))
     return conn
-
-
-def _add_columns(conn: sqlite3.Connection, table: str, columns: tuple[str, ...]) -> None:
-    """CREATE TABLE IF NOT EXISTS leaves an existing table as it was; a column
-    added later (the previous digest, §73f) is put on with ALTER. Additive, so
-    the schema version does not move."""
-    have = {r["name"] for r in conn.execute(f"PRAGMA table_info({table})")}
-    for col in columns:
-        if col not in have:
-            conn.execute(f"ALTER TABLE {table} ADD COLUMN {col} TEXT")
 
 
 def _rehandle(conn: sqlite3.Connection) -> None:

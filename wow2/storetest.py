@@ -334,26 +334,6 @@ def run(keep: bool) -> int:
               "...the version is 2 and both changes were said out loud")
         conn.close()
 
-        # ------------------------------------------- the previous digest (§73f)
-        old2 = root / "v2" / store.DB_NAME
-        old2.parent.mkdir(parents=True)
-        raw = sqlite3.connect(str(old2))
-        raw.executescript("""
-            CREATE TABLE meta (key TEXT PRIMARY KEY, value TEXT NOT NULL);
-            INSERT INTO meta VALUES ('schema_version', '2');
-            CREATE TABLE accounts (name TEXT PRIMARY KEY, pwhash TEXT, handle TEXT UNIQUE,
-                user_id INTEGER UNIQUE, first_seen TEXT, last_seen TEXT, last_ip TEXT);
-            INSERT INTO accounts (name, pwhash, handle, user_id) VALUES ('kept1', 'ab', 'cd', 7);
-        """)
-        raw.close()
-        conn = store.connect(old2)
-        cols = {r["name"] for r in conn.execute("PRAGMA table_info(accounts)")}
-        row = conn.execute("SELECT * FROM accounts").fetchone()
-        check({"prev_pwhash", "prev_at"} <= cols and row["name"] == "kept1" and row["user_id"] == 7
-              and row["prev_pwhash"] is None and store.meta_get(conn, "schema_version") == "2",
-              "a store from before the previous-digest columns gets them on connect, rows kept, "
-              "still schema 2")
-        conn.close()
     finally:
         store.close()
         if keep:

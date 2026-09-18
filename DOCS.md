@@ -82,6 +82,19 @@ letter could register and never sign in; the first start on the new code
 recomputes every handle and says so in the log.) `wow2-account` takes a
 name in any case.
 
+A player who "cannot sign in, it says the name is already in use" is
+almost always a player whose console types a password other than the one
+the account was created with: the create is answered 707, the sign-in the
+game re-issues gets a ticket their console cannot open. The log has what
+you need without either password. Their `create-account request` line
+carries `pwhash=`, the digest of what they are typing now, and
+
+```
+wow2-account set NAME --hash <that pwhash>
+```
+
+makes the account theirs again under that password, with no restart.
+
 Names are first come, first served, and nothing needs a console to claim
 one: the create-account request is encrypted under a constant the game
 ships, this package carries it because the server decrypts with it, and

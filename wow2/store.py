@@ -162,12 +162,15 @@ CREATE INDEX IF NOT EXISTS storage_owner ON storage (owner);
 
 -- tail is board 1's [i32][i64 A][i64 B] completion history as the JSON list
 -- of [typename, value] pairs the upload carried, NULL on every other board.
+-- period is the ISO week / month / year a Weekly, Monthly or Yearly row was
+-- written in (§74); a row from an earlier period is read as no row at all.
 CREATE TABLE IF NOT EXISTS stats (
     board  INTEGER NOT NULL,
     entity TEXT NOT NULL,
     score  INTEGER NOT NULL,
     name   TEXT,
     tail   TEXT,
+    period TEXT,
     PRIMARY KEY (board, entity));
 CREATE INDEX IF NOT EXISTS stats_board_score ON stats (board, score DESC);
 
@@ -229,11 +232,21 @@ def connect(db_path: Path | str) -> sqlite3.Connection:
     with tx(conn):
         for statement in _statements(SCHEMA):
             conn.execute(statement)
+        _add_columns(conn, "stats", ("period",))
         if 0 < version < 2:
             _rehandle(conn)
         if version < SCHEMA_VERSION:
             meta_set(conn, "schema_version", str(SCHEMA_VERSION))
     return conn
+
+
+def _add_columns(conn: sqlite3.Connection, table: str, columns: tuple[str, ...]) -> None:
+    """CREATE TABLE IF NOT EXISTS leaves an existing table as it was; a column
+    added later goes on with ALTER. Additive, so the schema version does not move."""
+    have = {r["name"] for r in conn.execute(f"PRAGMA table_info({table})")}
+    for col in columns:
+        if col not in have:
+            conn.execute(f"ALTER TABLE {table} ADD COLUMN {col} TEXT")
 
 
 def _rehandle(conn: sqlite3.Connection) -> None:

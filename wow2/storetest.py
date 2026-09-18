@@ -14,6 +14,7 @@ import shutil
 import sqlite3
 import sys
 import tempfile
+import time
 from pathlib import Path
 
 HERE = Path(__file__).resolve().parent
@@ -299,6 +300,73 @@ def run(keep: bool) -> int:
             refused = True
         store.close()
         check(refused, "a damaged database refuses to start, with a StoreError")
+
+        # ----------------------------------------- the windowed boards (§74)
+        print("Weekly, Monthly and Yearly restart from the starting rating each period")
+        import statsdb
+        pdir = root / "periods"
+        store.startup(log=quiet, stores=(), data_dir=pdir)
+        week1 = 1_789_000_000.0                          # a Thursday in 2026-W37
+        statsdb.CLOCK = lambda: week1
+        e1, e2 = 0x975367efa4bbebed, 0x0badf00d0badf00d
+        check(statsdb.period_key(2) == "2026-W37" and statsdb.period_key(3) == "2026-09"
+              and statsdb.period_key(4) == "2026" and statsdb.period_key(5) is None
+              and statsdb.period_key(1) is None,
+              "board 2 is the ISO week, 3 the month, 4 the year; 1 and 5 have no period")
+        check(statsdb.get(2, e1)[0] == statsdb.STARTING_RATING == statsdb.get(5, e1)[0]
+              and statsdb.get(1, e1)[0] == 0,
+              "a player with no row is served the starting rating on 2, 3, 4 and 5, and 0 on 1")
+        statsdb.put(2, e1, 440, "player1")
+        statsdb.put(2, e2, 360, "snailhead")
+        statsdb.put(5, e1, 440, "player1")
+        check(statsdb.get(2, e1) == (440, 1, "player1") and statsdb.get(2, e2)[:2] == (360, 2)
+              and statsdb.count(2) == 2 and [r[1] for r in statsdb.top(2, 10)] == [440, 360]
+              and [r[1] for r in statsdb.page_around(2, e2, 10)] == [440, 360],
+              "within the week the rows, ranks, count and pages are as written")
+        statsdb.CLOCK = lambda: week1 + 7 * 86400
+        check(statsdb.period_key(2) == "2026-W38"
+              and statsdb.get(2, e1) == (statsdb.STARTING_RATING, 0, "")
+              and statsdb.get(2, e2)[0] == statsdb.STARTING_RATING
+              and statsdb.count(2) == 0 and statsdb.top(2, 10) == [] and statsdb.raw(2, e1) is None
+              and statsdb.page_around(2, e1, 10) == [],
+              "a week later the same rows are no rows: everyone is served the start again, "
+              "the board is empty")
+        check(statsdb.get(3, e1)[0] == statsdb.STARTING_RATING and statsdb.get(5, e1) == (440, 1, "player1"),
+              "...the month has not turned for board 3 either way, and board 5 is Permanent")
+        statsdb.put(2, e1, 360, "player1")
+        check(statsdb.get(2, e1) == (360, 1, "player1") and statsdb.count(2) == 1
+              and statsdb.get(2, e2)[0] == statsdb.STARTING_RATING,
+              "the first upload of the new week takes the row over; the other player is still "
+              "served the start")
+        with store.tx() as conn:
+            conn.execute("UPDATE stats SET period = NULL WHERE board = 2")
+        check(statsdb.get(2, e1)[0] == statsdb.STARTING_RATING and statsdb.count(2) == 0,
+              "a row from before the periods existed (no period) counts as an earlier period")
+        statsdb.PERIOD_BOARDS_ON = False
+        check(statsdb.get(2, e1) == (360, 1, "player1") and statsdb.count(2) == 2
+              and statsdb.get(3, e2)[0] == 0,
+              "period_boards = false: the boards are all-time again (both weeks' rows count), "
+              "a missing row is 0")
+        statsdb.PERIOD_BOARDS_ON = True
+        statsdb.CLOCK = time.time
+        store.close()
+        old_stats = root / "oldstats" / store.DB_NAME
+        old_stats.parent.mkdir(parents=True)
+        rawdb = sqlite3.connect(str(old_stats))
+        rawdb.executescript("""
+            CREATE TABLE meta (key TEXT PRIMARY KEY, value TEXT NOT NULL);
+            INSERT INTO meta VALUES ('schema_version', '2');
+            CREATE TABLE stats (board INTEGER NOT NULL, entity TEXT NOT NULL, score INTEGER NOT NULL,
+                name TEXT, tail TEXT, PRIMARY KEY (board, entity));
+            INSERT INTO stats (board, entity, score, name) VALUES (2, 'aa', 12, 'kept');
+        """)
+        rawdb.close()
+        conn = store.connect(old_stats)
+        cols = {r["name"] for r in conn.execute("PRAGMA table_info(stats)")}
+        row = conn.execute("SELECT score, period FROM stats").fetchone()
+        check("period" in cols and tuple(row) == (12, None) and store.meta_get(conn, "schema_version") == "2",
+              "a store from before the column gets it on connect, rows kept, still schema 2")
+        conn.close()
 
         # ------------------------------------------------ schema 1 -> 2 (§71d)
         print("schema 1 -> 2: handles of the lowercased name")

@@ -4,9 +4,11 @@ row can be edited with the server running.
 """
 from __future__ import annotations
 
+import datetime
 import json
 import os
 import sys
+import time
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
@@ -21,8 +23,8 @@ BOARD_NAMES = {
     1: "games started",
     2: "All players / Weekly",
     3: "Monthly",
-    4: "(read at sign-in)",
-    5: "RANKED RATING -- the one the lobby wagers 10% of",
+    4: "Yearly",
+    5: "RANKED RATING -- the one the lobby wagers 10% of (Permanent)",
     6: "(read in a ranked lobby)",
     7: "(read in a ranked lobby)",
     8: "(read in a ranked lobby)",
@@ -35,6 +37,37 @@ RATING_BOARD = 5
 RATING_FLOOR = 10     # the floor the UPLOAD clamps to
 DISPLAY_FLOOR = 1     # the floor the LOBBY DISPLAY clamps to; not the same
 STARTING_RATING = int(serverconfig.get("stats", "starting_rating") or 0)
+# The game's own Board types: 2 Weekly, 3 Monthly, 4 Yearly, 5 Permanent (§74).
+PERIOD_BOARDS = {2: "week", 3: "month", 4: "year"}
+PERIOD_BOARDS_ON = bool(serverconfig.get("stats", "period_boards"))
+CLOCK = time.time
+
+
+def period_key(board_id: int, now: float | None = None) -> str | None:
+    """Which period a Weekly/Monthly/Yearly row belongs to right now (ISO week,
+    month or year, UTC); None for a board that is not windowed."""
+    if not PERIOD_BOARDS_ON or board_id not in PERIOD_BOARDS:
+        return None
+    t = datetime.datetime.fromtimestamp(CLOCK() if now is None else now, datetime.timezone.utc)
+    kind = PERIOD_BOARDS[board_id]
+    if kind == "week":
+        y, w, _d = t.isocalendar()
+        return f"{y}-W{w:02d}"
+    return t.strftime("%Y-%m" if kind == "month" else "%Y")
+
+
+def served_start(board_id: int) -> bool:
+    """Is a missing row on this board served the starting rating?"""
+    return board_id == RATING_BOARD or period_key(board_id) is not None
+
+
+def _where(board_id: int) -> tuple[str, tuple]:
+    """The rows that count as this board's, now: a windowed board's are only
+    those written in the current period."""
+    period = period_key(board_id)
+    if period is None:
+        return "board = ?", (board_id,)
+    return "board = ? AND period = ?", (board_id, period)
 
 
 def upload_after_stake(served: int) -> int:
@@ -70,16 +103,19 @@ def count(board_id: int) -> int:
     """How many rows the board has -- the `totalEntries` a leaderboard reply carries."""
     if disabled():
         return 0
-    return int(store.db().execute("SELECT COUNT(*) FROM stats WHERE board = ?",
-                                  (board_id,)).fetchone()[0])
+    where, args = _where(board_id)
+    return int(store.db().execute(f"SELECT COUNT(*) FROM stats WHERE {where}",
+                                  args).fetchone()[0])
 
 
 def raw(board_id: int, entity_id: int) -> tuple[int, str, list | None] | None:
-    """The stored (score, name, tail) for one board/entity, or None if no row."""
+    """The stored (score, name, tail) for one board/entity, or None if no row
+    (a windowed board's row from an earlier period is no row)."""
     if disabled():
         return None
-    r = store.db().execute("SELECT score, name, tail FROM stats WHERE board = ? "
-                           "AND entity = ?", (board_id, _e(entity_id))).fetchone()
+    where, args = _where(board_id)
+    r = store.db().execute(f"SELECT score, name, tail FROM stats WHERE {where} "
+                           "AND entity = ?", (*args, _e(entity_id))).fetchone()
     if r is None:
         return None
     return int(r["score"]), r["name"] or "", (json.loads(r["tail"]) if r["tail"] else None)
@@ -92,8 +128,9 @@ def tail(board_id: int, entity_id: int) -> list | None:
 
 
 def _rank(conn, board_id: int, score: int) -> int:
-    return 1 + int(conn.execute("SELECT COUNT(*) FROM stats WHERE board = ? AND score > ?",
-                                (board_id, score)).fetchone()[0])
+    where, args = _where(board_id)
+    return 1 + int(conn.execute(f"SELECT COUNT(*) FROM stats WHERE {where} AND score > ?",
+                                (*args, score)).fetchone()[0])
 
 
 def get(board_id: int, entity_id: int, default_name: str = "") -> tuple[int, int, str]:
@@ -102,13 +139,15 @@ def get(board_id: int, entity_id: int, default_name: str = "") -> tuple[int, int
     if row is not None:
         score, name, _tail = row
         return score, _rank(store.db(), board_id, score), name or default_name
-    if board_id == RATING_BOARD:
+    if served_start(board_id):
         return STARTING_RATING, 0, default_name
     return 0, 0, default_name
 
 
-_PAGE_SQL = ("SELECT entity, score, name, RANK() OVER (ORDER BY score DESC) AS rank "
-             "FROM stats WHERE board = ? ORDER BY score DESC, entity")
+def _page_sql(board_id: int) -> tuple[str, tuple]:
+    where, args = _where(board_id)
+    return (f"SELECT entity, score, name, RANK() OVER (ORDER BY score DESC) AS rank "
+            f"FROM stats WHERE {where} ORDER BY score DESC, entity"), args
 
 
 def _rows(cur, default_name: str) -> list[tuple[int, int, int, str]]:
@@ -120,14 +159,16 @@ def board(board_id: int, default_name: str = "") -> list:
     """Every stored row of one board as (entityID, score, rank, name), best first."""
     if disabled():
         return []
-    return _rows(store.db().execute(_PAGE_SQL, (board_id,)), default_name)
+    sql, args = _page_sql(board_id)
+    return _rows(store.db().execute(sql, args), default_name)
 
 
 def top(board_id: int, want: int, default_name: str = "") -> list:
     """The first `want` rows of a board, best first."""
     if disabled():
         return []
-    return _rows(store.db().execute(_PAGE_SQL + " LIMIT ?", (board_id, want)), default_name)
+    sql, args = _page_sql(board_id)
+    return _rows(store.db().execute(sql + " LIMIT ?", (*args, want)), default_name)
 
 
 def page_by_rank(board_id: int, start_rank: int, want: int, default_name: str = "") -> list:
@@ -137,8 +178,9 @@ def page_by_rank(board_id: int, start_rank: int, want: int, default_name: str = 
     """
     if disabled():
         return []
-    sql = f"SELECT * FROM ({_PAGE_SQL}) WHERE rank >= ? ORDER BY score DESC, entity LIMIT ?"
-    return _rows(store.db().execute(sql, (board_id, start_rank, want)), default_name)
+    page, args = _page_sql(board_id)
+    sql = f"SELECT * FROM ({page}) WHERE rank >= ? ORDER BY score DESC, entity LIMIT ?"
+    return _rows(store.db().execute(sql, (*args, start_rank, want)), default_name)
 
 
 def page_around(board_id: int, pivot: int, want: int, default_name: str = "") -> list:
@@ -151,14 +193,15 @@ def page_around(board_id: int, pivot: int, want: int, default_name: str = "") ->
     n = count(board_id)
     row = raw(board_id, pivot)
     at = 0
+    where, args = _where(board_id)
     if row is not None:
         at = int(conn.execute(
-            "SELECT COUNT(*) FROM stats WHERE board = ? AND (score > ? OR "
+            f"SELECT COUNT(*) FROM stats WHERE {where} AND (score > ? OR "
             "(score = ? AND entity < ?))",
-            (board_id, row[0], row[0], _e(pivot))).fetchone()[0])
+            (*args, row[0], row[0], _e(pivot))).fetchone()[0])
     lo = max(0, min(at - want // 2, max(0, n - want)))
-    return _rows(conn.execute(_PAGE_SQL + " LIMIT ? OFFSET ?", (board_id, want, lo)),
-                 default_name)
+    sql, args = _page_sql(board_id)
+    return _rows(conn.execute(sql + " LIMIT ? OFFSET ?", (*args, want, lo)), default_name)
 
 
 def put(board_id: int, entity_id: int, score: int, name: str = "",
@@ -169,11 +212,11 @@ def put(board_id: int, entity_id: int, score: int, name: str = "",
     conn = store.db()
     with store.tx(conn):
         conn.execute(
-            "INSERT INTO stats (board, entity, score, name, tail) VALUES (?, ?, ?, ?, ?) "
+            "INSERT INTO stats (board, entity, score, name, tail, period) VALUES (?, ?, ?, ?, ?, ?) "
             "ON CONFLICT (board, entity) DO UPDATE SET score = excluded.score, "
-            "name = excluded.name, tail = excluded.tail",
+            "name = excluded.name, tail = excluded.tail, period = excluded.period",
             (board_id, _e(entity_id), int(score), name or "",
-             json.dumps(extra) if extra else None))
+             json.dumps(extra) if extra else None, period_key(board_id)))
         return True, _rank(conn, board_id, int(score))
 
 

@@ -181,6 +181,17 @@ nat_type_alt_port = 3078
 # stake, not when they first sign in.
 # starting_rating = 400
 
+# The game's leaderboard has four Board types: Weekly (board 2), Monthly (3),
+# Yearly (4) and Permanent (5, the rating above). The client uploads the same
+# stake and payout arithmetic to all four from whatever each board served, so a
+# windowed board is one the SERVER restarts: with this on, a row on 2, 3 or 4
+# counts only in the ISO week, month or year (UTC) it was written in, and
+# everyone is served starting_rating again when the period turns -- a fresh
+# race each week, month and year. Off, those boards are all-time and a new
+# player starts them at 0, which the game turns into 10 at the first stake and
+# 12 for a win (the stake floors at 1 on a 0 score).
+# period_boards = true
+
 [storage]
 # Where the store (wow2.sqlite3: accounts, leaderboards, pots, clans, friends,
 # profiles, storage rows), the uploaded blobs and the logs live. The server reads

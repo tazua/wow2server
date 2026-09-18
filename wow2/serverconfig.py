@@ -60,6 +60,7 @@ DEFAULTS: dict[str, dict] = {
     },
     "stats": {
         "starting_rating": 400,
+        "period_boards": True,
     },
     "storage": {
         "data_dir": str(_DEFAULT_DATA),
@@ -151,6 +152,7 @@ _ENV = {
     ("logging", "level"): ("WOW2_LOG_LEVEL", str),
     ("storage", "data_dir"): ("WOW2_DATA_DIR", str),
     ("stats", "starting_rating"): ("WOW2_STARTING_RATING", int),
+    ("stats", "period_boards"): ("WOW2_PERIOD_BOARDS", lambda v: v not in ("0", "false", "no", "off")),
     ("limits", "max_msgs_per_sec"): ("WOW2_MAX_MSGS_PER_SEC", int),
     ("limits", "max_conns_per_ip"): ("WOW2_MAX_CONNS_PER_IP", int),
     ("limits", "max_stream_bytes"): ("WOW2_MAX_STREAM_BYTES", int),
@@ -199,6 +201,7 @@ NAT_TYPE = bool(get("nat", "nat_type"))
 NAT_TYPE_ALT_PORT = int(get("nat", "nat_type_alt_port"))
 NAT_TYPE_ALT_ADDRESS = str(get("nat", "nat_type_alt_address"))
 STARTING_RATING = int(get("stats", "starting_rating"))
+PERIOD_BOARDS = bool(get("stats", "period_boards"))
 DISCORD_LOBBY_WEBHOOK = str(get("discord", "lobby_webhook") or "")
 DISCORD_ANNOUNCE_WEBHOOK = str(get("discord", "announce_webhook") or "")
 DISCORD_MENTION = str(get("discord", "mention") or "")
@@ -264,7 +267,9 @@ def describe() -> str:
             + _nat_line()
             + _nat_type_line()
             + f"  stats: a player with no ranked row is served "
-            f"{STARTING_RATING} (stakes {max(1, STARTING_RATING // 10)})\n"
+            f"{STARTING_RATING} (stakes {max(1, STARTING_RATING // 10)}); "
+            + ("the Weekly, Monthly and Yearly boards restart from it each period\n"
+               if PERIOD_BOARDS else "Weekly, Monthly and Yearly are all-time boards from 0\n")
             + f"  limits: {MAX_MSGS_PER_SEC} msg/s per conn, "
             f"{MAX_CONNS_PER_IP} conns per address, "
             f"{MAX_STREAM_BYTES // 1024} KB per conn, "

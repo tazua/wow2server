@@ -90,8 +90,8 @@ def run(keep: bool) -> int:
     desk = bot.Desk(claims_per_day=3, rng=random.Random(7), clock=clock)
 
     print("the text")
-    txt = bot.kit_text("Hiragamer98", "k7mfp2qx", "Wormhole", "<#555>")
-    check("`k7mfp2qx`" in txt and "**Hiragamer98**" in txt and "**Wormhole**" in txt
+    txt = bot.kit_text("BoggyB", "k7mfp2qx", "Wormhole", "<#555>")
+    check("`k7mfp2qx`" in txt and "**BoggyB**" in txt and "**Wormhole**" in txt
           and "<#555>" in txt and "Change password" in txt and "Infrastructure mode" in txt,
           "the kit names the profile, the server, the help channel, the password and both routes")
     tmpl, why = bot.check_text("{name}: {password} {nope}")
@@ -105,7 +105,7 @@ def run(keep: bool) -> int:
     check(len(longest) < 2000, f"the kit fits a Discord message with the longest name ({len(longest)} chars)")
 
     print("names and passwords")
-    check(bot.name_error("Hiragamer98") is None and bot.name_error("lukas1") is None
+    check(bot.name_error("BoggyB") is None and bot.name_error("lukas1") is None
           and bot.name_error("a1b2c3d4e5f6") is None, "6 to 12 letters and digits pass")
     check(all(bot.name_error(n) for n in ("abcde", "a" * 13, "has space", "dot.name", "", "fivec")),
           "too short, too long, a space, punctuation and the empty name are refused")
@@ -118,26 +118,26 @@ def run(keep: bool) -> int:
           "50 passwords: all different, 8 characters, no i/l/1/o/0 to misread on a screen")
 
     print("the desk")
-    r = desk.claim("Hiragamer98", A)
+    r = desk.claim("BoggyB", A)
     p1 = r.password
-    check(r.outcome is bot.Outcome.CLAIMED and r.name == "Hiragamer98" and p1
-          and pwhash("Hiragamer98") == digest(p1),
+    check(r.outcome is bot.Outcome.CLAIMED and r.name == "BoggyB" and p1
+          and pwhash("BoggyB") == digest(p1),
           "a name nobody holds: claimed, and the stored digest is Tiger192 of the password sent")
-    check(srv.stored_credential("hiragamer98") == srv.tiger192(p1.encode()),
+    check(srv.stored_credential("boggyb") == srv.tiger192(p1.encode()),
           "...which is the digest the login reply's ticket is encrypted under (any letter case)")
-    check(bound_to("Hiragamer98") == A, "...and the name is bound to the Discord user who asked")
-    uid = store.db().execute("SELECT user_id FROM accounts WHERE name = 'Hiragamer98'").fetchone()[0]
+    check(bound_to("BoggyB") == A, "...and the name is bound to the Discord user who asked")
+    uid = store.db().execute("SELECT user_id FROM accounts WHERE name = 'BoggyB'").fetchone()[0]
     check(uid and uid >= 100, f"...with a user id allocated like a console's create ({uid})")
 
-    r = desk.claim("hiragamer98", B)
+    r = desk.claim("boggyb", B)
     check(r.outcome is bot.Outcome.TAKEN and "somebody else" in r.detail
-          and pwhash("Hiragamer98") == digest(p1) and bound_to("Hiragamer98") == A,
+          and pwhash("BoggyB") == digest(p1) and bound_to("BoggyB") == A,
           "somebody else asking for the same name (any case) is refused; nothing changes")
 
-    r = desk.claim("HIRAGAMER98", A)
+    r = desk.claim("BOGGYB", A)
     p2 = r.password
-    check(r.outcome is bot.Outcome.RESET and p2 and p2 != p1 and r.name == "Hiragamer98"
-          and pwhash("Hiragamer98") == digest(p2),
+    check(r.outcome is bot.Outcome.RESET and p2 and p2 != p1 and r.name == "BoggyB"
+          and pwhash("BoggyB") == digest(p2),
           "the same user again: a fresh password, the stored name keeps its first case")
 
     srv.set_account_password("lukas1", srv.tiger192(b"123456"))
@@ -186,9 +186,9 @@ def run(keep: bool) -> int:
     check(all(free.claim(f"unlimited{i}", C).outcome is bot.Outcome.CLAIMED for i in range(5)),
           "bot_claims_per_day = 0 is no limit")
 
-    d = desk.lookup("HIRAGAMER98")
-    check(d["registered"] and d["name"] == "Hiragamer98" and d["claimed_by"] == A
-          and d["handle"] == store.account_handle("hiragamer98"),
+    d = desk.lookup("BOGGYB")
+    check(d["registered"] and d["name"] == "BoggyB" and d["claimed_by"] == A
+          and d["handle"] == store.account_handle("boggyb"),
           "lookup: registered, the stored name, who set it, the handle the log prints")
     d = desk.lookup("nobody99")
     check(not d["registered"] and d["claimed_by"] is None, "lookup of a name never seen")

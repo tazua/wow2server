@@ -53,6 +53,15 @@ def cmd_set(args) -> int:
         if not pw:
             print("!! empty password")
             return 1
+        if not 6 <= len(pw) <= 12:
+            print(f"!! {len(pw)} characters: the game takes 6 to 12 and refuses anything else "
+                  f"at its keyboard, before a login is sent -- a console could never type this "
+                  f"password, so the account would be locked out. Pick another.")
+            return 1
+        if not pw.isascii() or not pw.isprintable():
+            print("!! the game's keyboard has no such character; ASCII letters, digits and "
+                  "punctuation only")
+            return 1
         digest = srv.tiger192(pw.encode())
     srv.set_account_password(args.name, digest)
     print(f"stored credential for {args.name!r} "

@@ -65,9 +65,9 @@ and press START to finish.
 **Change it** (only while signed in; the row is greyed out otherwise)
 4. Press ○ until you are back at the Main Menu. That does not sign you out.
 5. Profile → Manage User Profiles → Edit profile.
-6. Second row, *Change password*: type `{password}` once more, then your new \
-password (6 to 12 characters). The game answers *The password for account \
-{name} has been changed*.
+6. Second row, *Change password*. The game asks twice, in this order: first the \
+TEMPORARY password `{password}`, then your NEW password (6 to 12 characters). It \
+answers *The password for account {name} has been changed*.
 7. Optional: *Save password* → On on the same screen, then *Apply Changes and \
 Exit*, and the game stops asking for it.
 
@@ -495,7 +495,7 @@ def dry_run(template: str) -> int:
     text, bad = check_text(template)
     if bad:
         print(f"!! {bad}")
-    print(kit_text("Wormgamer98", new_password(), "Wormhole", "#connection-help", text))
+    print(kit_text("BoggyB", new_password(), "Wormhole", "#connection-help", text))
     files = guide_files()
     print(f"-- {len(files)} picture(s): " + ", ".join(p.name for p in files)
           if files else "-- no pictures (no guide/ directory beside this module)")

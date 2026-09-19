@@ -193,6 +193,7 @@ server prints what is in force at startup.
 | `discord.title` | `Open lobbies` | the board's heading |
 | `discord.announce_text`, `closed_text`, `empty_text`, `offline_text` | built-in wording | templates for what the poster says; the example file lists each one's fields |
 | `discord.announce_cooldown` | `300` | seconds before the same host name pings again; inside it a new lobby edits the previous announcement back to open |
+| `[[discord.also]]` | none | more Discord servers that get the same board and pings: one table per server with its own `lobby_webhook`, `announce_webhook`, `mention`, and optionally `name`, `title`, the four texts and `announce_cooldown` |
 | `discord.bot_guild` | `0` (off) | the Discord server id the password bot (`wow2-discordbot`) serves; the token comes from the environment. See Discord |
 | `discord.bot_admin_roles`, `bot_help_channel`, `bot_claims_per_day`, `bot_text` | `["Admin", "Moderator"]`, `connection-help`, `3`, built-in wording | who may `/reset`, where a refused player is sent, passwords per person per day (`0` = no limit), the DM as a template (`{name} {password} {server} {help}`) |
 
@@ -404,6 +405,16 @@ server whose webhook is a character can give it lines; a template with a
 field that does not exist is named at startup and the built-in wording is
 used.
 
+**Other communities' servers.** Any number of them can carry the same
+board and the same pings: their admin makes the webhooks in their channels,
+you put the URLs in a `[[discord.also]]` table with the role they want
+pinged, restart. Each server gets its own copy of the board, edited in
+place under its own message id, and its own announcements, inheriting the
+title, wording and cooldown unless the table sets its own. Nothing of the
+other server is needed but the two URLs; deleting the webhook on their
+side turns their board off with one line in the log, and the rest carry
+on. The password bot is separate and stays in your own server.
+
 Discord being down costs nothing: the posting runs on its own thread, a
 request that fails is logged once a minute and the next session change
 repaints the whole board, a rate limit is waited out, and a webhook that
@@ -414,7 +425,7 @@ new webhook in the channel's *Integrations*, put its URL in `[discord]` and
 restart. A webhook URL is a secret — whoever holds it can post to the
 channel — so keep the config file to the operator.
 
-`lobbyboardtest.py` is the feature's own suite: 43 checks against a fake
+`lobbyboardtest.py` is the feature's own suite: 53 checks against a fake
 webhook endpoint in the same process, no Discord needed.
 
 ### The password bot
@@ -495,7 +506,7 @@ Discord at all.
 .venv/bin/python -m wow2.blocktest    # a block stops all three invites, 7 checks
 .venv/bin/python -m wow2.ownertest    # identity, ownership, clans, storage, profiles, UDP, relay and login-table bounds, the create limit, 72 checks
 .venv/bin/python -m wow2.storetest    # the SQLite store: the import keeps everything, the rules hold, 33 checks
-.venv/bin/python -m wow2.lobbyboardtest   # the Discord board: what it posts, coalescing, Discord down, 43 checks
+.venv/bin/python -m wow2.lobbyboardtest   # the Discord board: what it posts, coalescing, Discord down, other servers, 53 checks
 .venv/bin/python -m wow2.discordbottest   # the password bot: who gets a password for which name, the DM, 52 checks
 .venv/bin/python -m wow2.loadtest --consoles 32 --lifetime 200   # capacity, see below
 .venv/bin/python -m wow2.dbcli roundtrip DIR   # a directory of JSON stores in and out, field by field

@@ -456,6 +456,65 @@ def run(keep: bool) -> int:
               and src.count("lobbyboard.BOARD.opened(") == 1,
               "...create, update, delete and host-gone all refresh; create announces; "
               "delete, host-gone and a replaced session close")
+
+        print("-- the same board on another community's server ([[discord.also]])")
+        OTHER_BOARD, OTHER_LFG = "500500500", "600600600"
+        fake.reset()
+        fan = lobbyboard.Fanout()
+        bad = fan.configure(fake.url(BOARD_HOOK), fake.url(LFG_HOOK), "<@&424242>", "Open lobbies",
+                            {"announce_text": "{mention} home: {name} {count}"}, 0.6,
+                            [{"name": "Worms Central", "lobby_webhook": fake.url(OTHER_BOARD),
+                              "announce_webhook": fake.url(OTHER_LFG), "mention": "<@&777>",
+                              "announce_text": "{mention} theirs: {name} {count}"},
+                             {"name": "broken", "lobby_webhook": "https://discord.com/api/webhooks/x/y",
+                              "colour": "red"},
+                             "not a table"])
+        check(len(fan.boards) == 3 and fan.boards[1].label == "discord.also[0] (Worms Central)"
+              and fan.boards[1].mention == "<@&777>" and fan.boards[1].title == "Open lobbies"
+              and fan.boards[1].cooldown == 0.6
+              and fan.boards[1].text["announce_text"] == "{mention} theirs: {name} {count}"
+              and fan.boards[1].text["closed_text"] == lobbyboard.DEFAULT_TEXT["closed_text"],
+              "a second server gets its own board with its own mention and lines, inheriting "
+              "the title, the cooldown and the texts it does not set")
+        check(len(bad) == 4 and any("(broken): discord.lobby_webhook is not a webhook URL" in x for x in bad)
+              and any("(broken): no such setting 'colour'" in x for x in bad)
+              and any("(broken): neither lobby_webhook nor announce_webhook" in x for x in bad)
+              and any("also[2] is not a table" in x for x in bad),
+              "a broken entry is named with every problem; the good ones are untouched")
+        for b in fan.boards:
+            b.debounce = 0.15
+            b.retry_delay = 0.3
+        fandb = root / "fan.sqlite3"
+        check(fan.start(fandb) and fan.enabled, "start() runs every board that has a webhook")
+        fan.refresh({}); fan.flush()
+        check(len(fake.of("POST", BOARD_HOOK)) == 1 and len(fake.of("POST", OTHER_BOARD)) == 1
+              and embed_of(fake.of("POST", OTHER_BOARD)[0])["title"] == "Open lobbies",
+              "the empty board is posted to both servers")
+        fan.opened(rec(0x5720, "host9", 1, 4, 1)); fan.refresh({0x5720: rec(0x5720, "host9", 1, 4, 1)}); fan.flush()
+        pings_home = fake.of("POST", LFG_HOOK)
+        pings_other = fake.of("POST", OTHER_LFG)
+        check(len(pings_home) == 1 and pings_home[0][2]["content"] == "<@&424242> home: host9 1/4"
+              and len(pings_other) == 1 and pings_other[0][2]["content"] == "<@&777> theirs: host9 1/4",
+              "a lobby opening pings both servers, each with its own role and its own words")
+        check(len(fake.of("PATCH", BOARD_HOOK)) == 1 and len(fake.of("PATCH", OTHER_BOARD)) == 1
+              and "host9" in embed_of(fake.of("PATCH", OTHER_BOARD)[0])["description"],
+              "...and both boards are edited to show it")
+        fan.closed(0x5720); fan.refresh({}); fan.flush()
+        check(len(fake.of("PATCH", LFG_HOOK)) == 1 and len(fake.of("PATCH", OTHER_LFG)) == 1,
+              "the lobby closing strikes the announcement through on both")
+        fake.reset()
+        fan.stop()
+        check(len(fake.of("PATCH", BOARD_HOOK)) == 1 and len(fake.of("PATCH", OTHER_BOARD)) == 1
+              and fake.of("PATCH", OTHER_BOARD)[0][2]["embeds"][0]["color"] == lobbyboard.COLOR_OFFLINE,
+              "a clean stop paints both boards offline")
+        conn = store.connect(fandb)
+        check(store.meta_get(conn, f"discord.board.{OTHER_BOARD}") is not None
+              and store.meta_get(conn, f"discord.board.{BOARD_HOOK}") is not None,
+              "each board's message id is kept under its own webhook id, so a restart edits both")
+        conn.close()
+        lone = lobbyboard.Fanout()
+        check(lone.configure("", "", "", "", None, None, []) == [] and lone.start(fandb) is False
+              and not lone.enabled, "nothing configured anywhere: off, as before")
     finally:
         fake.close()
         if keep:

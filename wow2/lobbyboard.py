@@ -179,6 +179,7 @@ class LobbyBoard:
         self._last_sid: dict[str, int] = {}
         self._muted_until = 0.0
         self.posted = 0
+        self.label = ""
 
     # ------------------------------------------------------------ the server side
     def configure(self, lobby_url: str = "", announce_url: str = "", mention: str = "",
@@ -473,4 +474,82 @@ class LobbyBoard:
                  f"the next start will post a new one")
 
 
-BOARD = LobbyBoard()
+ALSO_KEYS = ("name", "lobby_webhook", "announce_webhook", "mention", "title",
+             "announce_cooldown", *DEFAULT_TEXT)
+
+
+class Fanout:
+    """Every configured Discord server gets the same board and the same pings,
+    each behind a LobbyBoard of its own: the operator's ([discord]) and any
+    number of other communities' ([[discord.also]]), whose admins made the
+    webhooks and hold the power to delete them (§75)."""
+
+    def __init__(self) -> None:
+        self.boards: list[LobbyBoard] = []
+
+    @property
+    def enabled(self) -> bool:
+        return any(b.enabled for b in self.boards)
+
+    @property
+    def posted(self) -> int:
+        return sum(b.posted for b in self.boards)
+
+    def configure(self, lobby_url: str = "", announce_url: str = "", mention: str = "",
+                  title: str = "Open lobbies", text: dict | None = None,
+                  cooldown: float | None = None, also: list | None = None) -> list[str]:
+        """The operator's settings, then one board per [[discord.also]] entry
+        inheriting the title, texts and cooldown it does not set; the problems."""
+        self.boards = []
+        home = LobbyBoard()
+        bad = home.configure(lobby_url, announce_url, mention, title, text, cooldown)
+        self.boards.append(home)
+        for i, extra in enumerate(also or ()):
+            label = f"discord.also[{i}]"
+            if not isinstance(extra, dict):
+                bad.append(f"{label} is not a table ([[discord.also]] with lobby_webhook = ...)")
+                continue
+            label += f" ({extra['name']})" if extra.get("name") else ""
+            for key in extra:
+                if key not in ALSO_KEYS:
+                    bad.append(f"{label}: no such setting {key!r} (the keys are "
+                               f"{', '.join(ALSO_KEYS)})")
+            b = LobbyBoard()
+            b.label = label
+            own = {**(text or {}), **{k: extra[k] for k in DEFAULT_TEXT if extra.get(k)}}
+            problems = b.configure(str(extra.get("lobby_webhook") or ""),
+                                   str(extra.get("announce_webhook") or ""),
+                                   str(extra.get("mention") or ""),
+                                   str(extra.get("title") or title), own,
+                                   extra.get("announce_cooldown", cooldown))
+            bad.extend(f"{label}: {problem}" for problem in problems)
+            if not b.lobby_url and not b.announce_url:
+                bad.append(f"{label}: neither lobby_webhook nor announce_webhook is set -- "
+                           f"nothing to post there")
+            self.boards.append(b)
+        return bad
+
+    def start(self, db_path: Path | str | None = None) -> bool:
+        return any([b.start(db_path) for b in self.boards])
+
+    def refresh(self, sessions: dict) -> None:
+        for b in self.boards:
+            b.refresh(sessions)
+
+    def opened(self, rec: dict) -> None:
+        for b in self.boards:
+            b.opened(rec)
+
+    def closed(self, sid: int) -> None:
+        for b in self.boards:
+            b.closed(sid)
+
+    def stop(self, timeout: float = 5.0) -> None:
+        for b in self.boards:
+            b.stop(timeout)
+
+    def flush(self, timeout: float = 10.0) -> bool:
+        return all([b.flush(timeout) for b in self.boards])
+
+
+BOARD = Fanout()

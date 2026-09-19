@@ -264,6 +264,23 @@ offline_text = ""
 # pages the role once and the message still reads as open. 0 pings every time.
 announce_cooldown = 300
 
+# ---- THE SAME BOARD AND PINGS ON OTHER SERVERS ----
+# Another community wants #open-lobbies and the LFG ping in its own Discord:
+# their admin makes the two webhooks there (channel settings > Integrations >
+# Webhooks > New Webhook > Copy Webhook URL), hands you the URLs, and picks the
+# role to ping. One table per server; each gets its own copy of the board
+# (edited in place, its message id kept under its own webhook id) and its own
+# pings, with the title, texts and cooldown above unless it sets its own. They
+# revoke by deleting the webhook, which turns that board off with one log line.
+# No bot, no token, nothing of theirs on your machine but the two URLs.
+#
+# [[discord.also]]
+# name = "Worms Central"                                   # for the log
+# lobby_webhook = "https://discord.com/api/webhooks/..."   # their #open-lobbies
+# announce_webhook = "https://discord.com/api/webhooks/..."   # their #looking-for-game
+# mention = "<@&THEIR_ROLE_ID>"                            # their role (or "@here", or "")
+# announce_text = ""                                       # optional: their own lines
+
 # ---- THE PASSWORD BOT (wow2-discordbot) ----
 # A profile that has ever been online sends a sign-in and never a create, and
 # a sign-in carries a hash of the name and nothing else -- so a server that

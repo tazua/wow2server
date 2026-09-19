@@ -4041,7 +4041,8 @@ async def main():
                                               serverconfig.DISCORD_MENTION,
                                               serverconfig.DISCORD_TITLE,
                                               serverconfig.DISCORD_TEXT,
-                                              serverconfig.DISCORD_COOLDOWN):
+                                              serverconfig.DISCORD_COOLDOWN,
+                                              serverconfig.DISCORD_ALSO):
         log(f"!! {problem} -- ignored")
     lobbyboard.BOARD.start(store.path())
     log(f"WOW2 server up: TCP+UDP {bind}:{port}")

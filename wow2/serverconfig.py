@@ -81,6 +81,7 @@ DEFAULTS: dict[str, dict] = {
         "bot_help_channel": "connection-help",
         "bot_claims_per_day": 3,
         "bot_text": "",
+        "also": [],
     },
 }
 
@@ -209,6 +210,7 @@ DISCORD_TITLE = str(get("discord", "title") or "Open lobbies")
 DISCORD_TEXT = {k: str(get("discord", k) or "")
                 for k in ("announce_text", "closed_text", "empty_text", "offline_text")}
 DISCORD_COOLDOWN = float(get("discord", "announce_cooldown"))
+DISCORD_ALSO = list(get("discord", "also") or [])
 DISCORD_BOT_GUILD = int(get("discord", "bot_guild") or 0)
 DISCORD_BOT_ADMIN_ROLES = [str(r) for r in (get("discord", "bot_admin_roles") or [])]
 DISCORD_BOT_HELP_CHANNEL = str(get("discord", "bot_help_channel") or "connection-help").lstrip("#")
@@ -234,7 +236,7 @@ def _nat_line() -> str:
 
 
 def _discord_line() -> str:
-    if not DISCORD_LOBBY_WEBHOOK and not DISCORD_ANNOUNCE_WEBHOOK:
+    if not DISCORD_LOBBY_WEBHOOK and not DISCORD_ANNOUNCE_WEBHOOK and not DISCORD_ALSO:
         return "  discord: off\n"
     parts = []
     if DISCORD_LOBBY_WEBHOOK:
@@ -242,6 +244,10 @@ def _discord_line() -> str:
     if DISCORD_ANNOUNCE_WEBHOOK:
         parts.append(f"announcements -> webhook {_webhook_id(DISCORD_ANNOUNCE_WEBHOOK)}"
                      + (f" (mention {DISCORD_MENTION})" if DISCORD_MENTION else ""))
+    if DISCORD_ALSO:
+        names = [str(a.get("name") or f"also[{i}]") for i, a in enumerate(DISCORD_ALSO)
+                 if isinstance(a, dict)]
+        parts.append(f"and the same to {len(DISCORD_ALSO)} more server(s): {', '.join(names)}")
     return "  discord: " + ", ".join(parts) + "\n"
 
 

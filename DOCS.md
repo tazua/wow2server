@@ -306,7 +306,7 @@ per file, and renames each to `<name>.imported-<date>`.
 |---|---|
 | accounts: name, credential digest, handle, user id | `accounts` |
 | leaderboards: one row per (board, entity) with the score and name; the rank is derived on read; a Weekly, Monthly or Yearly row carries the period it was written in and is read only in that period | `stats` |
-| ranked wagers: open pots, stakes, payouts | `pots` |
+| ranked wagers: open pots, each player's stake on the rating and on the Weekly, Monthly and Yearly boards, payouts; a match nobody finished is refunded on every board 20 s after its session goes | `pots` |
 | clans, members, ranks, outstanding invites | `teams`, `team_members`, `team_proposals` |
 | buddies, invites, blocks, the mailbox, and every name seen | `friends`, `friend_invites`, `blocks`, `messages`, `names` |
 | player profiles, keyed by account id | `profiles` |
@@ -524,7 +524,7 @@ Discord at all.
 .venv/bin/python -m wow2.lsgauth      # the credential path, 27 checks
 .venv/bin/python -m wow2.blocktest    # a block stops all three invites, 7 checks
 .venv/bin/python -m wow2.ownertest    # identity, ownership, clans, storage, profiles, UDP, relay and login-table bounds, the create limit, 72 checks
-.venv/bin/python -m wow2.storetest    # the SQLite store: the import keeps everything, the rules hold, the windowed boards, 42 checks
+.venv/bin/python -m wow2.storetest    # the SQLite store: the import keeps everything, the rules hold, the windowed boards, the pot on every board, 49 checks
 .venv/bin/python -m wow2.lobbyboardtest   # the Discord boards: what they post, coalescing, Discord down, other servers, the leaderboards, 78 checks
 .venv/bin/python -m wow2.discordbottest   # the password bot: who gets a password for which name, the DM, 51 checks
 .venv/bin/python -m wow2.loadtest --consoles 32 --lifetime 200   # capacity, see below

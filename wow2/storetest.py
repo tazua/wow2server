@@ -350,6 +350,76 @@ def run(keep: bool) -> int:
         statsdb.PERIOD_BOARDS_ON = True
         statsdb.CLOCK = time.time
         store.close()
+
+        # ------------------------------------ the pot pays every board back (§77)
+        print("a refund and an award give the side boards their stakes back")
+        import potbank
+        store.startup(log=quiet, stores=(), data_dir=root / "pots")
+        statsdb.CLOCK = lambda: week1
+        potbank._now = lambda: week1
+        wormy, sorer = e1, e2
+        pair = ((sorer, "snailhead"), (wormy, "wormy"))
+        for b in (3, 4, 5):                       # snailhead's rows from an earlier match this month
+            statsdb.put(b, sorer, 360, "snailhead")
+
+        def start(sid: int) -> None:
+            """A ranked start as the client sends it: the side boards, then the rating."""
+            potbank.open_pot(sid, "snailhead")
+            for b in (2, 3, 4, 5):
+                for e, name in pair:
+                    before = statsdb.get(b, e, name)[0]
+                    after = statsdb.upload_after_stake(before)
+                    if b == 5:
+                        potbank.note_stake(sid, e, name, before, after)
+                    else:
+                        potbank.note_side_stake(sid, b, e, name, before, after)
+                    statsdb.put(b, e, after, name)
+
+        start(0x5706)
+        check([statsdb.get(b, wormy)[0] for b in (2, 3, 4, 5)] == [360, 360, 360, 360]
+              and [statsdb.get(b, sorer)[0] for b in (2, 3, 4, 5)] == [360, 324, 324, 324],
+              "a ranked start stakes all four boards from what each served (the VPS's 2026-09-21 match)")
+        _st, rec = potbank._find_live("5706")
+        check(rec["stakes"][f"{wormy:016x}"]["boards"] == {"2": {"before": 400, "after": 360, "stake": 40},
+                                                             "3": {"before": 400, "after": 360, "stake": 40},
+                                                             "4": {"before": 400, "after": 360, "stake": 40}}
+              and rec["stakes"][f"{sorer:016x}"]["boards"]["3"] == {"before": 360, "after": 324, "stake": 36}
+              and rec["stakes"][f"{sorer:016x}"]["stake"] == 36 and potbank._pot_of(rec) == 76
+              and potbank._side_pots(rec) == {"2": 80, "3": 76, "4": 76},
+              "...each stake recorded per board beside the rating's, the side pots summed per board")
+        held = potbank.settle_unresolved(0x5706)
+        potbank._now = lambda: week1 + 30
+        swept = potbank.sweep()
+        check("HELD" in held and len(swept) == 1 and "pot 76 REFUNDED" in swept[0]
+              and "Weekly 80, Monthly 76, Yearly 76 on the side boards too" in swept[0],
+              "the session gone and nobody paid: the sweep refunds, and says what the side boards got back")
+        check([statsdb.get(b, wormy)[0] for b in (2, 3, 4, 5)] == [400, 400, 400, 400]
+              and [statsdb.get(b, sorer)[0] for b in (2, 3, 4, 5)] == [400, 360, 360, 360],
+              "...and every board is back where it was, not just Permanent")
+        potbank.open_pot(0x5707, "snailhead")
+        potbank.settle_unresolved(0x5707)                            # gone with nothing staked: settled
+        check(potbank.note_side_stake(0x5707, 2, wormy, "wormy", 360, 436) == 0
+              and potbank.note_side_stake(0x5708, 2, wormy, "wormy", 400, 360) == 0
+              and potbank._find_live("5708") == (None, None),
+              "a rise on a side board is never a stake, and nothing is recorded for a pot that is not open")
+        start(0x5709)
+        report = potbank.award(["wormy"], "5709")
+        check("Weekly +80, Monthly +76, Yearly +76" in report
+              and [statsdb.get(b, wormy)[0] for b in (2, 3, 4, 5)] == [440, 436, 436, 436]
+              and [statsdb.get(b, sorer)[0] for b in (2, 3, 4, 5)] == [360, 324, 324, 324],
+              "wow2 award pays the winner each board's own pot, as the client's payout would")
+        start(0x570a)
+        statsdb.CLOCK = lambda: week1 + 7 * 86400                    # 2026-W38, still September
+        potbank._now = lambda: week1 + 7 * 86400
+        msg = potbank.settle_unresolved(0x570a, policy_override="refund")
+        check("REFUNDED" in msg and statsdb.raw(2, wormy) is None
+              and statsdb.get(2, wormy)[0] == statsdb.STARTING_RATING
+              and [statsdb.get(b, wormy)[0] for b in (3, 4, 5)] == [436, 436, 436],
+              "a stake refunded after the week turned: the new week's board is left alone, "
+              "Monthly, Yearly and Permanent get theirs back")
+        statsdb.CLOCK = time.time
+        potbank._now = time.time
+        store.close()
         old_stats = root / "oldstats" / store.DB_NAME
         old_stats.parent.mkdir(parents=True)
         rawdb = sqlite3.connect(str(old_stats))

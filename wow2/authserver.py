@@ -682,6 +682,14 @@ def stats_write_upload(dec: dict, who: tuple[str, int] | None = None,
                 stake, pot = potbank.note_stake(sid, entity, name, before, score)
                 log(f"  POT: {name} staked {stake} ({before} -> {score}); "
                     f"session 0x{sid:x} pot is now {pot}")
+    elif board_id in potbank.SIDE_BOARDS:
+        sid = ranked_session_id()
+        if sid:
+            before, _rank, _n = stats_get(board_id, entity, name)
+            stake = potbank.note_side_stake(sid, board_id, entity, name, before, score)
+            if stake:
+                log(f"  POT: {name} staked {stake} on {potbank.SIDE_BOARDS[board_id]} "
+                    f"({before} -> {score}) for session 0x{sid:x}")
     stats_put(board_id, entity, score, name, extra)
     return 0, None
 

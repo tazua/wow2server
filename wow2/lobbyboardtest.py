@@ -1,8 +1,10 @@
 #!/usr/bin/env python3
 """Does the Discord lobby board post what the session table says, coalesce a
 burst into one edit, survive Discord being down, and never block the caller?
-No Discord, no emulator: a fake webhook endpoint in this process records
-every request and answers what the checks tell it to (netrecon §69).
+And does the leaderboards message show the store's top rows, in the period
+that is current, repainted after a score and when the period turns? No
+Discord, no emulator: a fake webhook endpoint in this process records every
+request and answers what the checks tell it to (netrecon §69, §76).
 
     lobbyboardtest.py            # every check
 """
@@ -22,12 +24,14 @@ HERE = Path(__file__).resolve().parent
 sys.path.insert(0, str(HERE))
 
 import lobbyboard                                               # noqa: E402
+import statsdb                                                  # noqa: E402
 import store                                                    # noqa: E402
 
 RESULTS: list[tuple[bool, str]] = []
 LOGGED: list[str] = []
 
 BOARD_HOOK, LFG_HOOK, BAD_HOOK, DEAD_HOOK = "100100100", "200200200", "300300300", "400400400"
+LEAD_HOOK, OTHER_LEAD = "700700700", "800800800"
 
 
 def check(cond: bool, what: str) -> bool:
@@ -139,6 +143,39 @@ def board(fake: FakeDiscord, db: Path | None, lobby=BOARD_HOOK, announce=LFG_HOO
     return b
 
 
+def leaders(fake: FakeDiscord, db: Path | None, hook=LEAD_HOOK, rows=10,
+            start=400) -> lobbyboard.LeaderBoard:
+    b = lobbyboard.LeaderBoard()
+    b.debounce = 0.15
+    b.retry_delay = 0.3
+    bad = b.configure(fake.url(hook), "Leader boards", rows, None, start)
+    assert not bad, bad
+    b.start(db)
+    return b
+
+
+def seed(db: Path, rows: list[tuple[int, str, int, str | None]]) -> None:
+    """(board, name, score, period) rows straight into a scratch store."""
+    conn = store.connect(db)
+    try:
+        with store.tx(conn):
+            for board, name, score, period in rows:
+                conn.execute("INSERT OR REPLACE INTO stats (board, entity, score, name, period) "
+                             "VALUES (?, ?, ?, ?, ?)",
+                             (board, store.account_handle(name), score, name, period))
+    finally:
+        conn.close()
+
+
+def field(call, name: str) -> dict | None:
+    return next((f for f in embed_of(call).get("fields", []) if f["name"].startswith(name)), None)
+
+
+def utc(*ymdhm) -> float:
+    import datetime
+    return datetime.datetime(*ymdhm, tzinfo=datetime.timezone.utc).timestamp()
+
+
 def rec(sid: int, name: str, players=1, max_players=4, points=0, created=None) -> dict:
     return {"id": sid, "name": name, "players": players, "max_players": max_players,
             "points": points, "created": created or int(time.time()) - 60}
@@ -161,11 +198,11 @@ def run(keep: bool) -> int:
         print("-- configuration")
         b = lobbyboard.LobbyBoard()
         bad = b.configure("https://discord.com/api/webhooks/not-a-number/tok", "", "", "")
-        check(len(bad) == 1 and "lobby_webhook" in bad[0] and not b.lobby_url,
+        check(len(bad) == 1 and "lobby_webhook" in bad[0] and not b.url,
               "a malformed webhook URL is reported and that side is left off")
         b = lobbyboard.LobbyBoard()
         check(b.configure("https://discord.com/api/webhooks/123/AbC_-xyz", "", "", "") == []
-              and b.lobby_url.endswith("/123/AbC_-xyz"),
+              and b.url.endswith("/123/AbC_-xyz"),
               "a real-looking webhook URL is accepted")
         b = lobbyboard.LobbyBoard()
         check(b.start(None) is False and not b.enabled, "nothing configured: start() is a no-op")
@@ -456,6 +493,12 @@ def run(keep: bool) -> int:
               and src.count("lobbyboard.BOARD.opened(") == 1,
               "...create, update, delete and host-gone all refresh; create announces; "
               "delete, host-gone and a replaced session close")
+        put = src[src.index("def stats_put("):src.index("def read_typed_tail(")]
+        check(put.count("lobbyboard.BOARD.scored(board_id)") == 1
+              and put.index("stats STORED") < put.index("lobbyboard.BOARD.scored(board_id)")
+              and "serverconfig.DISCORD_LEADERBOARD_WEBHOOK" in src,
+              "...and a stored score tells the leaderboards, after the write, with the "
+              "webhook from the config")
 
         print("-- the same board on another community's server ([[discord.also]])")
         OTHER_BOARD, OTHER_LFG = "500500500", "600600600"
@@ -478,7 +521,7 @@ def run(keep: bool) -> int:
               "the title, the cooldown and the texts it does not set")
         check(len(bad) == 4 and any("(broken): discord.lobby_webhook is not a webhook URL" in x for x in bad)
               and any("(broken): no such setting 'colour'" in x for x in bad)
-              and any("(broken): neither lobby_webhook nor announce_webhook" in x for x in bad)
+              and any("(broken): none of lobby_webhook, announce_webhook and leaderboard_webhook" in x for x in bad)
               and any("also[2] is not a table" in x for x in bad),
               "a broken entry is named with every problem; the good ones are untouched")
         for b in fan.boards:
@@ -515,6 +558,188 @@ def run(keep: bool) -> int:
         lone = lobbyboard.Fanout()
         check(lone.configure("", "", "", "", None, None, []) == [] and lone.start(fandb) is False
               and not lone.enabled, "nothing configured anywhere: off, as before")
+
+        print("-- the leaderboards (§76)")
+        check(lobbyboard.period_text("week", 1_789_000_000) == "week 37 of 2026"
+              and lobbyboard.period_text("month", 1_789_000_000) == "September 2026"
+              and lobbyboard.period_text("year", 1_789_000_000) == "2026",
+              "a windowed board's heading names its period: week 37 of 2026, September 2026, 2026")
+        check(lobbyboard.next_turn(utc(2026, 9, 23, 15, 30)) == utc(2026, 9, 28)
+              and lobbyboard.next_turn(utc(2026, 9, 21)) == utc(2026, 9, 28)
+              and lobbyboard.next_turn(utc(2026, 10, 31, 12)) == utc(2026, 11, 1)
+              and lobbyboard.next_turn(utc(2026, 12, 30, 12)) == utc(2027, 1, 1),
+              "next_turn() is the next Monday, unless a month or a year begins first; "
+              "a Monday at 00:00 is already the new week")
+        e = lobbyboard.render_leaderboards(
+            "Leader boards", ((5, "Permanent", "", ((1, "wormy", 440), (1, "bo", 440),
+                                                    (3, "snailhead", 360)), 12),
+                              (2, "Weekly", "week 37 of 2026", (), 0)),
+            "up", 1_789_000_000, None, 400)
+        f5, f2 = e["fields"]
+        check(e["color"] == lobbyboard.COLOR_LEADER and e["description"].startswith(
+                  "Ranked rating, best first. Everyone starts at 400")
+              and e["timestamp"] == "2026-09-10T00:26:40+00:00" and e["footer"]["text"] == "Updated",
+              "the leaderboards embed: gold, the starting rating in the blurb, an 'Updated' stamp")
+        check(f5["name"] == "Permanent" and f5["value"] ==
+              "```\n 1. wormy      440\n 1. bo         440\n 3. snailhead  360\n```*…and 9 more*"
+              and f2["name"] == "Weekly — week 37 of 2026" and f2["value"] == "*Nobody yet.*",
+              "...a field per board: rank, name and score in aligned columns, ties sharing a rank, "
+              "'and N more', an empty board saying so, the period in the heading")
+        o = lobbyboard.render_leaderboards("Leader boards", (), "offline", 1_700_000_000)
+        check(o["color"] == lobbyboard.COLOR_OFFLINE and "Server offline since <t:1700000000:R>"
+              in o["description"] and "fields" not in o, "...and offline is the red offline line")
+        big = tuple((r, f"name{r:02d}", 1000 - r) for r in range(1, 31))
+        e = lobbyboard.render_leaderboards("L", ((5, "Permanent", "", big, 30),), "up", 0)
+        check(e["fields"][0]["value"].count("\n") == lobbyboard.MAX_ROWS + 1
+              and "and 5 more" in e["fields"][0]["value"] and len(e["fields"][0]["value"]) < 1024,
+              f"thirty rows: {lobbyboard.MAX_ROWS} lines and 'and 5 more', inside Discord's field limit")
+
+        lb = lobbyboard.LeaderBoard()
+        bad = lb.configure("https://discord.com/api/webhooks/x/y", "", 0)
+        check(len(bad) == 2 and "leaderboard_webhook is not a webhook URL" in bad[0]
+              and "leaderboard_rows must be 1 to 25" in bad[1] and lb.rows == 10 and not lb.url
+              and lb.title == "Leader boards",
+              "a malformed webhook URL and a row count out of range are reported, the defaults stand")
+        LOGGED.clear()
+        lb = lobbyboard.LeaderBoard()
+        lb.configure(fake.url(LEAD_HOOK))
+        check(lb.start(None) is False and not lb.enabled and any("need the store" in m for m in LOGGED),
+              "started without a store: off, with a line saying so")
+
+        fake.reset()
+        LOGGED.clear()
+        ldb = root / "leaders.sqlite3"
+        store.connect(ldb).close()
+        lb = leaders(fake, ldb)
+        check(lb.flush(3) and len(fake.of("POST", LEAD_HOOK)) == 1
+              and [f["name"].split(" — ")[0] for f in embed_of(fake.of("POST", LEAD_HOOK)[0])["fields"]]
+              == ["Permanent", "Weekly", "Monthly", "Yearly"]
+              and all(f["value"] == "*Nobody yet.*" for f in embed_of(fake.of("POST", LEAD_HOOK)[0])["fields"])
+              and any("leaderboard message" in m for m in LOGGED),
+              "start() posts the leaderboards at once: Permanent, Weekly, Monthly, Yearly, all empty")
+        lead_id = str(fake.next_id)
+        conn = store.connect(ldb)
+        saved = store.meta_get(conn, f"discord.leaderboard.{LEAD_HOOK}")
+        conn.close()
+        check(saved == lead_id, f"...and its message id {saved} is in the meta table under the "
+                                f"webhook id, apart from the lobby board's")
+        seed(ldb, [(5, f"player{i:02d}", 1000 - 10 * i, None) for i in range(1, 13)]
+                  + [(5, "boggyb", 990, None)]
+                  + [(2, "boggyb", 440, statsdb.period_key(2)), (2, "oldtimer", 999, "2020-W01"),
+                     (3, "boggyb", 440, statsdb.period_key(3)), (4, "boggyb", 440, statsdb.period_key(4))])
+        fake.reset()
+        t0 = time.monotonic()
+        lb.scored(5)
+        took = time.monotonic() - t0
+        lb.flush(3)
+        edits = fake.of("PATCH", LEAD_HOOK)
+        f5 = field(edits[0], "Permanent") if edits else {"value": ""}
+        check(took < 0.02 and len(edits) == 1 and edits[0][1].endswith(f"/messages/{lead_id}")
+              and not fake.of("POST", LEAD_HOOK),
+              f"a score on board 5: scored() returns at once ({took * 1000:.1f} ms), the message is "
+              f"EDITED, nothing new posted")
+        tied = sorted(["player01", "boggyb"], key=store.account_handle)     # a tie is ordered by entity id
+        check(f5["value"].startswith(f"```\n 1. {tied[0]:<8}  990\n 1. {tied[1]:<8}  990\n 3. player02  980\n")
+              and f5["value"].count("\n") == 11 and f5["value"].endswith("```*…and 3 more*"),
+              "...Permanent: ten rows of thirteen, best first, a tie sharing rank 1, 'and 3 more'")
+        f2 = field(edits[0], "Weekly")
+        check(f2 and f2["name"] == "Weekly — " + lobbyboard.period_text("week", time.time())
+              and f2["value"] == "```\n 1. boggyb  440\n```" and "oldtimer" not in f2["value"],
+              "...Weekly: this week's row only, the row from 2020 ignored, the week in the heading")
+        fake.reset()
+        lb.scored(1)
+        lb.scored(9)
+        lb.scored(29)
+        lb.flush(3)
+        check(fake.calls == [], "a score on a board the message does not show (1, 9, 29) repaints nothing")
+        for b in (2, 3, 4, 5, 2, 3, 4, 5):
+            lb.scored(b)
+        lb.flush(3)
+        check(len(fake.of("PATCH", LEAD_HOOK)) == 1,
+              "a match start's burst on boards 2-5, twice over: ONE edit")
+
+        fake.reset()
+        lb.next_turn = lambda now: now + 0.2
+        lb.scored(5)
+        lb.flush(3)
+        fake.reset()
+        time.sleep(1.7)
+        turned = fake.of("PATCH", LEAD_HOOK)
+        check(len(turned) >= 1 and field(turned[0], "Weekly") is not None,
+              f"the period turning (next_turn a second away) repaints the message with nothing scored "
+              f"({len(turned)} edit(s))")
+        lb.next_turn = lobbyboard.next_turn
+        was = statsdb.PERIOD_BOARDS_ON
+        statsdb.PERIOD_BOARDS_ON = False
+        due_off = lb._due()
+        statsdb.PERIOD_BOARDS_ON = was
+        due_on = lb._due()
+        check(due_off is None and due_on is not None and 1.0 <= due_on <= 8 * 86400,
+              "with stats.period_boards off there is no timed wake; on, it is within the week")
+
+        fake.reset()
+        lb.stop(timeout=3)
+        edits = fake.of("PATCH", LEAD_HOOK)
+        check(edits and embed_of(edits[-1])["color"] == lobbyboard.COLOR_OFFLINE
+              and "Server offline" in embed_of(edits[-1])["description"] and not lb.enabled,
+              "stop() paints the leaderboards offline, in red")
+        lb._thread.join(2)
+        check(not lb._thread.is_alive() and lb._conn is None,
+              "...the worker has exited and closed its own store connection")
+        fake.reset()
+        lb2 = leaders(fake, ldb)
+        lb2.flush(3)
+        check(not fake.of("POST", LEAD_HOOK) and len(fake.of("PATCH", LEAD_HOOK)) == 1
+              and fake.of("PATCH", LEAD_HOOK)[0][1].endswith(f"/messages/{lead_id}")
+              and field(fake.of("PATCH", LEAD_HOOK)[0], "Permanent")["value"].count("\n") == 11,
+              "a new server on the same store edits the SAME message, with the rows it holds")
+        lb2.stop(timeout=3)
+
+        fake.reset()
+        fan = lobbyboard.Fanout()
+        bad = fan.configure(fake.url(BOARD_HOOK), "", "", "Open lobbies", None, None,
+                            [{"name": "Worms Central", "leaderboard_webhook": fake.url(OTHER_LEAD),
+                              "leaderboard_title": "Top worms",
+                              "leaderboard_empty_text": "No one on this one yet."}],
+                            fake.url(LEAD_HOOK), "Ranked", 5, 400)
+        check(bad == [] and len(fan.leaders) == 2 and fan.leaders[0].url == fake.url(LEAD_HOOK)
+              and fan.leaders[0].title == "Ranked" and fan.leaders[0].rows == 5
+              and fan.leaders[1].label == "discord.also[0] (Worms Central)"
+              and fan.leaders[1].title == "Top worms" and fan.leaders[1].rows == 5
+              and fan.leaders[1].text["leaderboard_empty_text"] == "No one on this one yet."
+              and len(fan.boards) == 2 and not fan.boards[1].url,
+              "the fan-out: the operator's leaderboards, and a second server's from a table with "
+              "only leaderboard_webhook (its own title and line, the row count inherited), no complaint")
+        for b in fan.boards + fan.leaders:
+            b.debounce = 0.15
+        fan.start(ldb)
+        fan.flush(3)
+        fan.scored(5)
+        fan.flush(3)
+        home = fake.of("PATCH", LEAD_HOOK)
+        other = fake.of("PATCH", OTHER_LEAD)
+        check(len(fake.of("POST", LEAD_HOOK)) == 0 and len(fake.of("POST", OTHER_LEAD)) == 1
+              and len(home) == 2 and len(other) == 1
+              and embed_of(other[0])["title"] == "Top worms"
+              and field(other[0], "Permanent")["value"].count("\n") == 6
+              and field(other[0], "Monthly")["value"] == "```\n 1. boggyb  440\n```",
+              "...a score edits both (the operator's message is the one from before, the second "
+              "server's is new), the second under its own title with five rows")
+        fake.reset()
+        fan.stop()
+        check(len(fake.of("PATCH", LEAD_HOOK)) == 1 and len(fake.of("PATCH", OTHER_LEAD)) == 1
+              and len(fake.of("PATCH", BOARD_HOOK)) == 1,
+              "a clean stop paints every board offline, the leaderboards with the lobby boards")
+        fake.reset()
+        LOGGED.clear()
+        fake.dead.add(DEAD_HOOK)
+        lb3 = leaders(fake, ldb, hook=DEAD_HOOK)
+        lb3.flush(3)
+        check(not lb3.enabled and any("does not exist any more (404 on POST)" in m
+                                      and "Leaderboard off" in m for m in LOGGED),
+              "a leaderboards webhook deleted on Discord's side turns that message off, "
+              "with the line that says so")
+        lb3.stop(timeout=2)
     finally:
         fake.close()
         if keep:

@@ -193,7 +193,10 @@ server prints what is in force at startup.
 | `discord.title` | `Open lobbies` | the board's heading |
 | `discord.announce_text`, `closed_text`, `empty_text`, `offline_text` | built-in wording | templates for what the poster says; the example file lists each one's fields |
 | `discord.announce_cooldown` | `300` | seconds before the same host name pings again; inside it a new lobby edits the previous announcement back to open |
-| `[[discord.also]]` | none | more Discord servers that get the same board and pings: one table per server with its own `lobby_webhook`, `announce_webhook`, `mention`, and optionally `name`, `title`, the four texts and `announce_cooldown` |
+| `discord.leaderboard_webhook` | unset | a webhook URL; the channel gets one message that always shows the top of the Permanent, Weekly, Monthly and Yearly boards. See Discord |
+| `discord.leaderboard_title`, `leaderboard_rows` | `Leader boards`, `10` | the heading, and rows per board (1 to 25) |
+| `discord.leaderboard_text`, `leaderboard_empty_text` | built-in wording | the line under the heading (`{start}` is the starting rating) and what an empty board says |
+| `[[discord.also]]` | none | more Discord servers that get the same boards and pings: one table per server with its own `lobby_webhook`, `announce_webhook`, `leaderboard_webhook`, `mention`, and optionally `name`, `title`, `leaderboard_title`, the six texts and `announce_cooldown` |
 | `discord.bot_guild` | `0` (off) | the Discord server id the password bot (`wow2-discordbot`) serves; the token comes from the environment. See Discord |
 | `discord.bot_admin_roles`, `bot_help_channel`, `bot_claims_per_day`, `bot_text` | `["Admin", "Moderator"]`, `connection-help`, `3`, built-in wording | who may `/reset`, where a refused player is sent, passwords per person per day (`0` = no limit), the DM as a template (`{name} {password} {server} {help}`) |
 
@@ -405,15 +408,31 @@ server whose webhook is a character can give it lines; a template with a
 field that does not exist is named at startup and the built-in wording is
 used.
 
+**The leaderboards.** With `leaderboard_webhook` set the server keeps one
+message in that channel showing the top `leaderboard_rows` of the four
+boards the game's own Leader boards screen offers — Permanent (the rating
+a ranked lobby wagers 10% of), then Weekly, Monthly and Yearly, each with
+the period it is showing in its heading (*Weekly — week 39 of 2026*) while
+`stats.period_boards` is on. Rank, name and score in aligned columns, ties
+sharing a rank, *…and N more* under a full board, *Nobody yet.* on an
+empty one. It is posted at startup and edited after every score that
+lands on one of those boards (a match start's burst is coalesced, at most
+one edit every two seconds), when a sweep refunds an abandoned pot, and
+again the moment a week, month or year turns, so it never shows last
+week's rows under this week's heading. A score put in from the command
+line shows at the next of those. Its message id is kept apart from the
+lobby board's, so one webhook may serve both.
+
 **Other communities' servers.** Any number of them can carry the same
-board and the same pings: their admin makes the webhooks in their channels,
-you put the URLs in a `[[discord.also]]` table with the role they want
-pinged, restart. Each server gets its own copy of the board, edited in
-place under its own message id, and its own announcements, inheriting the
-title, wording and cooldown unless the table sets its own. Nothing of the
-other server is needed but the two URLs; deleting the webhook on their
-side turns their board off with one line in the log, and the rest carry
-on. The password bot is separate and stays in your own server.
+boards and the same pings: their admin makes the webhooks in their
+channels, you put the URLs in a `[[discord.also]]` table with the role
+they want pinged, restart. Each server gets its own copy of whatever it
+named — the lobby board, the pings, the leaderboards — edited in place
+under its own message ids, inheriting the titles, wording, row count and
+cooldown unless the table sets its own. Nothing of the other server is
+needed but the URLs; deleting a webhook on their side turns that message
+off with one line in the log, and the rest carry on. The password bot is
+separate and stays in your own server.
 
 Discord being down costs nothing: the posting runs on its own thread, a
 request that fails is logged once a minute and the next session change
@@ -425,7 +444,7 @@ new webhook in the channel's *Integrations*, put its URL in `[discord]` and
 restart. A webhook URL is a secret — whoever holds it can post to the
 channel — so keep the config file to the operator.
 
-`lobbyboardtest.py` is the feature's own suite: 53 checks against a fake
+`lobbyboardtest.py` is the feature's own suite: 78 checks against a fake
 webhook endpoint in the same process, no Discord needed.
 
 ### The password bot
@@ -505,9 +524,9 @@ Discord at all.
 .venv/bin/python -m wow2.lsgauth      # the credential path, 27 checks
 .venv/bin/python -m wow2.blocktest    # a block stops all three invites, 7 checks
 .venv/bin/python -m wow2.ownertest    # identity, ownership, clans, storage, profiles, UDP, relay and login-table bounds, the create limit, 72 checks
-.venv/bin/python -m wow2.storetest    # the SQLite store: the import keeps everything, the rules hold, 33 checks
-.venv/bin/python -m wow2.lobbyboardtest   # the Discord board: what it posts, coalescing, Discord down, other servers, 53 checks
-.venv/bin/python -m wow2.discordbottest   # the password bot: who gets a password for which name, the DM, 52 checks
+.venv/bin/python -m wow2.storetest    # the SQLite store: the import keeps everything, the rules hold, the windowed boards, 42 checks
+.venv/bin/python -m wow2.lobbyboardtest   # the Discord boards: what they post, coalescing, Discord down, other servers, the leaderboards, 78 checks
+.venv/bin/python -m wow2.discordbottest   # the password bot: who gets a password for which name, the DM, 51 checks
 .venv/bin/python -m wow2.loadtest --consoles 32 --lifetime 200   # capacity, see below
 .venv/bin/python -m wow2.dbcli roundtrip DIR   # a directory of JSON stores in and out, field by field
 ```

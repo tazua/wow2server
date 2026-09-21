@@ -99,13 +99,13 @@ def _e(entity_id: int) -> str:
     return f"{int(entity_id):016x}"
 
 
-def count(board_id: int) -> int:
+def count(board_id: int, conn=None) -> int:
     """How many rows the board has -- the `totalEntries` a leaderboard reply carries."""
     if disabled():
         return 0
     where, args = _where(board_id)
-    return int(store.db().execute(f"SELECT COUNT(*) FROM stats WHERE {where}",
-                                  args).fetchone()[0])
+    return int((conn or store.db()).execute(f"SELECT COUNT(*) FROM stats WHERE {where}",
+                                            args).fetchone()[0])
 
 
 def raw(board_id: int, entity_id: int) -> tuple[int, str, list | None] | None:
@@ -163,12 +163,13 @@ def board(board_id: int, default_name: str = "") -> list:
     return _rows(store.db().execute(sql, args), default_name)
 
 
-def top(board_id: int, want: int, default_name: str = "") -> list:
-    """The first `want` rows of a board, best first."""
+def top(board_id: int, want: int, default_name: str = "", conn=None) -> list:
+    """The first `want` rows of a board, best first. `conn` is for a reader on
+    another thread (the Discord leaderboards), which cannot use the process's."""
     if disabled():
         return []
     sql, args = _page_sql(board_id)
-    return _rows(store.db().execute(sql + " LIMIT ?", (*args, want)), default_name)
+    return _rows((conn or store.db()).execute(sql + " LIMIT ?", (*args, want)), default_name)
 
 
 def page_by_rank(board_id: int, start_rank: int, want: int, default_name: str = "") -> list:

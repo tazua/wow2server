@@ -264,20 +264,45 @@ offline_text = ""
 # pages the role once and the message still reads as open. 0 pings every time.
 announce_cooldown = 300
 
-# ---- THE SAME BOARD AND PINGS ON OTHER SERVERS ----
-# Another community wants #open-lobbies and the LFG ping in its own Discord:
-# their admin makes the two webhooks there (channel settings > Integrations >
-# Webhooks > New Webhook > Copy Webhook URL), hands you the URLs, and picks the
-# role to ping. One table per server; each gets its own copy of the board
-# (edited in place, its message id kept under its own webhook id) and its own
-# pings, with the title, texts and cooldown above unless it sets its own. They
-# revoke by deleting the webhook, which turns that board off with one log line.
-# No bot, no token, nothing of theirs on your machine but the two URLs.
+# ---- THE LEADERBOARDS ----
+# leaderboard_webhook: ONE message in that channel showing the top of the
+# four ranked boards the game's own Leader boards screen offers -- Permanent
+# (the rating a ranked lobby wagers 10% of), then Weekly, Monthly and Yearly,
+# each with the period it is showing in its heading ("Weekly -- week 39 of
+# 2026") when stats.period_boards is on. Posted at startup, edited in place
+# after every score that lands on one of them (a match start's burst is one
+# edit) and again the moment a week, month or year turns, so it never shows
+# last week's rows under this week's heading; "Server offline" on a clean
+# stop. A score put in by hand (`wow2 rating`, `wow2 award`) shows at the
+# next edit. The message id is kept in the store, apart from the lobby
+# board's, so the same webhook may serve both if one channel is wanted.
+#
+# leaderboard_rows: rows per board, 1 to 25 (a field of Discord's holds 25).
+# leaderboard_text: the line under the heading, fields {start} (the
+#   starting rating) and {when}; leaderboard_empty_text: a board with no
+#   row yet, field {when}. Empty for the built-in wording, as above.
+leaderboard_webhook = ""
+leaderboard_title = "Leader boards"
+leaderboard_rows = 10
+leaderboard_text = ""
+leaderboard_empty_text = ""
+
+# ---- THE SAME BOARDS AND PINGS ON OTHER SERVERS ----
+# Another community wants #open-lobbies, the LFG ping or the leaderboards in
+# its own Discord: their admin makes the webhooks there (channel settings >
+# Integrations > Webhooks > New Webhook > Copy Webhook URL), hands you the
+# URLs, and picks the role to ping. One table per server, any of the three
+# webhooks; each gets its own copy of what it asked for (edited in place, the
+# message ids kept under its own webhook ids) and its own pings, with the
+# titles, texts, row count and cooldown above unless it sets its own. They
+# revoke by deleting the webhook, which turns that message off with one log
+# line. No bot, no token, nothing of theirs on your machine but the URLs.
 #
 # [[discord.also]]
 # name = "Worms Central"                                   # for the log
 # lobby_webhook = "https://discord.com/api/webhooks/..."   # their #open-lobbies
 # announce_webhook = "https://discord.com/api/webhooks/..."   # their #looking-for-game
+# leaderboard_webhook = "https://discord.com/api/webhooks/..."   # their #leaderboards
 # mention = "<@&THEIR_ROLE_ID>"                            # their role (or "@here", or "")
 # announce_text = ""                                       # optional: their own lines
 

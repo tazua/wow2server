@@ -604,6 +604,17 @@ def stats_put(board_id: int, entity_id: int, score: int,
         return
     log(f"  stats STORED {statsdb.key(board_id, entity_id)} = score {score} "
         f"(rank {rank or '?'}, was {before[0] if before else None})")
+    lobbyboard.BOARD.scored(board_id)
+
+
+def pot_gone(sid: int) -> None:
+    """The session behind a pot went away: potbank holds or settles it, and a
+    refund it sweeps moves board 5, so the leaderboards repaint."""
+    settled = potbank.settle_unresolved(sid)
+    if settled:
+        log(f"  POT: {settled}")
+        if "REFUNDED" in settled:
+            lobbyboard.BOARD.scored(statsdb.RATING_BOARD)
 
 
 def read_typed_tail(r) -> list:
@@ -812,9 +823,7 @@ def sessions_create_result(dec: dict, peer_ip: str = "", host_key: str = ""):
         SESSIONS.pop(old_sid, None)
         log(f"  session create: {rec['host']!r} already hosted 0x{old_sid:x} "
             f"{old_rec.get('name')!r} -- replaced")
-        settled = potbank.settle_unresolved(old_sid)
-        if settled:
-            log(f"  POT: {settled}")
+        pot_gone(old_sid)
         lobbyboard.BOARD.closed(old_sid)
     sid = _next_session_id[0]
     _next_session_id[0] += 1
@@ -1034,9 +1043,7 @@ def sessions_host_gone(host_key: str) -> None:
         log(f"  session EXPIRED: id=0x{sid:x} {rec.get('name')!r} -- its host's LSG "
             f"connection went away without a Sessions op 3 "
             f"({len(SESSIONS)} live)")
-        settled = potbank.settle_unresolved(sid)
-        if settled:
-            log(f"  POT: {settled}")
+        pot_gone(sid)
         lobbyboard.BOARD.closed(sid)
     if doomed:
         lobbyboard.BOARD.refresh(SESSIONS)
@@ -1132,9 +1139,7 @@ def sessions_delete(dec: dict, host_key: str = ""):
     log(f"  session delete: id=0x{sid:x} "
         + (f"({gone['name']!r} removed, {len(SESSIONS)} live)" if gone
            else "-- not one of ours; the client had no session id"))
-    settled = potbank.settle_unresolved(sid)
-    if settled:
-        log(f"  POT: {settled}")
+    pot_gone(sid)
     if gone:
         lobbyboard.BOARD.closed(sid)
         lobbyboard.BOARD.refresh(SESSIONS)
@@ -4042,7 +4047,11 @@ async def main():
                                               serverconfig.DISCORD_TITLE,
                                               serverconfig.DISCORD_TEXT,
                                               serverconfig.DISCORD_COOLDOWN,
-                                              serverconfig.DISCORD_ALSO):
+                                              serverconfig.DISCORD_ALSO,
+                                              serverconfig.DISCORD_LEADERBOARD_WEBHOOK,
+                                              serverconfig.DISCORD_LEADERBOARD_TITLE,
+                                              serverconfig.DISCORD_LEADERBOARD_ROWS,
+                                              serverconfig.STARTING_RATING):
         log(f"!! {problem} -- ignored")
     lobbyboard.BOARD.start(store.path())
     log(f"WOW2 server up: TCP+UDP {bind}:{port}")

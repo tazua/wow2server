@@ -75,6 +75,11 @@ DEFAULTS: dict[str, dict] = {
         "empty_text": "",
         "offline_text": "",
         "announce_cooldown": 300,
+        "leaderboard_webhook": "",
+        "leaderboard_title": "Leader boards",
+        "leaderboard_rows": 10,
+        "leaderboard_text": "",
+        "leaderboard_empty_text": "",
         # ---- THE PASSWORD BOT (wow2-discordbot; DOCS.md "Discord") ----
         "bot_guild": 0,
         "bot_admin_roles": ["Admin", "Moderator"],
@@ -169,6 +174,7 @@ _ENV = {
     ("discord", "lobby_webhook"): ("WOW2_DISCORD_LOBBY_WEBHOOK", str),
     ("discord", "announce_webhook"): ("WOW2_DISCORD_ANNOUNCE_WEBHOOK", str),
     ("discord", "mention"): ("WOW2_DISCORD_MENTION", str),
+    ("discord", "leaderboard_webhook"): ("WOW2_DISCORD_LEADERBOARD_WEBHOOK", str),
     ("discord", "bot_guild"): ("WOW2_DISCORD_BOT_GUILD", int),
     ("discord", "bot_claims_per_day"): ("WOW2_DISCORD_BOT_CLAIMS_PER_DAY", int),
 }
@@ -208,8 +214,12 @@ DISCORD_ANNOUNCE_WEBHOOK = str(get("discord", "announce_webhook") or "")
 DISCORD_MENTION = str(get("discord", "mention") or "")
 DISCORD_TITLE = str(get("discord", "title") or "Open lobbies")
 DISCORD_TEXT = {k: str(get("discord", k) or "")
-                for k in ("announce_text", "closed_text", "empty_text", "offline_text")}
+                for k in ("announce_text", "closed_text", "empty_text", "offline_text",
+                          "leaderboard_text", "leaderboard_empty_text")}
 DISCORD_COOLDOWN = float(get("discord", "announce_cooldown"))
+DISCORD_LEADERBOARD_WEBHOOK = str(get("discord", "leaderboard_webhook") or "")
+DISCORD_LEADERBOARD_TITLE = str(get("discord", "leaderboard_title") or "Leader boards")
+DISCORD_LEADERBOARD_ROWS = get("discord", "leaderboard_rows")
 DISCORD_ALSO = list(get("discord", "also") or [])
 DISCORD_BOT_GUILD = int(get("discord", "bot_guild") or 0)
 DISCORD_BOT_ADMIN_ROLES = [str(r) for r in (get("discord", "bot_admin_roles") or [])]
@@ -236,7 +246,8 @@ def _nat_line() -> str:
 
 
 def _discord_line() -> str:
-    if not DISCORD_LOBBY_WEBHOOK and not DISCORD_ANNOUNCE_WEBHOOK and not DISCORD_ALSO:
+    if not DISCORD_LOBBY_WEBHOOK and not DISCORD_ANNOUNCE_WEBHOOK \
+            and not DISCORD_LEADERBOARD_WEBHOOK and not DISCORD_ALSO:
         return "  discord: off\n"
     parts = []
     if DISCORD_LOBBY_WEBHOOK:
@@ -244,6 +255,9 @@ def _discord_line() -> str:
     if DISCORD_ANNOUNCE_WEBHOOK:
         parts.append(f"announcements -> webhook {_webhook_id(DISCORD_ANNOUNCE_WEBHOOK)}"
                      + (f" (mention {DISCORD_MENTION})" if DISCORD_MENTION else ""))
+    if DISCORD_LEADERBOARD_WEBHOOK:
+        parts.append(f"leaderboards -> webhook {_webhook_id(DISCORD_LEADERBOARD_WEBHOOK)} "
+                     f"(top {DISCORD_LEADERBOARD_ROWS})")
     if DISCORD_ALSO:
         names = [str(a.get("name") or f"also[{i}]") for i, a in enumerate(DISCORD_ALSO)
                  if isinstance(a, dict)]

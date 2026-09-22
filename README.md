@@ -8,11 +8,45 @@ the auth and lobby services the game talks to, so consoles can sign in, find
 each other and play. Sign-in, the game browser, hosting, joining, full
 matches, chat, leaderboards, daily awards, ranked play, clans, buddies,
 match invites and host migration all work, on the PPSSPP emulator and on
-retail hardware.
+retail hardware. A public server running this code is already up, with
+players on it — see below if you want to play rather than deploy.
 
 Python 3.11 or newer, nothing else.
 
-## Install
+## You do not have to run one to play
+
+A public server built from this code has been up since September 2026, and
+the players are on Discord: **https://discord.gg/xPeXxye8Z** (Wormhole).
+One DNS address on the console and the game's online mode works as it did
+in 2007 — hosting, the browser, ranked play, clans, chat. Come and get a
+match rather than playing alone against your own server.
+
+Set the console's **primary DNS** to either of these; both reach the same
+server:
+
+- `67.222.156.250` — PS Rewired, a DNS service for revived PSP games in
+  general. It answers for other titles too, and the PSP's own connection
+  test passes.
+- `199.247.2.103` — the game server's own responder. It answers the four
+  `demonware.net` names this game asks for and nothing else, so the PSP's
+  connection test says there is no internet; the game works anyway.
+
+On a PSP: Settings, Network Settings, Infrastructure Mode, your connection,
+Address Settings, Custom, DNS Setting, Manual, Primary DNS, and leave the
+rest automatic. In PPSSPP: Settings, Networking, turn Networking on, then
+the DNS server field.
+
+Then Wireless MP, Infrastructure, and follow the prompts. Your online name
+is the name of the local profile you are playing on, so play on a real
+profile rather than Guest; the password the game asks for the first time is
+a new one, 6 to 12 characters. The PAL and US discs play together.
+
+A profile that was ever online on the original Demonware servers carries an
+account no new server has ever seen, and the game will say the name or
+password is incorrect whatever you type. The Discord's #old-profiles channel
+and its password bot exist for exactly that.
+
+## Run your own
 
 A deployment is two processes: the game server, and a DNS responder that
 answers the four `demonware.net` names the game looks up. A real PSP cannot

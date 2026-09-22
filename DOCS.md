@@ -2,7 +2,8 @@
 
 What the game speaks, what the server does with it, and how to run it.
 [RPCS.md](RPCS.md) is the per-opcode reference for the lobby; this file is
-everything around it.
+everything around it. To *play* rather than deploy, you want the README
+instead: a public server is already running and its community is on Discord.
 
 Contents: [Protocol](#protocol) · [Configuration](#configuration) ·
 [Accounts](#accounts) · [What the server stores](#what-the-server-stores) ·

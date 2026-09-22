@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
-"""Does the Discord lobby board post what the session table says, coalesce a
-burst into one edit, survive Discord being down, and never block the caller?
+"""Does the Discord lobby board post what the session table says -- who is
+online, the lobbies, the games in progress -- coalesce a burst into one edit,
+survive Discord being down, and never block the caller?
 And does the leaderboards message show the store's top rows, in the period
 that is current, repainted after a score and when the period turns? No
 Discord, no emulator: a fake webhook endpoint in this process records every
@@ -218,6 +219,9 @@ def run(keep: bool) -> int:
               and "No open lobbies" in embed_of(posts[0])["description"]
               and embed_of(posts[0])["color"] == lobbyboard.COLOR_EMPTY,
               "...one POST with ?wait=true, saying there is nothing open, in grey")
+        check(embed_of(posts[0])["description"].startswith(
+                  "\U0001F465 **0** online — 0 in a lobby, 0 playing, 0 waiting\n\n"),
+              "...under a first line saying nobody is online")
         conn = store.connect(db)
         saved = store.meta_get(conn, f"discord.board.{BOARD_HOOK}")
         conn.close()
@@ -271,8 +275,63 @@ def run(keep: bool) -> int:
         check(d.count("\U0001F7E2") == lobbyboard.MAX_ROWS and "and 5 more" in d,
               f"thirty lobbies: {lobbyboard.MAX_ROWS} rows and 'and 5 more'")
 
+        print("-- who is online, and the games in progress (§78)")
+        fake.reset()
+        sessions = {0x5701: rec(0x5701, "player1", players=2, points=1, created=1_700_000_000)}
+        b.refresh(sessions, 5)
+        b.flush(3)
+        d = embed_of(fake.of("PATCH", BOARD_HOOK)[0])["description"]
+        check(d.startswith("\U0001F465 **5** online — 2 in a lobby, 0 playing, 3 waiting\n\n\U0001F7E2"),
+              "five signed in, two of them in the one lobby: the first line says so, "
+              "and the waiting are the rest")
+        fake.reset()
+        game = rec(0x5702, "player2", players=4, created=1_700_000_050)
+        game.update(started=1_700_000_100, playing=2)
+        sessions[0x5702] = game
+        b.refresh(sessions, 5)
+        b.flush(3)
+        d = embed_of(fake.of("PATCH", BOARD_HOOK)[0])["description"]
+        check("**5** online — 2 in a lobby, 2 playing, 1 waiting" in d
+              and "\U0001F3AE **player2** — 2 playing — friendly — started <t:1700000100:R>" in d
+              and "4/4" not in d and "full" not in d
+              and d.index("**player1**") < d.index("**player2**"),
+              "a session whose host reported a game started is a game in progress: its "
+              "own line with the players it had before the start, after the lobbies, "
+              "never '4/4 full'; the first line counts them as playing")
+        fake.reset()
+        b.refresh(sessions, 1)
+        b.flush(3)
+        d = embed_of(fake.of("PATCH", BOARD_HOOK)[0])["description"]
+        check("**1** online — 2 in a lobby, 2 playing, 0 waiting" in d,
+              "fewer online than the sessions account for (a joiner that quit mid-match): "
+              "waiting stops at 0")
+        rows, counts = lobbyboard.snapshot(sessions, 5)
+        check(counts == (5, 1, 2, 2, 1, 1)
+              and rows == (("player1", 2, 4, True, 1_700_000_000, False, 0),
+                           ("player2", 2, 4, False, 1_700_000_050, False, 1_700_000_100)),
+              "snapshot() is (rows, counts): counts (online, waiting, in a lobby, playing, "
+              "lobbies, games), a row (name, players, max, ranked, opened, full, started)")
+        full = rec(0x5703, "player3", players=4)
+        rows, counts = lobbyboard.snapshot({**sessions, 0x5703: full}, 0)
+        check([r[0] for r in rows] == ["player1", "player3", "player2"] and rows[1][5] is True
+              and counts == (0, 0, 6, 2, 2, 1),
+              "open lobbies first, then the full ones, then the games in progress")
+        sarge_line = {"online_text": "{online} on the line: {in_lobby} falling in, {playing} in the "
+                                     "field, {waiting} standing by ({lobbies} lobbies, {games} games)"}
+        e = lobbyboard.render_board("Sitrep", rows, "up", 1_700_000_000,
+                                    {**lobbyboard.DEFAULT_TEXT, **sarge_line}, counts)["description"]
+        check(e.startswith("0 on the line: 6 falling in, 2 in the field, 0 standing by (2 lobbies, 1 games)\n"),
+              "online_text is a template over online, in_lobby, playing, waiting, lobbies, games")
+        b8 = lobbyboard.LobbyBoard()
+        bad = b8.configure(fake.url(BOARD_HOOK), "", "", "", {"online_text": "{online} up, {idle} idle"})
+        check(len(bad) == 1 and "online_text" in bad[0] and "{waiting}" in bad[0]
+              and b8.text["online_text"] == lobbyboard.DEFAULT_TEXT["online_text"],
+              "...and a broken one is named with the fields it may use, the default standing")
+
         print("-- announcements")
         fake.reset()
+        sessions = {0x5701: rec(0x5701, "player1", players=4, points=1, created=1_700_000_000),
+                    0x5702: rec(0x5702, "player2", players=2), 0x5703: rec(0x5703, "player3")}
         b.opened(sessions[0x5701])
         b.flush(3)
         posts = fake.of("POST", LFG_HOOK)
@@ -460,7 +519,7 @@ def run(keep: bool) -> int:
         o = lobbyboard.render_board("Sitrep", (), "offline", 1_700_000_000, b5.text)["description"]
         check(a == "<@&7> Listen up! player1 opened a ranked lobby, 1/4. Move it!"
               and c == "At ease. player1's friendly lobby closed <t:1700000000:R>."
-              and e.startswith("Nothing on the board. Host one, recruit.")
+              and e.split("\n")[2] == "Nothing on the board. Host one, recruit."
               and o == "Server down since <t:1700000000:R>. Stand by.",
               "...and every field fills in: mention, name, mode, count, when")
         check(lobbyboard.render_announcement("", "player1", False, 1, 4, b5.text)
@@ -480,19 +539,59 @@ def run(keep: bool) -> int:
         import authserver
         s = {"id": 0x5710, "name": "player9", "players": 1, "max_players": 4, "points": 0,
              "created": int(time.time())}
-        snap = lobbyboard.snapshot({0x5710: s})
-        check(snap == (("player9", 1, 4, False, s["created"], False),),
+        snap = lobbyboard.snapshot({0x5710: s}, 1)
+        check(snap == ((("player9", 1, 4, False, s["created"], False, 0),), (1, 0, 1, 0, 1, 0)),
               "snapshot() takes exactly the fields the create handler fills in")
-        check(getattr(authserver.lobbyboard, "BOARD") is lobbyboard.BOARD
-              and "lobbyboard.BOARD.refresh(SESSIONS)" in
-              Path(authserver.__file__).read_text(),
-              "authserver imports the board and refreshes it from the session handlers")
         src = Path(authserver.__file__).read_text()
-        check(src.count("lobbyboard.BOARD.refresh(SESSIONS)") == 4
+        check(getattr(authserver.lobbyboard, "BOARD") is lobbyboard.BOARD
+              and "lobbyboard.BOARD.refresh(SESSIONS, online_count())" in src,
+              "authserver imports the board and refreshes it with the session table and "
+              "the number of consoles signed in")
+        check(src.count("board_refresh()") - 1 == 7
               and src.count("lobbyboard.BOARD.closed(") == 3
-              and src.count("lobbyboard.BOARD.opened(") == 1,
-              "...create, update, delete and host-gone all refresh; create announces; "
-              "delete, host-gone and a replaced session close")
+              and src.count("lobbyboard.BOARD.opened(") == 1
+              and src.index("board_refresh()", src.index("def complete_bind(")) <
+              src.index("def data_received(")
+              and src.index("board_refresh()", src.index("def connection_lost(")) <
+              src.index("# ----", src.index("def connection_lost(")),
+              "...create, update, delete, host-gone, a game started, a bind completed and a "
+              "bound connection lost all refresh; create announces; delete, host-gone and "
+              "a replaced session close")
+        said = []
+        authserver.log = said.append
+        Conn = type("Conn", (), {})
+        def conn(account, is_lsg=True, authenticated=True):
+            c = Conn(); c.account, c.is_lsg, c.authenticated = account, is_lsg, authenticated
+            return c
+        authserver.LSG_CONNS.clear()
+        authserver.LSG_CONNS.update({"player1": conn("player1"), "player2": conn("player2"),
+                                     "10.0.0.9": conn(None, authenticated=False)})
+        check(authserver.online_count() == 2,
+              "online_count() is the bound LSG connections; a provisional one (§60) is not in")
+        authserver.SESSIONS.clear()
+        live = {"id": 0x5731, "name": "player1", "host": "player1", "players": 4, "max_players": 4,
+                "players_before": 2, "points": 0, "created": 1_700_000_000}
+        authserver.SESSIONS[0x5731] = live
+        authserver.host_reported_game("player2", 8, 9)
+        check(not live.get("started"), "a game reported by somebody who is not the host changes nothing")
+        authserver.host_reported_game("player1", 8, 9)
+        check(live.get("started") and live.get("playing") == 2
+              and any("session STARTED" in m and "2 playing" in m for m in said),
+              "the host's board 1 going up by one starts the session, with the players it "
+              "advertised before the start's own 4/4 (§63d), and says so in the log")
+        said.clear()
+        authserver.host_reported_game("player1", 9, 9)
+        check(live.get("started") and any("session FINISHED" in m for m in said),
+              "...the same score again is logged as the finish; the session stays until "
+              "the host deletes it")
+        lobby = {"id": 0x5732, "name": "player2", "host": "player2", "players": 3, "max_players": 4,
+                 "players_before": 2, "points": 1, "created": 1_700_000_000}
+        authserver.SESSIONS[0x5732] = lobby
+        authserver.host_reported_game("player2", 0, 1)
+        check(lobby.get("playing") == 3,
+              "a host whose count never reached the maximum started with the count as it stands")
+        authserver.SESSIONS.clear()
+        authserver.LSG_CONNS.clear()
         put = src[src.index("def stats_put("):src.index("def read_typed_tail(")]
         check(put.count("lobbyboard.BOARD.scored(board_id)") == 1
               and put.index("stats STORED") < put.index("lobbyboard.BOARD.scored(board_id)")

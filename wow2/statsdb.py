@@ -34,6 +34,7 @@ BOARD_NAMES = {
     32: "clan",
 }
 RATING_BOARD = 5
+GAMES_BOARD = 1       # games started: +1 from every player at a match start (§21, §48)
 RATING_FLOOR = 10     # the floor the UPLOAD clamps to
 DISPLAY_FLOOR = 1     # the floor the LOBBY DISPLAY clamps to; not the same
 STARTING_RATING = int(serverconfig.get("stats", "starting_rating") or 0)

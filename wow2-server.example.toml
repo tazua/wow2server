@@ -213,9 +213,13 @@ nat_type_alt_port = 3078
 # Leave both empty and none of this runs.
 #
 # lobby_webhook: ONE message in that channel, posted at startup and edited in
-# place from then on -- every create, join, leave and close the server sees,
-# a burst coalesced into one edit two seconds later, "Server offline" in red
-# on a clean stop. The message id is kept in the store, so a restart edits the
+# place from then on: a first line with how many consoles are signed in and
+# where they are (in a lobby, playing, or waiting in the menus), then a line
+# per lobby (host, players, ranked or friendly, when it opened) and per game
+# in progress (host, players, when it started) -- every sign-in, sign-out,
+# create, join, leave, match start and close the server sees, a burst
+# coalesced into one edit two seconds later, "Server offline" in red on a
+# clean stop. The message id is kept in the store, so a restart edits the
 # same message; a message a moderator deleted is simply re-posted. Discord
 # being unreachable costs one log line a minute and nothing else: the board is
 # a picture of the session table, not a queue of events, so the next change
@@ -242,6 +246,10 @@ title = "Open lobbies"
 #                  -- the announcement is EDITED into this when the lobby closes
 #   empty_text     {when}       -- the board with no lobby open
 #   offline_text   {when}       -- the board after a clean stop
+#   online_text    {online} {in_lobby} {playing} {waiting} {lobbies} {games} {when}
+#                  -- the board's first line: consoles signed in, of them how
+#                  many are in a lobby, in a game, or waiting in the menus,
+#                  and how many lobbies and games there are
 # {when} is a Discord timestamp that reads "3 minutes ago" and keeps counting.
 # A template with a field that does not exist is named at startup and the
 # built-in wording is used instead. Discord markdown works (**bold**, ~~struck~~).
@@ -252,10 +260,12 @@ title = "Open lobbies"
 #   closed_text = "At ease. **{name}**'s {mode} lobby stood down {when}."
 #   empty_text = "*Nothing on the board, recruit. Host a game from the Infrastructure menu and I'll post it here.*"
 #   offline_text = "\U0001F534 *The server is down since {when}. Stand by for orders.*"
+#   online_text = "{online} recruits on the line: {in_lobby} falling in, {playing} in the field, {waiting} standing by."
 announce_text = ""
 closed_text = ""
 empty_text = ""
 offline_text = ""
+online_text = ""
 
 # Seconds after a host's ping before the same host name pings again. Inside
 # the window a new lobby from that host EDITS the previous announcement back

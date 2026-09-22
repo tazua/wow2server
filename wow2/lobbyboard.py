@@ -1,10 +1,11 @@
 #!/usr/bin/env python3
-"""The Discord boards: one message in a channel that always shows the live
-session list, one that shows the leaderboards, and an optional announcement
-when a lobby opens. Fed by the server's session and stats handlers, posted
+"""The Discord boards: one message in a channel that always shows who is
+online and the live session list (lobbies and the games in progress), one
+that shows the leaderboards, and an optional announcement when a lobby
+opens. Fed by the server's session, connection and stats handlers, posted
 through Discord webhooks from a worker thread that never blocks a handler
-(netrecon §69, §76; tools/README.md "lobbyboard.py"; the [discord] section
-of wow2-server.example.toml).
+(netrecon §69, §76, §78; tools/README.md "lobbyboard.py"; the [discord]
+section of wow2-server.example.toml).
 """
 from __future__ import annotations
 
@@ -61,6 +62,8 @@ DEFAULT_TEXT = {
     "closed_text": "~~\U0001F3AE **{name}** opened a {mode} lobby~~ — closed {when}",
     "empty_text": "*No open lobbies. Host one from the Infrastructure menu and it "
                   "appears here.*",
+    "online_text": "\U0001F465 **{online}** online — {in_lobby} in a lobby, {playing} "
+                   "playing, {waiting} waiting",
     "offline_text": "\U0001F534 *Server offline since {when}.*",
     "leaderboard_text": "Ranked rating, best first. Everyone starts at {start}; a ranked "
                         "lobby wagers 10% of it.",
@@ -71,6 +74,8 @@ TEXT_FIELDS = {
                       "players": 1, "max": 4},
     "closed_text": {"name": "x", "mode": "ranked", "count": "1/4", "when": "<t:0:R>"},
     "empty_text": {"when": "<t:0:R>"},
+    "online_text": {"online": 5, "waiting": 1, "in_lobby": 2, "playing": 2, "lobbies": 1,
+                    "games": 1, "when": "<t:0:R>"},
     "offline_text": {"when": "<t:0:R>"},
     "leaderboard_text": {"start": 400, "when": "<t:0:R>"},
     "leaderboard_empty_text": {"when": "<t:0:R>"},
@@ -107,42 +112,62 @@ def _id_in(url: str) -> str:
     return m.group(1) if m else "?"
 
 
-def snapshot(sessions: dict) -> tuple:
-    """What the board needs from the live session table, cheap to take and safe
-    to hand to another thread: open lobbies first, newest first, like the browser.
-    """
-    rows = []
+def snapshot(sessions: dict, online: int = 0) -> tuple:
+    """What the board needs from the live session table and the number of
+    consoles signed in, cheap to take and safe to hand to another thread:
+    (rows, counts). Rows go open lobbies first, newest first, like the
+    browser, then the full ones, then the games in progress (a session whose
+    host reported a game started, §78); counts is (online, waiting, in a
+    lobby, playing, lobbies, games)."""
+    rows, in_lobby, playing, lobbies, games = [], 0, 0, 0, 0
     for rec in sessions.values():
         mx = int(rec.get("max_players") or 0)
         n = int(rec.get("players") or 0)
-        rows.append((bool(mx) and n >= mx, -int(rec.get("id") or 0),
+        started = int(rec.get("started") or 0)
+        if started:
+            n = int(rec.get("playing") or n)
+            playing += n
+            games += 1
+        else:
+            in_lobby += n
+            lobbies += 1
+        full = bool(mx) and n >= mx and not started
+        rows.append((2 if started else 1 if full else 0, -int(rec.get("id") or 0),
                      str(rec.get("name") or "?"), n, mx, bool(rec.get("points")),
-                     int(rec.get("created") or 0)))
+                     int(rec.get("created") or 0), full, started))
     rows.sort()
-    return tuple((name, n, mx, ranked, created, full)
-                 for full, _neg, name, n, mx, ranked, created in rows)
+    return (tuple((name, n, mx, ranked, created, full, started)
+                  for _order, _neg, name, n, mx, ranked, created, full, started in rows),
+            (online, max(0, online - in_lobby - playing), in_lobby, playing, lobbies, games))
 
 
 def render_board(title: str, rows: tuple, state: str, now: float,
-                 text: dict | None = None) -> dict:
-    """The embed for a snapshot. `state` is "up" or "offline"."""
+                 text: dict | None = None, counts: tuple | None = None) -> dict:
+    """The embed for a snapshot. `state` is "up" or "offline"; `counts` is the
+    snapshot's (online, waiting, in a lobby, playing, lobbies, games)."""
     text = text or DEFAULT_TEXT
     when = f"<t:{int(now)}:R>"
     if state == "offline":
         return {"title": title, "color": COLOR_OFFLINE,
                 "description": text["offline_text"].format(when=when)}
-    lines = []
-    for name, n, mx, ranked, created, full in rows[:MAX_ROWS]:
+    online, waiting, in_lobby, playing, lobbies, games = counts or (0, 0, 0, 0, 0, 0)
+    lines = [text["online_text"].format(online=online, waiting=waiting, in_lobby=in_lobby,
+                                        playing=playing, lobbies=lobbies, games=games,
+                                        when=when), ""]
+    for name, n, mx, ranked, created, full, started in rows[:MAX_ROWS]:
+        mode = "ranked" if ranked else "friendly"
+        if started:
+            lines.append(f"\U0001F3AE **{name}** — {n} playing — {mode} — "
+                         f"started <t:{started}:R>")
+            continue
         dot = "\U0001F534" if full else "\U0001F7E2"
-        count = f"{n}/{mx}" if mx else f"{n} player{'s' if n != 1 else ''}"
-        line = (f"{dot} **{name}** — {count}{' full' if full else ''} — "
-                f"{'ranked' if ranked else 'friendly'}")
+        line = f"{dot} **{name}** — {count_text(n, mx)}{' full' if full else ''} — {mode}"
         if created:
             line += f" — opened <t:{created}:R>"
         lines.append(line)
     if len(rows) > MAX_ROWS:
         lines.append(f"*…and {len(rows) - MAX_ROWS} more*")
-    if not lines:
+    if not rows:
         lines.append(text["empty_text"].format(when=when))
     lines += ["", f"Updated {when}"]
     return {"title": title, "color": COLOR_OPEN if rows else COLOR_EMPTY,
@@ -516,7 +541,8 @@ class Board:
 
 
 class LobbyBoard(Board):
-    """The live session list, and the announcements, on one worker."""
+    """Who is online and the live session list, and the announcements, on one
+    worker."""
 
     def __init__(self) -> None:
         super().__init__()
@@ -550,13 +576,15 @@ class LobbyBoard(Board):
         return bool(self.url or self.announce_url)
 
     def picture(self, snap: tuple, now: float) -> dict:
-        return render_board(self.title, snap, self._state, now, self.text)
+        rows, counts = snap if snap else ((), None)
+        return render_board(self.title, rows, self._state, now, self.text, counts)
 
-    def refresh(self, sessions: dict) -> None:
-        """The session table changed. Called from the loop thread; returns at once."""
+    def refresh(self, sessions: dict, online: int = 0) -> None:
+        """The session table, or who is signed in, changed. Called from the loop
+        thread; returns at once."""
         if not self.enabled or not self.url:
             return
-        self._offer(snapshot(sessions))
+        self._offer(snapshot(sessions, online))
 
     def opened(self, rec: dict) -> None:
         """A session was created: a fresh ping, or, inside the host's cooldown, the
@@ -765,9 +793,9 @@ class Fanout:
     def start(self, db_path: Path | str | None = None) -> bool:
         return any([b.start(db_path) for b in self.boards + self.leaders])
 
-    def refresh(self, sessions: dict) -> None:
+    def refresh(self, sessions: dict, online: int = 0) -> None:
         for b in self.boards:
-            b.refresh(sessions)
+            b.refresh(sessions, online)
 
     def opened(self, rec: dict) -> None:
         for b in self.boards:

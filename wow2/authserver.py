@@ -690,6 +690,9 @@ def stats_write_upload(dec: dict, who: tuple[str, int] | None = None,
             if stake:
                 log(f"  POT: {name} staked {stake} on {potbank.SIDE_BOARDS[board_id]} "
                     f"({before} -> {score}) for session 0x{sid:x}")
+    elif board_id == statsdb.GAMES_BOARD:
+        before, _rank, _n = stats_get(board_id, entity, name)
+        host_reported_game(peer_ip, before, score)
     stats_put(board_id, entity, score, name, extra)
     return 0, None
 
@@ -807,6 +810,37 @@ _next_session_id = [0x5701]
 SEARCH_PAGE_MAX = 50    # the browser asks for 25
 
 
+def online_count() -> int:
+    """Consoles signed in: the LSG connections bound to an account (§60)."""
+    return sum(1 for c in LSG_CONNS.values() if c.is_lsg and c.account and c.authenticated)
+
+
+def board_refresh() -> None:
+    """The session table, or who is signed in, changed: repaint the lobby board."""
+    lobbyboard.BOARD.refresh(SESSIONS, online_count())
+
+
+def host_reported_game(host_key: str, before: int, score: int) -> None:
+    """Board 1 from a session's host: one more game started puts the session in
+    progress with the players it had before the start's own re-publish (which
+    says maxPlayers, §63d); the same score again is the match's end (§48)."""
+    for sid, rec in SESSIONS.items():
+        if rec.get("host") != host_key:
+            continue
+        if score > before and not rec.get("started"):
+            n = rec.get("players") or 0
+            if rec.get("max_players") and n >= rec["max_players"] and rec.get("players_before"):
+                n = rec["players_before"]
+            rec["started"] = int(time.time())
+            rec["playing"] = int(n)
+            log(f"  session STARTED: id=0x{sid:x} {rec.get('name')!r} -- its host "
+                f"reports a game started; {n} playing")
+            board_refresh()
+        elif score == before and rec.get("started"):
+            log(f"  session FINISHED: id=0x{sid:x} {rec.get('name')!r} -- its host "
+                f"reports the game over; the session goes when the host deletes it")
+
+
 def sessions_create_result(dec: dict, peer_ip: str = "", host_key: str = ""):
     """Result block for Sessions op 1. Returns (num_results, writer-callback)."""
     rec: dict = {"info": [], "name": "", "max_players": 0, "addr": b"",
@@ -860,7 +894,7 @@ def sessions_create_result(dec: dict, peer_ip: str = "", host_key: str = ""):
         log(f"  POT opened for ranked session 0x{sid:x} -- each console will pay "
             f"10% of board {statsdb.RATING_BOARD} when the match starts")
     lobbyboard.BOARD.opened(rec)
-    lobbyboard.BOARD.refresh(SESSIONS)
+    board_refresh()
     return 1, emit
 
 
@@ -1054,7 +1088,7 @@ def sessions_host_gone(host_key: str) -> None:
         pot_gone(sid)
         lobbyboard.BOARD.closed(sid)
     if doomed:
-        lobbyboard.BOARD.refresh(SESSIONS)
+        board_refresh()
 
 
 def sessions_update(dec: dict, peer_ip: str = "", host_key: str = ""):
@@ -1096,6 +1130,7 @@ def sessions_update(dec: dict, peer_ip: str = "", host_key: str = ""):
     if len(ints) > 10:
         rec["max_players"] = ints[10]
     if len(ints) > 1:
+        rec["players_before"] = int(rec.get("players") or 0)
         rec["players"] = ints[1]
     if len(ints) > 6:
         rec["points"] = ints[6]
@@ -1115,7 +1150,7 @@ def sessions_update(dec: dict, peer_ip: str = "", host_key: str = ""):
         log(f"  *** SESSION HOST CHANGED: {was_name!r}@{was_ip} -> "
             f"{rec['name']!r}@{rec['host_ip']} -- this is what a HOST MIGRATION "
             f"would look like from here. Write it down (netrecon Phase 23).")
-    lobbyboard.BOARD.refresh(SESSIONS)
+    board_refresh()
     return 0, None
 
 
@@ -1150,7 +1185,7 @@ def sessions_delete(dec: dict, host_key: str = ""):
     pot_gone(sid)
     if gone:
         lobbyboard.BOARD.closed(sid)
-        lobbyboard.BOARD.refresh(SESSIONS)
+        board_refresh()
     return 0, None
 
 
@@ -3444,6 +3479,8 @@ class AuthConnection(asyncio.Protocol):
             LSG_CONNS[self.ident_key] = self
         self.authenticated = True
         log(f"  LSG connect: account {name!r} id={uid} ({why})")
+        if self.is_lsg:
+            board_refresh()
 
     @property
     def ident_key(self) -> str:
@@ -3703,6 +3740,8 @@ class AuthConnection(asyncio.Protocol):
         log(f"TCP {self.peer} closed ({exc})")
         if was_lsg:
             sessions_host_gone(self.ident_key)
+            if self.account:
+                board_refresh()
 
 
 # ------------------------------------------------------------- UDP discovery

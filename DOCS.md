@@ -188,15 +188,15 @@ server prints what is in force at startup.
 | `stats.starting_rating` | `400` | what a player with no ranked row is served, so their first stake is 40 |
 | `stats.period_boards` | `true` | the Weekly, Monthly and Yearly boards (2, 3, 4) restart from `starting_rating` each ISO week, month and year; `false` keeps them as all-time boards from 0 |
 | `storage.data_dir` | `wow2-data/` beside the checkout, `/var/lib/wow2-server` as a service | where everything below lives |
-| `discord.lobby_webhook` | unset | a Discord webhook URL; the channel gets one message that always shows the open lobbies. See Discord |
+| `discord.lobby_webhook` | unset | a Discord webhook URL; the channel gets one message that always shows who is online, the open lobbies and the games in progress. See Discord |
 | `discord.announce_webhook`, `discord.mention` | unset | a webhook URL that gets a message when a lobby opens, and what to put in front of it (`<@&ROLE_ID>` or `@here`) |
 | `discord.title` | `Open lobbies` | the board's heading |
-| `discord.announce_text`, `closed_text`, `empty_text`, `offline_text` | built-in wording | templates for what the poster says; the example file lists each one's fields |
+| `discord.announce_text`, `closed_text`, `empty_text`, `offline_text`, `online_text` | built-in wording | templates for what the poster says; the example file lists each one's fields |
 | `discord.announce_cooldown` | `300` | seconds before the same host name pings again; inside it a new lobby edits the previous announcement back to open |
 | `discord.leaderboard_webhook` | unset | a webhook URL; the channel gets one message that always shows the top of the Permanent, Weekly, Monthly and Yearly boards. See Discord |
 | `discord.leaderboard_title`, `leaderboard_rows` | `Leader boards`, `10` | the heading, and rows per board (1 to 25) |
 | `discord.leaderboard_text`, `leaderboard_empty_text` | built-in wording | the line under the heading (`{start}` is the starting rating) and what an empty board says |
-| `[[discord.also]]` | none | more Discord servers that get the same boards and pings: one table per server with its own `lobby_webhook`, `announce_webhook`, `leaderboard_webhook`, `mention`, and optionally `name`, `title`, `leaderboard_title`, the six texts and `announce_cooldown` |
+| `[[discord.also]]` | none | more Discord servers that get the same boards and pings: one table per server with its own `lobby_webhook`, `announce_webhook`, `leaderboard_webhook`, `mention`, and optionally `name`, `title`, `leaderboard_title`, the seven texts and `announce_cooldown` |
 | `discord.bot_guild` | `0` (off) | the Discord server id the password bot (`wow2-discordbot`) serves; the token comes from the environment. See Discord |
 | `discord.bot_admin_roles`, `bot_help_channel`, `bot_claims_per_day`, `bot_text` | `["Admin", "Moderator"]`, `connection-help`, `3`, built-in wording | who may `/reset`, where a refused player is sent, passwords per person per day (`0` = no limit), the DM as a template (`{name} {password} {server} {help}`) |
 
@@ -389,12 +389,21 @@ pasted into the `[discord]` section of `wow2-server.toml`; leaving the
 section empty turns the feature off.
 
 With `lobby_webhook` set the server posts one message to that channel at
-startup and edits it from then on: one line per live session — host, `N/M`
-players, ranked or friendly, when it opened — with full lobbies last, or
-*No open lobbies*; *Server offline* in red on a clean stop. Every create,
-update, delete and expiry the server sees repaints it, a burst coalesced
-into one edit two seconds later, so a lobby filling up is one edit and not
-four. The message id is kept in the store, so a restart edits the same
+startup and edits it from then on. Its first line is who is online —
+`👥 **5** online — 2 in a lobby, 2 playing, 1 waiting` — counting the
+consoles signed in, of them how many are in a lobby (the host's own
+count), in a game, or waiting in the menus. Under it, one line per live
+session: a lobby as host, `N/M` players, ranked or friendly, when it
+opened, with full lobbies after the open ones; a game in progress as
+`🎮 **name** — 2 playing — friendly — started 5 minutes ago`, last. A
+game is in progress from the moment its host reports a game started
+(the score every player sends a second after the start) until the host
+ends the session. *No open lobbies* when there is none; *Server offline*
+in red on a clean stop. Every sign-in and sign-out, every create,
+update, delete, match start and expiry the server sees repaints it, a
+burst coalesced into one edit two seconds later, so a lobby filling up
+is one edit and not four. The message id is kept in the store, so a
+restart edits the same
 message; a message somebody deleted is re-posted. With `announce_webhook`
 set, each lobby opened is a fresh message (`@role 🎮 **name** opened a
 ranked lobby (1/4)`), struck through when the lobby closes; `mention` is
@@ -402,8 +411,9 @@ what goes in front, typically a role people give themselves to be pinged.
 A host name pings at most once per `announce_cooldown` (five minutes);
 inside that window a new lobby from the same host edits the struck-through
 announcement back to open, with the new lobby's mode and count, and an edit
-notifies nobody. All four texts are templates in the
-config (`announce_text`, `closed_text`, `empty_text`, `offline_text`), so a
+notifies nobody. All five texts are templates in the
+config (`announce_text`, `closed_text`, `empty_text`, `offline_text`,
+`online_text`), so a
 server whose webhook is a character can give it lines; a template with a
 field that does not exist is named at startup and the built-in wording is
 used.
@@ -444,7 +454,7 @@ new webhook in the channel's *Integrations*, put its URL in `[discord]` and
 restart. A webhook URL is a secret — whoever holds it can post to the
 channel — so keep the config file to the operator.
 
-`lobbyboardtest.py` is the feature's own suite: 78 checks against a fake
+`lobbyboardtest.py` is the feature's own suite: 91 checks against a fake
 webhook endpoint in the same process, no Discord needed.
 
 ### The password bot
@@ -525,7 +535,7 @@ Discord at all.
 .venv/bin/python -m wow2.blocktest    # a block stops all three invites, 7 checks
 .venv/bin/python -m wow2.ownertest    # identity, ownership, clans, storage, profiles, UDP, relay and login-table bounds, the create limit, 72 checks
 .venv/bin/python -m wow2.storetest    # the SQLite store: the import keeps everything, the rules hold, the windowed boards, the pot on every board, 49 checks
-.venv/bin/python -m wow2.lobbyboardtest   # the Discord boards: what they post, coalescing, Discord down, other servers, the leaderboards, 78 checks
+.venv/bin/python -m wow2.lobbyboardtest   # the Discord boards: what they post, coalescing, Discord down, other servers, the leaderboards, 91 checks
 .venv/bin/python -m wow2.discordbottest   # the password bot: who gets a password for which name, the DM, 51 checks
 .venv/bin/python -m wow2.loadtest --consoles 32 --lifetime 200   # capacity, see below
 .venv/bin/python -m wow2.dbcli roundtrip DIR   # a directory of JSON stores in and out, field by field

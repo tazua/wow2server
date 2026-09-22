@@ -74,6 +74,7 @@ DEFAULTS: dict[str, dict] = {
         "closed_text": "",
         "empty_text": "",
         "offline_text": "",
+        "online_text": "",
         "announce_cooldown": 300,
         "leaderboard_webhook": "",
         "leaderboard_title": "Leader boards",
@@ -215,7 +216,7 @@ DISCORD_MENTION = str(get("discord", "mention") or "")
 DISCORD_TITLE = str(get("discord", "title") or "Open lobbies")
 DISCORD_TEXT = {k: str(get("discord", k) or "")
                 for k in ("announce_text", "closed_text", "empty_text", "offline_text",
-                          "leaderboard_text", "leaderboard_empty_text")}
+                          "online_text", "leaderboard_text", "leaderboard_empty_text")}
 DISCORD_COOLDOWN = float(get("discord", "announce_cooldown"))
 DISCORD_LEADERBOARD_WEBHOOK = str(get("discord", "leaderboard_webhook") or "")
 DISCORD_LEADERBOARD_TITLE = str(get("discord", "leaderboard_title") or "Leader boards")

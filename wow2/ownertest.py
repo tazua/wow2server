@@ -996,6 +996,34 @@ def run_search_relay_checks(check: Checks) -> None:
     rl.enabled, natrelay._log = was_enabled, was_log
 
 
+def run_search_started_checks(check: Checks) -> None:
+    """In-process: a game in progress is not offered to the browser."""
+    import authserver
+    print("\n-- search: a session whose game has started is not listed")
+    was_log, was = authserver.log, dict(authserver.SESSIONS)
+    authserver.log = lambda *_a, **_k: None
+    authserver.SESSIONS.clear()
+    authserver.SESSIONS[0x5701] = {"id": 0x5701, "name": "wormy", "host": "wormy",
+                                   "players": 2, "max_players": 4, "info": []}
+    authserver.SESSIONS[0x5702] = {"id": 0x5702, "name": "snailhead", "host": "snailhead",
+                                   "players": 1, "max_players": 4, "info": []}
+    n, _ = authserver.sessions_search_results({})
+    check(n == 2, f"CONTROL: two open lobbies are both listed ({n})")
+    authserver.host_reported_game("wormy", 0, 1)
+    n, _ = authserver.sessions_search_results({})
+    check(n == 1, "a lobby whose host reported a game started is left out of the "
+          f"search, so nobody is offered a join the host will refuse ({n})")
+    authserver.host_reported_game("wormy", 1, 1)
+    n, _ = authserver.sessions_search_results({})
+    check(n == 2, f"...and listed again once the host reports the game over ({n})")
+    authserver.host_reported_game("wormy", 1, 2)
+    n, _ = authserver.sessions_search_results({})
+    check(n == 1, f"...and hidden again when the same session starts its next game ({n})")
+    authserver.SESSIONS.clear()
+    authserver.SESSIONS.update(was)
+    authserver.log = was_log
+
+
 def run_relay_checks(check: Checks) -> None:
     """In-process: the relay's own tables, no sockets bound."""
     import natrelay
@@ -1050,6 +1078,33 @@ def run_relay_checks(check: Checks) -> None:
     check(b.seen[a.mailbox.port] == ("10.0.0.2", 7000),
           "...and moves b's return path to the new port", f"seen={b.seen}")
 
+    joiner = rl.mailbox_for(("185.0.0.1", 31236)).owner
+    host = rl.mailbox_for(("49.0.0.35", 24438)).owner
+    other = rl.mailbox_for(("49.0.0.1", 15040)).owner
+    rl.link(joiner, host)
+    rl.link(joiner, other)
+    joiner.seen[host.mailbox.port] = ("185.0.0.1", 31236)
+    dtls = bytes([0x16]) + bytes(99)
+    sent = []
+    host.mailbox.transport = type("T", (), {"sendto": lambda _s, d, a: sent.append(a)})()
+    who = rl.sender_for(joiner.mailbox, ("49.0.0.35", 24500), dtls)
+    check(who is host,
+          "a host whose router moved it to a new port is still the host when the "
+          "joiner's mailbox has another peer on a DIFFERENT address (the public "
+          "server, 2026-10-01: every join dropped with 'cannot tell who')",
+          f"who={who}")
+    joiner.mailbox.datagram_received(dtls, ("49.0.0.35", 24500))
+    check(host.seen.get(joiner.mailbox.port) == ("49.0.0.35", 24500)
+          and sent == [("185.0.0.1", 31236)],
+          "...and its datagram is carried to the joiner and its new port learned",
+          f"seen={host.seen} sent={sent}")
+    twin = rl.mailbox_for(("49.0.0.35", 24600)).owner
+    rl.link(joiner, twin)
+    who = rl.sender_for(joiner.mailbox, ("49.0.0.35", 24700), dtls)
+    check(who is None,
+          "two of the mailbox's peers behind that address leave nothing to guess (§71c)",
+          f"who={who}")
+
 
 def main() -> int:
     ap = argparse.ArgumentParser(description=__doc__,
@@ -1076,6 +1131,7 @@ def main() -> int:
             srv.stop()
     run_relay_checks(check)
     run_search_relay_checks(check)
+    run_search_started_checks(check)
     print(f"\n{'REVERTED -- ' if a.revert else ''}"
           f"{check.total - check.failed}/{check.total} checks passed")
     if a.keep:

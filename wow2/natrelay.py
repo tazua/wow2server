@@ -279,10 +279,10 @@ class Relay:
                 _log(f"RELAY: {src[0]}:{src[1]} names {c}'s mailbox in addrA "
                      f"but is not at {c.key[0]} -- not attributed")
                 return None
-        if mb.owner and len(mb.owner.peers) == 1:
-            peer = next(iter(mb.owner.peers))
-            if peer.key[0] == src[0]:
-                return peer
+        if mb.owner:
+            same_ip = [p for p in mb.owner.peers if p.key[0] == src[0]]
+            if len(same_ip) == 1:
+                return same_ip[0]
         return None
 
     def link(self, a: Console, b: Console) -> None:

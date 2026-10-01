@@ -827,16 +827,18 @@ def host_reported_game(host_key: str, before: int, score: int) -> None:
     for sid, rec in SESSIONS.items():
         if rec.get("host") != host_key:
             continue
-        if score > before and not rec.get("started"):
+        if score > before and (not rec.get("started") or rec.get("finished")):
             n = rec.get("players") or 0
             if rec.get("max_players") and n >= rec["max_players"] and rec.get("players_before"):
                 n = rec["players_before"]
             rec["started"] = int(time.time())
+            rec["finished"] = 0
             rec["playing"] = int(n)
             log(f"  session STARTED: id=0x{sid:x} {rec.get('name')!r} -- its host "
                 f"reports a game started; {n} playing")
             board_refresh()
-        elif score == before and rec.get("started"):
+        elif score == before and rec.get("started") and not rec.get("finished"):
+            rec["finished"] = int(time.time())
             log(f"  session FINISHED: id=0x{sid:x} {rec.get('name')!r} -- its host "
                 f"reports the game over; the session goes when the host deletes it")
 
@@ -1033,7 +1035,8 @@ def sessions_search_results(dec: dict, joiner_ip: str = ""):
     want = filters[1] if len(filters) > 1 and 0 < filters[1] <= SEARCH_PAGE_MAX \
         else SEARCH_PAGE_MAX
     start = filters[2] if len(filters) > 2 and filters[2] > 0 else 0
-    live = sorted(SESSIONS.values(),
+    live = sorted((rec for rec in SESSIONS.values()
+                   if not rec.get("started") or rec.get("finished")),
                   key=lambda rec: (bool(rec.get("max_players")) and
                                    rec.get("players", 0) >= rec.get("max_players", 0),
                                    -rec.get("id", 0)))
@@ -1043,8 +1046,10 @@ def sessions_search_results(dec: dict, joiner_ip: str = ""):
         for rec in rows:
             bd.write_fields(w, info_with_session_id(rec, joiner_ip))
 
+    playing = len(SESSIONS) - len(live)
     log(f"  session search: {len(rows)} of {len(live)} session(s) -> "
         + (", ".join(f"0x{r['id']:x} {r['name']!r}" for r in rows) or "none")
+        + (f"; {playing} in a game, not listed" if playing else "")
         + (f"  page {start}+{want}; filters={filters[:4]}..." if filters else ""))
     return len(rows), emit
 

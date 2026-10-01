@@ -52,6 +52,11 @@ PASSWORD_LENGTH = 8
 NAME_RE = re.compile(r"^[!-~][ -~]{0,14}[!-~]$|^[!-~]$")
 DAY = 86400.0
 RECOVER_TRIES_PER_HOUR = 5
+HISTORY = (("a profile", "SELECT 1 FROM profiles WHERE entity = ? LIMIT 1"),
+           ("scores", "SELECT 1 FROM stats WHERE entity = ? LIMIT 1"),
+           ("files", "SELECT 1 FROM storage WHERE owner = ? LIMIT 1"),
+           ("a clan", "SELECT 1 FROM team_members WHERE entity = ? LIMIT 1"),
+           ("buddies", "SELECT 1 FROM friends WHERE a = ? OR b = ? LIMIT 1"))
 
 DEFAULT_TEXT = """\
 Here is a temporary password for the online profile **{name}** on **{server}**:
@@ -134,6 +139,7 @@ class Outcome(enum.Enum):
     CLAIMED = "claimed"        # the name had no credential; it has one now
     RESET = "reset"            # it had one, and this user may replace it
     TAKEN = "taken"            # it has one that is not this user's to replace
+    HISTORY = "played here"    # no credential, but the account has history here: staff's
     INVALID = "invalid"
     TOO_MANY = "too many"
     UNREGISTERED = "no password on file"
@@ -150,25 +156,31 @@ class Result:
 
 class Desk:
     """The store's side of the counter: who may have a password for which
-    name. Synchronous; the Discord side runs it on one thread, the store's."""
+    name. Synchronous; the Discord side runs it on one thread, the store's.
+    Each decision is taken inside the transaction that writes it, because the
+    server writes the same rows from another process (§80ae)."""
 
     def __init__(self, claims_per_day: int = 3, rng=None, clock=time.time) -> None:
         self.claims_per_day = int(claims_per_day)
         self.rng = rng
         self.clock = clock
-        self.recent: dict[str, list[float]] = {}
         self.guesses: dict[str, list[float]] = {}
 
     def allowed(self, user_id: str) -> bool:
         if self.claims_per_day <= 0:
             return True
-        now = self.clock()
-        times = [t for t in self.recent.get(user_id, ()) if now - t < DAY]
-        self.recent[user_id] = times
-        return len(times) < self.claims_per_day
+        return store.db().execute(
+            "SELECT COUNT(*) FROM discord_issued WHERE user_id = ? AND at > ?",
+            (user_id, self.clock() - DAY)).fetchone()[0] < self.claims_per_day
 
     def _count(self, user_id: str) -> None:
-        self.recent.setdefault(user_id, []).append(self.clock())
+        if self.claims_per_day <= 0:
+            return
+        now = self.clock()
+        with store.tx() as conn:
+            conn.execute("DELETE FROM discord_issued WHERE at <= ?", (now - DAY,))
+            conn.execute("INSERT INTO discord_issued (user_id, at) VALUES (?, ?)",
+                         (user_id, now))
 
     @staticmethod
     def holder(handle: str):
@@ -179,6 +191,14 @@ class Desk:
         bound = conn.execute("SELECT user_id, name, at FROM discord_claims WHERE handle = ?",
                              (handle,)).fetchone()
         return acct, bound
+
+    @staticmethod
+    def made(handle: str) -> list[str]:
+        """What the account behind a handle has made on the server."""
+        e = f"{int.from_bytes(bytes.fromhex(handle), 'little'):016x}"
+        conn = store.db()
+        return [what for what, sql in HISTORY
+                if conn.execute(sql, (e,) * sql.count("?")).fetchone()]
 
     def _issue(self, name: str, user_id: str, kind: Outcome) -> Result:
         password = new_password(self.rng)
@@ -201,19 +221,24 @@ class Desk:
         err = name_error(name)
         if err:
             return Result(Outcome.INVALID, name, detail=err)
-        acct, bound = self.holder(store.account_handle(name))
-        if acct and acct["pwhash"]:
-            if bound is None or bound["user_id"] != user_id:
-                return Result(Outcome.TAKEN, acct["name"],
-                              detail="set from a console" if bound is None
-                              else "set through the bot by somebody else")
-            kind = Outcome.RESET
-        else:
-            kind = Outcome.CLAIMED
-        if not self.allowed(user_id):
-            return Result(Outcome.TOO_MANY, name)
-        r = self._issue(name, user_id, kind)
-        self._count(user_id)
+        handle = store.account_handle(name)
+        with store.tx():
+            acct, bound = self.holder(handle)
+            if acct and acct["pwhash"]:
+                if bound is None or bound["user_id"] != user_id:
+                    return Result(Outcome.TAKEN, acct["name"],
+                                  detail="set from a console" if bound is None
+                                  else "set through the bot by somebody else")
+                kind = Outcome.RESET
+            elif made := self.made(handle):
+                return Result(Outcome.HISTORY, acct["name"] if acct else name,
+                              detail=", ".join(made))
+            else:
+                kind = Outcome.CLAIMED
+            if not self.allowed(user_id):
+                return Result(Outcome.TOO_MANY, name)
+            r = self._issue(name, user_id, kind)
+            self._count(user_id)
         return r
 
     def reset(self, name: str, user_id) -> Result:
@@ -222,9 +247,10 @@ class Desk:
         err = name_error(name)
         if err:
             return Result(Outcome.INVALID, name, detail=err)
-        acct, _bound = self.holder(store.account_handle(name))
-        kind = Outcome.RESET if acct and acct["pwhash"] else Outcome.CLAIMED
-        return self._issue(name, str(user_id), kind)
+        with store.tx():
+            acct, _bound = self.holder(store.account_handle(name))
+            kind = Outcome.RESET if acct and acct["pwhash"] else Outcome.CLAIMED
+            return self._issue(name, str(user_id), kind)
 
     def recover(self, name: str, user_id, password: str) -> Result:
         """A player proves the account with the password on file and gets a
@@ -234,25 +260,26 @@ class Desk:
         err = name_error(name)
         if err:
             return Result(Outcome.INVALID, name, detail=err)
-        acct, _bound = self.holder(store.account_handle(name))
-        if not acct or not acct["pwhash"]:
-            return Result(Outcome.UNREGISTERED, acct["name"] if acct else name)
-        now = self.clock()
-        tries = [t for t in self.guesses.get(user_id, ()) if now - t < 3600.0]
-        self.guesses[user_id] = tries
-        if len(tries) >= RECOVER_TRIES_PER_HOUR:
-            return Result(Outcome.TOO_MANY, name, detail="tries")
-        tries.append(now)
-        if srv.tiger192(password.encode()).hex() != acct["pwhash"]:
-            return Result(Outcome.WRONG, acct["name"])
-        return self._issue(name, user_id, Outcome.RESET)
+        with store.tx():
+            acct, _bound = self.holder(store.account_handle(name))
+            if not acct or not acct["pwhash"]:
+                return Result(Outcome.UNREGISTERED, acct["name"] if acct else name)
+            now = self.clock()
+            tries = [t for t in self.guesses.get(user_id, ()) if now - t < 3600.0]
+            self.guesses[user_id] = tries
+            if len(tries) >= RECOVER_TRIES_PER_HOUR:
+                return Result(Outcome.TOO_MANY, name, detail="tries")
+            tries.append(now)
+            if srv.tiger192(password.encode()).hex() != acct["pwhash"]:
+                return Result(Outcome.WRONG, acct["name"])
+            return self._issue(name, user_id, Outcome.RESET)
 
     def lookup(self, name: str) -> dict:
         name = name.strip()
         handle = store.account_handle(name)
         acct, bound = self.holder(handle)
         return {"name": acct["name"] if acct else name, "handle": handle,
-                "registered": bool(acct and acct["pwhash"]),
+                "registered": bool(acct and acct["pwhash"]), "history": self.made(handle),
                 "user_id": acct["user_id"] if acct else None,
                 "last_seen": acct["last_seen"] if acct else None,
                 "claimed_by": bound["user_id"] if bound else None,
@@ -299,6 +326,10 @@ async def do_claim(desk: Desk, ctx: Ctx, name: str) -> str:
                 f"through me by you. Yours and you know the password, even one the game "
                 f"refuses? `/recover {r.name}` with it. Lost it? Ask in {ctx.help_mention}: "
                 f"staff can reset it for you.")
+    elif r.outcome is Outcome.HISTORY:
+        text = (f"**{r.name}** has played on {ctx.server} before but has no password here, "
+                f"so I cannot tell whose it is. Ask in {ctx.help_mention}: staff can check "
+                f"and set one for you.")
     elif r.outcome is Outcome.TOO_MANY:
         text = (f"That would be more than {desk.claims_per_day} passwords in a day. "
                 f"Try again tomorrow, or ask in {ctx.help_mention}.")
@@ -354,6 +385,8 @@ async def do_account(desk: Desk, ctx: Ctx, name: str) -> str:
                 f"last seen {d['last_seen'] or 'never'})")
     else:
         text = f"**{d['name']}**: no password on file (handle `{d['handle']}`)"
+    if d["history"]:
+        text += f"; on the server: {', '.join(d['history'])}"
     if d["claimed_by"]:
         text += f"; password set through me by {_mention(d['claimed_by'])} at {d['claimed_at']}"
     text += "."
@@ -381,10 +414,50 @@ async def _hand_over(ctx: Ctx, r: Result, to: str) -> str:
 # ---------------------------------------------------------------- Discord
 
 def invite_url(app_id: int | str) -> str:
-    """The setup bot's invite with the scope slash commands need; opening it
-    again for a bot already in the server adds the scope and removes nothing."""
+    """The password bot's invite: the scope slash commands need and no
+    permissions, which is all it uses (an ephemeral reply and a DM need none);
+    opening it again for a bot already in the server adds the scope."""
     return (f"https://discord.com/oauth2/authorize?client_id={app_id}"
-            f"&scope=bot%20applications.commands&permissions=8&integration_type=0")
+            f"&scope=bot%20applications.commands&permissions=0&integration_type=0")
+
+
+EXCESS_PERMISSIONS = {0x8: "Administrator", 0x20: "Manage Server", 0x10000000: "Manage Roles",
+                      0x10: "Manage Channels", 0x20000000: "Manage Webhooks",
+                      0x4: "Ban Members", 0x2: "Kick Members"}
+
+
+def excess_permissions(value: int) -> list[str]:
+    """The permissions this bot holds in the server and never uses, by name."""
+    return [name for bit, name in EXCESS_PERMISSIONS.items() if value & bit]
+
+
+def staff_role_ids(wanted: list, roles: list[tuple[int, str]]) -> tuple[set[int], list[str]]:
+    """The role ids `bot_admin_roles` grants staff to, given the guild's roles as
+    (id, name): an id as itself, a name only when exactly one role carries it,
+    pinned at start so a role made later under the same name is not staff."""
+    ids, problems = set(), []
+    known = {rid for rid, _name in roles}
+    for want in wanted or []:
+        text = str(want).strip()
+        if text.isdigit():
+            if int(text) in known:
+                ids.add(int(text))
+            else:
+                problems.append(f"bot_admin_roles: no role with id {text} in the server")
+            continue
+        match = [rid for rid, name in roles if name == text]
+        if len(match) == 1:
+            ids.add(match[0])
+        elif match:
+            problems.append(f"bot_admin_roles: {len(match)} roles are called {text!r}, so "
+                            f"the name grants nothing -- give the role's id instead")
+        else:
+            problems.append(f"bot_admin_roles: no role called {text!r} in the server")
+    return ids, problems
+
+
+def is_staff(manage_guild: bool, role_ids, staff_ids: set[int]) -> bool:
+    return bool(manage_guild) or any(int(r) in staff_ids for r in role_ids)
 
 
 def run_bot(token: str, guild_id: int, desk: Desk, admin_roles: list[str],
@@ -428,11 +501,23 @@ def run_bot(token: str, guild_id: int, desk: Desk, admin_roles: list[str],
                     f"that the setup bot was added to that server")
                 await self.close()
                 return
-            log(f"online as {self.user} in {g.name!r}; staff = {', '.join(admin_roles)} "
+            ids, problems = staff_role_ids(admin_roles, [(r.id, r.name) for r in g.roles])
+            staff_ids.clear()
+            staff_ids.update(ids)
+            for p in problems:
+                log(f"!! {p}")
+            extra = excess_permissions(g.me.guild_permissions.value) if g.me else []
+            if extra:
+                log(f"!! this token holds {', '.join(extra)} in {g.name!r} and the bot uses "
+                    f"none of it -- give the password bot its own application, invited with "
+                    f"{invite_url('<its id>')} (discord/README.md)")
+            names = ", ".join(f"{r.name} ({r.id})" for r in g.roles if r.id in staff_ids)
+            log(f"online as {self.user} in {g.name!r}; staff = {names or 'nobody by role'} "
                 f"or Manage Server; help -> #{help_channel}")
 
     client = Bot(intents=intents)
     tree = app_commands.CommandTree(client)
+    staff_ids: set[int] = set()
 
     def attachments(files) -> dict:
         return {"files": [discord.File(p) for p in files]} if files else {}
@@ -445,7 +530,7 @@ def run_bot(token: str, guild_id: int, desk: Desk, admin_roles: list[str],
     def is_admin(user) -> bool:
         if not isinstance(user, discord.Member):
             return False
-        return user.guild_permissions.manage_guild or any(r.name in admin_roles for r in user.roles)
+        return is_staff(user.guild_permissions.manage_guild, [r.id for r in user.roles], staff_ids)
 
     class InteractionCtx(Ctx):
         def __init__(self, interaction) -> None:
@@ -579,8 +664,9 @@ def cli(argv=None) -> int:
         return 0
     token = os.environ.get("DISCORD_BOT_TOKEN", "")
     if not token:
-        log("!! DISCORD_BOT_TOKEN is not in the environment (the setup bot's token; "
-            "discord/README.md step 2, or /etc/wow2-server.env on a system install)")
+        log("!! DISCORD_BOT_TOKEN is not in the environment (the password bot's own "
+            "application's token, discord/README.md; /etc/wow2-server.env on a system "
+            "install)")
         return 1
     if not guide_files():
         log("!! no pictures found beside the module (guide/*.png); the kit goes out as text")

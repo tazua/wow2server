@@ -85,6 +85,7 @@ def stake_paid(served: int) -> int:
     """What the player actually loses -- which can be NEGATIVE below the floor."""
     return served - upload_after_stake(served)
 CLAN_BOARDS = (29, 30, 31, 32)
+WRITABLE_BOARDS = range(1, 33)
 
 
 def disabled() -> bool:
@@ -178,7 +179,7 @@ def page_by_rank(board_id: int, start_rank: int, want: int, default_name: str = 
     leaderboard's "start at rank N" view. Ties share a rank (RANK(), not
     ROW_NUMBER()), exactly as the JSON board() computed it.
     """
-    if disabled():
+    if disabled() or not store.fits(start_rank):
         return []
     page, args = _page_sql(board_id)
     sql = f"SELECT * FROM ({page}) WHERE rank >= ? ORDER BY score DESC, entity LIMIT ?"

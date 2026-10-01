@@ -11,6 +11,7 @@
 from __future__ import annotations
 
 import argparse
+import os
 import shutil
 import sqlite3
 import sys
@@ -76,11 +77,16 @@ def cmd_backup(args) -> int:
         print(f"!! {dest} exists; --force to overwrite it")
         return 1
     dest.parent.mkdir(parents=True, exist_ok=True)
-    copy = sqlite3.connect(str(dest))
+    tmp = dest.with_name(dest.name + f".tmp-{os.getpid()}")
+    tmp.unlink(missing_ok=True)
+    os.close(os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600))
+    copy = sqlite3.connect(str(tmp))
     with copy:
         conn.backup(copy)
     copy.close()
-    print(f"backed up to {dest} ({dest.stat().st_size} bytes)")
+    os.replace(tmp, dest)
+    print(f"backed up to {dest} ({dest.stat().st_size} bytes, readable by its owner "
+          f"only: it holds every account's credential)")
     return 0
 
 

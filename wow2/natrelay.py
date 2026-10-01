@@ -13,12 +13,16 @@ import time
 import serverconfig
 
 _log = print
+_udp_log = lambda _ip, msg: _log(msg)
 
 
-def set_logger(fn) -> None:
-    """The server owns the session log; borrow it rather than opening another."""
-    global _log
+def set_logger(fn, udp_fn=None) -> None:
+    """The server owns the session log; borrow it rather than opening another.
+    `udp_fn(ip, msg)` is its rate-limited form, for lines a datagram caused."""
+    global _log, _udp_log
     _log = fn
+    if udp_fn is not None:
+        _udp_log = udp_fn
 
 
 # ------------------------------------------------------------------ our address
@@ -50,19 +54,33 @@ PORT_COUNT = int(serverconfig.get("nat", "relay_ports"))
 IDLE_TIMEOUT = float(serverconfig.get("nat", "relay_idle_timeout"))
 PUBLIC_ADDRESS = str(serverconfig.get("nat", "public_address") or "")
 PER_ADDRESS_MAX = int(os.environ.get("WOW2_RELAY_PER_ADDRESS", "8"))
+SILENCE = float(os.environ.get("WOW2_RELAY_SILENCE", "90"))
+GRACE = float(os.environ.get("WOW2_RELAY_GRACE", "300"))
+TRUST = float(os.environ.get("WOW2_RELAY_TRUST", str(24 * 3600)))
+REBIND_IDLE = float(os.environ.get("WOW2_RELAY_REBIND_IDLE", "30"))
+TRUST_MAX = 65536
+HOST_ALIASES: dict[str, str] = {}
+
+
+def same_host(a: str, b: str) -> bool:
+    """One machine's two source addresses are one host: on the rig console 1
+    reaches 3074 as loopback and every mailbox as the bridge address (§80l)."""
+    return HOST_ALIASES.get(a, a) == HOST_ALIASES.get(b, b)
 
 
 class Console:
     """One console, and every endpoint we have seen it speak from."""
 
-    __slots__ = ("key", "mailbox", "seen", "peers", "last")
+    __slots__ = ("key", "mailbox", "seen", "seen_at", "prev", "peers", "last", "born")
 
     def __init__(self, key: tuple[str, int]):
         self.key = key
         self.mailbox: "Mailbox | None" = None
         self.seen: dict[int, tuple[str, int]] = {}
+        self.seen_at: dict[int, float] = {}
+        self.prev: dict[int, tuple[str, int]] = {}
         self.peers: set["Console"] = set()
-        self.last = time.time()
+        self.last = self.born = time.time()
 
     def __repr__(self) -> str:
         p = self.mailbox.port if self.mailbox else "-"
@@ -91,27 +109,33 @@ class Mailbox(asyncio.DatagramProtocol):
         owner = self.owner
         if owner is None:
             return
-        owner.last = time.time()
         sender = self.relay.sender_for(self, src, data)
         if sender is None:
-            self._drop(f"cannot tell who {src[0]}:{src[1]} is "
+            self._drop(src[0], f"cannot tell who {src[0]}:{src[1]} is "
                        f"(mailbox {self.port} belongs to {owner}, "
                        f"peers {sorted(repr(p) for p in owner.peers)})")
             return
-        sender.last = owner.last
-        if sender.seen.get(self.port) != src:
-            _log(f"RELAY learn: {sender} talks to :{self.port} from "
-                 f"{src[0]}:{src[1]}")
-            sender.seen[self.port] = src
+        now = time.time()
+        cur = sender.seen.get(self.port)
+        if cur != src:
+            if not self.relay.may_move(sender, self.port, src, now):
+                self._drop(src[0], f"{sender} speaks to :{self.port} from {cur[0]}:{cur[1]} "
+                           f"({now - sender.seen_at.get(self.port, 0.0):.0f} s ago); "
+                           f"{src[0]}:{src[1]} does not move its return path")
+                return
+            _udp_log(src[0], f"RELAY learn: {sender} talks to :{self.port} from "
+                     f"{src[0]}:{src[1]}")
+            self.relay.move(sender, self.port, src)
+        sender.seen_at[self.port] = sender.last = now
         self.relay.link(owner, sender)
 
         out = sender.mailbox
         if out is None or out.transport is None:
-            self._drop(f"{sender} has no mailbox")
+            self._drop(src[0], f"{sender} has no mailbox")
             return
         dest = owner.seen.get(out.port)
         if dest is None:
-            self._drop(f"no return path to {owner} on :{out.port} yet "
+            self._drop(src[0], f"no return path to {owner} on :{out.port} yet "
                        f"(waiting for it to dial SERVER:{out.port})")
             return
         out.transport.sendto(data, dest)
@@ -120,12 +144,12 @@ class Mailbox(asyncio.DatagramProtocol):
     def port_str(self) -> str:
         return str(self.port)
 
-    def _drop(self, why: str) -> None:
+    def _drop(self, ip: str, why: str) -> None:
         self.dropped += 1
         now = time.time()
         if now - self._last_drop_log > 2.0:
             self._last_drop_log = now
-            _log(f"RELAY drop on :{self.port}: {why} [{self.dropped} so far]")
+            _udp_log(ip, f"RELAY drop on :{self.port}: {why} [{self.dropped} so far]")
 
     def release(self) -> None:
         self.owner = None
@@ -149,6 +173,13 @@ class Relay:
         self.by_port: dict[int, Mailbox] = {}
         self.consoles: dict[tuple[str, int], Console] = {}
         self.exhausted = 0
+        self.in_use = 0
+        self.per_ip: dict[str, int] = {}
+        self.signed_in: dict[str, int] = {}
+        self.signed_out: dict[str, float] = {}
+        self._full_until = 0.0
+        self._refused_at = 0.0
+        self._refused_n = 0
 
     # ----------------------------------------------------------------- startup
     async def start(self, bind: str) -> None:
@@ -189,13 +220,47 @@ class Relay:
             last = now
 
     def sweep(self, now: float | None = None) -> int:
-        """Forget every console idle past IDLE_TIMEOUT. How many went."""
+        """Forget every console silent past its limit. How many went."""
         now = time.time() if now is None else now
-        idle = [c for c in list(self.consoles.values()) if now - c.last > IDLE_TIMEOUT]
+        self._full_until = 0.0
+        idle = [c for c in list(self.consoles.values()) if self._gone(c, now)]
         for c in idle:
-            _log(f"RELAY: {c} idle {now - c.last:.0f}s -- forgotten")
+            _udp_log(c.key[0], f"RELAY: {c} idle {now - c.last:.0f}s"
+                     f"{'' if self.trusted(c.key[0], now) else ', nobody signed in from there'}"
+                     f" -- forgotten")
             self.forget(c)
+        stale = [ip for ip, t in self.signed_out.items() if now - t >= TRUST]
+        for ip in stale:
+            del self.signed_out[ip]
         return len(idle)
+
+    def _gone(self, c: Console, now: float) -> bool:
+        """Silent past IDLE_TIMEOUT, or past SILENCE with no sign-in behind it:
+        a console sends a keepalive every 15 s from discovery on."""
+        return now - c.last > (IDLE_TIMEOUT if self.trusted(c.key[0], now) else SILENCE)
+
+    # ------------------------------------------------------------------- trust
+    def note_sign_in(self, ip: str) -> None:
+        """An account's sign-in from `ip` completed (§60)."""
+        self.signed_in[ip] = self.signed_in.get(ip, 0) + 1
+
+    def note_sign_out(self, ip: str, now: float | None = None) -> None:
+        n = self.signed_in.get(ip, 0) - 1
+        if n > 0:
+            self.signed_in[ip] = n
+        else:
+            self.signed_in.pop(ip, None)
+        self.signed_out.pop(ip, None)
+        self.signed_out[ip] = time.time() if now is None else now
+        while len(self.signed_out) > TRUST_MAX:
+            del self.signed_out[next(iter(self.signed_out))]
+
+    def trusted(self, ip: str, now: float | None = None) -> bool:
+        """Has an account signed in from this address within TRUST?"""
+        if ip in self.signed_in:
+            return True
+        t = self.signed_out.get(ip)
+        return t is not None and (time.time() if now is None else now) - t < TRUST
 
     # -------------------------------------------------------------- allocation
     def mailbox_for(self, endpoint: tuple[str, int]) -> Mailbox | None:
@@ -210,45 +275,93 @@ class Relay:
             return c.mailbox
         mb = self._free_mailbox(endpoint[0])
         if mb is None:
-            self.exhausted += 1
-            _log(f"RELAY: pool exhausted ({len(self.mailboxes)} ports, all in "
-                 f"use) -- {endpoint[0]}:{endpoint[1]} gets the direct path")
+            self._refused(endpoint)
             return None
         c = self.consoles[endpoint] = Console(endpoint)
         mb.owner = c
         c.mailbox = mb
-        _log(f"RELAY: {endpoint[0]}:{endpoint[1]} -> mailbox :{mb.port}")
+        self.in_use += 1
+        self.per_ip[endpoint[0]] = self.per_ip.get(endpoint[0], 0) + 1
+        _udp_log(endpoint[0], f"RELAY: {endpoint[0]}:{endpoint[1]} -> mailbox :{mb.port}")
         return mb
 
+    def _refused(self, endpoint: tuple[str, int]) -> None:
+        """One line a minute, however many are turned away."""
+        self.exhausted += 1
+        now = time.time()
+        if now - self._refused_at < 60:
+            return
+        n = self.exhausted - self._refused_n
+        self._refused_at, self._refused_n = now, self.exhausted
+        why = (f"{endpoint[0]} holds {PER_ADDRESS_MAX}, each heard from in the last "
+               f"{SILENCE:.0f}s" if self.per_ip.get(endpoint[0], 0) >= PER_ADDRESS_MAX
+               else f"each of the {len(self.mailboxes)} is held by a console that may keep it")
+        _log(f"RELAY: no mailbox for {endpoint[0]}:{endpoint[1]} ({why}) -- it gets "
+             f"the direct path" + (f"; {n} turned away since the last line" if n > 1 else ""))
+
     def _free_mailbox(self, ip: str = "") -> Mailbox | None:
-        same = [c for c in self.consoles.values() if c.key[0] == ip and c.mailbox]
-        if ip and len(same) >= PER_ADDRESS_MAX:
+        now = time.time()
+        if ip and self.per_ip.get(ip, 0) >= PER_ADDRESS_MAX:
+            same = [c for c in self.consoles.values() if c.key[0] == ip and c.mailbox]
             victim = min(same, key=lambda c: c.last)
-            _log(f"RELAY: {ip} already holds {len(same)} mailboxes -- recycling "
-                 f":{victim.mailbox.port} from {victim} "
-                 f"(idle {time.time() - victim.last:.0f}s)")
+            if now - victim.last <= SILENCE:
+                return None
+            _udp_log(ip, f"RELAY: {ip} already holds {len(same)} mailboxes -- recycling "
+                     f":{victim.mailbox.port} from {victim} "
+                     f"(idle {now - victim.last:.0f}s)")
             mb = victim.mailbox
             self.forget(victim)
             return mb
-        for mb in self.mailboxes:
-            if mb.owner is None:
-                return mb
-        now = time.time()
-        stale = [mb for mb in self.mailboxes
-                 if mb.owner and now - mb.owner.last > IDLE_TIMEOUT]
-        if not stale:
+        if self.in_use < len(self.mailboxes):
+            for mb in self.mailboxes:
+                if mb.owner is None:
+                    return mb
+        claimant = self.trusted(ip, now)
+        if not claimant and now < self._full_until:
             return None
-        stale.sort(key=lambda mb: mb.owner.last)
-        mb = stale[0]
-        _log(f"RELAY: reclaiming :{mb.port} from {mb.owner} "
-             f"(idle {now - mb.owner.last:.0f}s)")
-        self.forget(mb.owner)
+        idle = unproven = None
+        soonest = float("inf")
+        for mb in self.mailboxes:
+            c = mb.owner
+            if c is None:
+                return mb
+            proven = self.trusted(c.key[0], now)
+            limit = IDLE_TIMEOUT if proven else SILENCE
+            if now - c.last > limit:
+                if idle is None or c.last < idle.last:
+                    idle = c
+                continue
+            soonest = min(soonest, c.last + limit)
+            if proven:
+                continue
+            if claimant or now - c.born > GRACE:
+                if unproven is None or c.born < unproven.born:
+                    unproven = c
+            else:
+                soonest = min(soonest, c.born + GRACE)
+        victim = idle or unproven
+        if victim is None:
+            if not claimant:
+                self._full_until = soonest
+            return None
+        mb = victim.mailbox
+        why = (f"idle {now - victim.last:.0f}s" if victim is idle else
+               f"nobody has signed in from {victim.key[0]} in the "
+               f"{now - victim.born:.0f}s it has held it")
+        _udp_log(ip, f"RELAY: reclaiming :{mb.port} from {victim} ({why}) for {ip}")
+        self.forget(victim)
         return mb
 
     def forget(self, c: Console) -> None:
         if c.mailbox is not None:
             c.mailbox.release()
             c.mailbox = None
+            self.in_use -= 1
+            n = self.per_ip.get(c.key[0], 0) - 1
+            if n > 0:
+                self.per_ip[c.key[0]] = n
+            else:
+                self.per_ip.pop(c.key[0], None)
         for p in c.peers:
             p.peers.discard(c)
         c.peers.clear()
@@ -274,16 +387,33 @@ class Relay:
         if len(data) == 29 and data[1:3] == b"\x02\x00":
             c = self.owner_of_advertised(_bd_addr_at(data, 17))
             if c is not None and c is not mb.owner:
-                if c.key[0] == src[0]:
+                if same_host(c.key[0], src[0]):
                     return c
-                _log(f"RELAY: {src[0]}:{src[1]} names {c}'s mailbox in addrA "
-                     f"but is not at {c.key[0]} -- not attributed")
+                _udp_log(src[0], f"RELAY: {src[0]}:{src[1]} names {c}'s mailbox in "
+                         f"addrA but is not at {c.key[0]} -- not attributed")
                 return None
         if mb.owner:
-            same_ip = [p for p in mb.owner.peers if p.key[0] == src[0]]
+            same_ip = [p for p in mb.owner.peers if same_host(p.key[0], src[0])]
             if len(same_ip) == 1:
                 return same_ip[0]
         return None
+
+    @staticmethod
+    def may_move(c: Console, port: int, src: tuple[str, int], now: float) -> bool:
+        """A console's return path on a mailbox moves when it has none, when the
+        endpoint an idle move replaced speaks again, or after REBIND_IDLE of
+        silence (a NAT that remapped the console while it idled, §79)."""
+        if port not in c.seen or c.prev.get(port) == src:
+            return True
+        return now - c.seen_at.get(port, 0.0) >= REBIND_IDLE
+
+    @staticmethod
+    def move(c: Console, port: int, src: tuple[str, int]) -> None:
+        if c.prev.get(port) == src:
+            del c.prev[port]
+        elif port in c.seen:
+            c.prev[port] = c.seen[port]
+        c.seen[port] = src
 
     def link(self, a: Console, b: Console) -> None:
         if a is not b:
@@ -305,7 +435,9 @@ class Relay:
         rx = sum(mb.rx for mb in live)
         tx = sum(mb.tx for mb in live)
         drop = sum(mb.dropped for mb in live)
-        return (f"relay: {len(live)}/{len(self.mailboxes)} mailboxes in use, "
+        signed = sum(1 for mb in live if self.trusted(mb.owner.key[0]))
+        return (f"relay: {len(live)}/{len(self.mailboxes)} mailboxes in use "
+                f"({signed} from a signed-in address), "
                 f"{rx} in / {tx} out / {drop} dropped")
 
 

@@ -3,9 +3,10 @@
 #
 #   ./setup.sh                        a local install: .venv, wow2-server.toml,
 #                                     wow2-data/ -- then `.venv/bin/wow2-server`
-#   sudo ./setup.sh --system          a service: the `wow2` user, a venv under
+#   sudo ./setup.sh --system          a service: the `wow2` user (and `wow2bot`
+#                                     for the password bot), a venv under
 #                                     /opt/wow2-server, /etc/wow2-server.toml,
-#                                     /var/lib/wow2-server, the systemd unit,
+#                                     /var/lib/wow2-server, the systemd units,
 #                                     enabled and started
 #   sudo ./setup.sh --system --dns 203.0.113.10
 #                                     ...plus the DNS responder a retail PSP
@@ -29,6 +30,7 @@ PREFIX=/opt/wow2-server           # the venv, with --system
 STATE=/var/lib/wow2-server        # the data directory, with --system
 CONF=/etc/wow2-server.toml
 SVC_USER=wow2
+BOT_USER=wow2bot                  # the password bot, in SVC_USER's group
 
 while [ $# -gt 0 ]; do
     case "$1" in
@@ -50,6 +52,8 @@ if [ "$SYSTEM" = 1 ] && [ "$(id -u)" != 0 ]; then
     die "--system installs a service; run it as root:  sudo $0 --system"
 fi
 [ -n "$DNS_ADDR" ] && [ "$SYSTEM" != 1 ] && die "--dns is part of --system"
+# the service users read the venv whatever root's umask (027/077 when hardened); secrets are chmodded below
+if [ "$SYSTEM" = 1 ]; then umask 022; fi
 
 # --------------------------------------------------------------- python 3.11+
 # tomllib arrived in 3.11 and the server reads its config with it.
@@ -129,6 +133,8 @@ if ! "$VENV/bin/python" -m pip install --quiet "$HERE[bot]" 2>/dev/null; then
     "$VENV/bin/python" -m pip install --quiet "$HERE"
     note "(discord.py did not install, so wow2-discordbot is not available; the server is)"
 fi
+# heals a venv an older setup.sh made under a hardened umask: pip leaves what it already has
+if [ "$SYSTEM" = 1 ]; then chmod -R a+rX "$VENV"; fi
 # -P: do not put the current directory on sys.path, so this imports the
 # INSTALLED package and not the checkout it was installed from.
 "$VENV/bin/python" -P - <<'PY'
@@ -162,16 +168,26 @@ write_config() {
 }
 
 if [ "$SYSTEM" = 1 ]; then
-    say "the service user and its state directory"
+    say "the service users and their state directory"
     if ! id -u "$SVC_USER" >/dev/null 2>&1; then
         useradd --system --home "$STATE" --create-home --shell /usr/sbin/nologin \
             "$SVC_USER" 2>/dev/null \
         || useradd --system --home "$STATE" --create-home "$SVC_USER"
     fi
+    # The bot's own user, so the server cannot read the bot's environment (the
+    # token); the shared group is how both write the one database.
+    if ! id -u "$BOT_USER" >/dev/null 2>&1; then
+        useradd --system --gid "$SVC_USER" --no-create-home --home-dir /nonexistent \
+            --shell /usr/sbin/nologin "$BOT_USER" 2>/dev/null \
+        || useradd --system --gid "$SVC_USER" --no-create-home "$BOT_USER"
+    fi
     mkdir -p "$STATE"
     chown "$SVC_USER:$SVC_USER" "$STATE"
-    chmod 750 "$STATE"
-    note "user $SVC_USER, data in $STATE"
+    chmod 770 "$STATE"
+    for f in "$STATE/wow2.sqlite3" "$STATE/wow2.sqlite3-wal" "$STATE/wow2.sqlite3-shm"; do
+        if [ -e "$f" ]; then chown "$SVC_USER:$SVC_USER" "$f"; chmod 660 "$f"; fi
+    done
+    note "users $SVC_USER (the server) and $BOT_USER (the password bot), data in $STATE"
 
     say "configuration"
     write_config "$CONF" "$STATE"
@@ -244,15 +260,12 @@ fi
 # the game browser stays empty forever, without UDP 3078 every console reports
 # a STRICT NAT, without UDP 53 a real console never sends a packet, and without
 # the relay ports everything works except the join.
-PORTS="3074/tcp 3074/udp 3078/udp"
+# the server's own reading of the file (any valid TOML), not the operator's environment
+if [ "$SYSTEM" = 1 ]; then CONF_USED="$CONF"; else CONF_USED="$HERE/wow2-server.toml"; fi
+PORTS=$(env -i PATH="$PATH" WOW2_CONFIG="$CONF_USED" "$VENV/bin/python" -P -c \
+        'from wow2 import serverconfig as c; print(" ".join(c.firewall_ports()))') \
+    || die "$CONF_USED does not load (the server would refuse it too): $VENV/bin/wow2-server says why"
 [ -n "$DNS_ADDR" ] && PORTS="$PORTS 53/udp"
-if [ -f "${CONF}" ] && [ "$SYSTEM" = 1 ] && grep -qE '^\s*relay\s*=\s*true' "$CONF"; then
-    # one UDP port per console online; the range follows the config's own values
-    RELAY_BASE=$(sed -nE 's/^\s*relay_port_base\s*=\s*([0-9]+).*/\1/p' "$CONF" | tail -1)
-    RELAY_N=$(sed -nE 's/^\s*relay_ports\s*=\s*([0-9]+).*/\1/p' "$CONF" | tail -1)
-    RELAY_BASE=${RELAY_BASE:-40000}; RELAY_N=${RELAY_N:-32}
-    PORTS="$PORTS ${RELAY_BASE}-$((RELAY_BASE + RELAY_N - 1))/udp"
-fi
 say "firewall"
 if [ "$OPEN_FW" = 1 ] && [ "$(id -u)" = 0 ]; then
     if command -v ufw >/dev/null && ufw status 2>/dev/null | grep -q '^Status: active'; then
@@ -281,8 +294,8 @@ if [ "$SYSTEM" = 1 ]; then
         note "a retail PSP needs the DNS responder too:  sudo $0 --system --dns <this machine's public address>"
     fi
 else
-    note "run       $SHOW/bin/wow2-server        (from this directory: it reads"
-    note "                                    wow2-server.toml here, data in wow2-data/)"
+    note "run       $SHOW/bin/wow2-server        (from anywhere: it reads the"
+    note "                                    wow2-server.toml beside .venv, data in wow2-data/)"
     note "accounts  $SHOW/bin/wow2-account list"
     note "backup    $SHOW/bin/wow2-db backup wow2-data/backup.sqlite3"
     note ""

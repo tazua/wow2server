@@ -11,6 +11,8 @@ cannot be.
 from __future__ import annotations
 
 import argparse
+import hashlib
+import hmac
 import json
 import os
 import socket
@@ -27,6 +29,7 @@ import rigconfig                                                # noqa: E402
 
 BD_AUTH_NO_ERROR = 700
 BD_AUTH_CREATE_USERNAME_EXISTS = 707
+BD_AUTH_INCORRECT_PASSWORD = 716
 
 HERE = Path(__file__).resolve().parent
 PORT = 3874    # not 3074: the live rig keeps that one
@@ -37,7 +40,10 @@ NEW_ACCOUNT = "lukas1"
 NEW_PASSWORD = "271828"
 IMPOSTOR_PASSWORD = "161803"
 KNOWN_NO_CRED = "player1"
+LEGACY_ACCOUNT = "oldworm1"    # a row with no digest: an import from the fallback era
 UNKNOWN_ACCOUNT = "nobodyatall"
+BIND_DEADLINE = 3.0    # the isolated server's; a deployment's is 30 s
+DEADLINE_ACCOUNT = "quietworm"
 
 
 # ------------------------------------------------------------------ the wire
@@ -70,6 +76,28 @@ def create_request(username: str, password: str, seed: int = 0x1234) -> bytes:
     w.u32(TITLE_ID)
     w.type_checked = False
     w.write_bits(b"\x00" * 8, 64)
+    w.write_bits(ct, len(ct) * 8)
+    return bd.frame_unencrypted(w.getvalue())
+
+
+def change_password_request(username: str, current: str, new: str,
+                            seed: int = 0x1234) -> bytes:
+    """A 0x02 change-password request: the name's handle, then the new digest
+    under Tiger192 of the current password, as `parse_change_password` reads it."""
+    sys.path.insert(0, str(HERE))
+    from authserver import BD_AUTH_MAGIC, account_handle, cbc_3des_encrypt, tiger_iv
+    plain = struct.pack("<I", BD_AUTH_MAGIC) + tiger192(new.encode()) + b"\x00" * 4
+    ct = cbc_3des_encrypt(plain, tiger192(current.encode()), tiger_iv(seed))
+    w = bd.BdWriter()
+    w.bitmode = True
+    w.type_checked = False
+    w.u8(0x02)
+    w.write_bits(b"\x01", 1)
+    w.type_checked = True
+    w.u32(seed)
+    w.u32(TITLE_ID)
+    w.type_checked = False
+    w.write_bits(account_handle(username), 64)
     w.write_bits(ct, len(ct) * 8)
     return bd.frame_unencrypted(w.getvalue())
 
@@ -133,10 +161,16 @@ def lsg_rpc(service: int, op: int) -> bytes:
     return bd.frame_unencrypted(w.getvalue())
 
 
-def lsg_rpc_encrypted(key: bytes, seed: int, service: int, op: int) -> bytes:
+def lsg_mac(key: bytes, plain: bytes) -> bytes:
+    """What a console puts in the first 4 plaintext bytes (§80d)."""
+    return hmac.new(key, plain[5:], hashlib.sha1).digest()[:4]
+
+
+def lsg_rpc_encrypted(key: bytes, seed: int, service: int, op: int,
+                      mac: bytes | None = None) -> bytes:
     """The same RPC the way a console sends it (§60): [u8 1][u32 seed] then 3DES-CBC
-    under `key` of [u32 hmac slot][u8 service][bits], padded with the seed's low
-    byte."""
+    under `key` of [4-byte MAC][u8 service][bits], padded with the seed's low
+    byte (§80d)."""
     sys.path.insert(0, str(HERE))
     from authserver import session_cbc_encrypt, tiger_iv
     w = bd.BdWriter()
@@ -147,6 +181,7 @@ def lsg_rpc_encrypted(key: bytes, seed: int, service: int, op: int) -> bytes:
     w.u8(op)
     plain = struct.pack("<I", 0) + bytes([service]) + w.getvalue()
     plain += bytes([seed & 0xFF]) * ((-len(plain)) % 8)
+    plain = (lsg_mac(key, plain) if mac is None else mac) + plain[4:]
     body = b"\x01" + struct.pack("<I", seed) + session_cbc_encrypt(plain, key, tiger_iv(seed))
     return struct.pack("<I", len(body)) + body
 
@@ -226,6 +261,20 @@ def create_account(host: str, port: int, username: str, password: str) -> int:
                 return read_reply_error(body)
     p.close()
     raise SystemExit(f"no CreateAccountReply for {username!r}")
+
+
+def change_password(host: str, port: int, username: str, current: str, new: str) -> int:
+    """Send a change-password and return the BdErrorCode the server answered."""
+    p = Peer(host, port)
+    p.send(change_password_request(username, current, new))
+    for kind, data in p.frames(timeout=4.0):
+        if kind == "msg":
+            _enc, body = bd.unwrap_message(data)
+            if body and body[0] == 0x03:
+                p.close()
+                return read_reply_error(body)
+    p.close()
+    raise SystemExit(f"no ChangePasswordReply for {username!r}")
 
 
 def proof_session_key(proof: bytes) -> bytes:
@@ -324,7 +373,8 @@ def start_server(tmp: Path, revert: bool) -> subprocess.Popen:
                WOW2_HEXDUMPS="0",
                WOW2_LOG_LEVEL="info",
                WOW2_SHARED_PASSWORD_FALLBACK="false",
-               WOW2_NO_NAT_TYPE="1")
+               WOW2_NO_NAT_TYPE="1",
+               WOW2_BIND_DEADLINE=str(BIND_DEADLINE))
     if revert:
         env["WOW2_LSG_NO_KEY_CHECK"] = "1"
         env["WOW2_CREATE_MODE"] = "success"
@@ -360,7 +410,10 @@ def seed_store(tmp: Path) -> None:
                        "user_id": 101,
                        "handle": tiger192(GOOD_ACCOUNT.encode())[:8].hex(),
                        "first_seen": "2026-09-13T00:00:00",
-                       "last_seen": "2026-09-13T00:00:00"}}, indent=2))
+                       "last_seen": "2026-09-13T00:00:00"},
+        LEGACY_ACCOUNT: {"user_id": 102,
+                         "first_seen": "2026-08-01T00:00:00",
+                         "last_seen": "2026-08-01T00:00:00"}}, indent=2))
 
 
 def sign_in_as(host: str, port: int, account: str, hold: float,
@@ -401,10 +454,14 @@ def sign_in_as(host: str, port: int, account: str, hold: float,
               "nothing else, so it stays provisional -- it is not the account's "
               "connection and signs nobody out (§60)")
     print(f"holding for {hold:.0f}s")
-    deadline = time.time() + hold
-    while time.time() < deadline:
+    t0 = time.time()
+    while time.time() < t0 + hold:
         for kind, data in p.frames(timeout=1.0):
             print(f"  <- {kind} {len(data)}B")
+        if getattr(p, "closed", False):
+            print(f"the server closed the connection after {time.time() - t0:.1f}s"
+                  + ("" if key else " -- a provisional bind has a deadline (§80t)"))
+            break
     p.close()
     return 0
 
@@ -543,6 +600,33 @@ def main() -> int:
         p.close()
         q.close()
 
+        ticket5, good5 = login(host, PORT, GOOD_ACCOUNT)
+        k5 = ticket_key(ticket5, GOOD_PASSWORD)
+        r = Peer(host, PORT)
+        r.send(bufsize_announce())
+        r.send(lsg_connect(good5))
+        r.frames(timeout=2.0)
+        r.send(lsg_rpc_encrypted(k5, 0, 10, 7, mac=bytes(4)))
+        later = r.frames(timeout=2.0)
+        check(not later and r.is_closed(),
+              "a first RPC under the TICKET key whose MAC is wrong is REFUSED -- the "
+              "bind needs the client's HMAC, not a plaintext that happens to parse")
+        r.close()
+        ticket6, good6 = login(host, PORT, GOOD_ACCOUNT)
+        k6 = ticket_key(ticket6, GOOD_PASSWORD)
+        r = Peer(host, PORT)
+        r.send(bufsize_announce())
+        r.send(lsg_connect(good6))
+        r.frames(timeout=2.0)
+        r.send(lsg_rpc_encrypted(k6, 0, 10, 7))
+        served = [d for kind, d in r.frames(timeout=2.0) if kind == "msg"]
+        r.send(lsg_rpc_encrypted(k6, 1, 10, 7, mac=b"\x01\x02\x03\x04"))
+        later = r.frames(timeout=2.0)
+        check(bool(served) and not later and r.is_closed(),
+              "...and on a bound connection a later RPC with a wrong MAC closes it "
+              "(the first, with the right one, was served)")
+        r.close()
+
         # ---- A12: two players, one profile name (§56) ----------------------
         print("\n  -- A12: two players pick the same profile name --")
         err = create_account(host, PORT, NEW_ACCOUNT, NEW_PASSWORD)
@@ -583,6 +667,22 @@ def main() -> int:
         check(ticket_opens(owner_t, NEW_PASSWORD) and not ticket_opens(owner_t, IMPOSTOR_PASSWORD),
               "...and the original password still opens the ticket, the impostor's does not")
 
+        # ---- §80ag: a password change needs the password on file ------------
+        print("\n  -- a password change needs the password on file (§80ag) --")
+        for name in (LEGACY_ACCOUNT, KNOWN_NO_CRED):
+            err = change_password(host, PORT, name, rigconfig.ACCOUNT_PASSWORD,
+                                  IMPOSTOR_PASSWORD)
+            t, _pr = login(host, PORT, name)
+            check(err == BD_AUTH_INCORRECT_PASSWORD and not ticket_opens(t, IMPOSTOR_PASSWORD),
+                  f"{name!r} has no password on file: a change proven with the shared "
+                  f"password is refused (716) with the fallback off, and its login stays "
+                  f"refused (got {err})")
+        err = change_password(host, PORT, NEW_ACCOUNT, NEW_PASSWORD, "141421")
+        t, _pr = login(host, PORT, NEW_ACCOUNT)
+        check(err == BD_AUTH_NO_ERROR and ticket_opens(t, "141421"),
+              f"CONTROL: a change proven with the password on file is made, and the new "
+              f"one opens the next ticket (got {err})")
+
         # ---- §64: a login the server cannot DECODE ---------------------------
         print("\n  -- a login that cannot be decoded (§64) --")
         p = Peer(host, PORT)
@@ -603,6 +703,52 @@ def main() -> int:
             closed, replies = present(host, PORT, short_proof)
             check(closed and not replies,
                   "...and its clear proof is REFUSED at the LSG")
+
+        # ---- §80t: a connection is bound, or closed, at the deadline ---------
+        print(f"\n  -- every connection is bound or closed {BIND_DEADLINE:.0f} s "
+              f"after it opens (§80t) --")
+        silent = Peer(host, PORT)
+        ta, ga = login(host, PORT, GOOD_ACCOUNT)
+        ka = ticket_key(ta, GOOD_PASSWORD)
+        _tb, gb = login(host, PORT, GOOD_ACCOUNT)
+        again = Peer(host, PORT)
+        again.send(bufsize_announce())
+        again.send(lsg_connect(ga))
+        again.frames(timeout=2.0)
+        if ka:
+            again.send(lsg_rpc_encrypted(ka, 0, 10, 7))
+        again_served = [d for kind, d in again.frames(timeout=2.0) if kind == "msg"]
+        again.send(lsg_connect(gb))
+        again.frames(timeout=2.0)
+        _tc, gc = login(host, PORT, GOOD_ACCOUNT)
+        prov = Peer(host, PORT)
+        prov.send(bufsize_announce())
+        prov.send(lsg_connect(gc))
+        prov_answered = bool(prov.frames(timeout=2.0))
+        create_account(host, PORT, DEADLINE_ACCOUNT, NEW_PASSWORD)
+        td, gd = login(host, PORT, DEADLINE_ACCOUNT)
+        kd = ticket_key(td, NEW_PASSWORD)
+        bound = Peer(host, PORT)
+        bound.send(bufsize_announce())
+        bound.send(lsg_connect(gd))
+        bound.frames(timeout=2.0)
+        if kd:
+            bound.send(lsg_rpc_encrypted(kd, 0, 10, 7))
+        bound_served = [d for kind, d in bound.frames(timeout=2.0) if kind == "msg"]
+        time.sleep(BIND_DEADLINE + 1.5)
+        check(silent.is_closed(timeout=0.5),
+              "a connection that never says anything is closed at the deadline")
+        check(prov_answered and prov.is_closed(timeout=0.5),
+              "a connection that shows the clear proof and nothing under the ticket "
+              "key (a relayed proof) is closed at the deadline")
+        check(bool(again_served) and again.is_closed(timeout=0.5),
+              "a bound connection that shows a second clear proof is provisional "
+              "again, and closed at the deadline")
+        check(bool(bound_served) and not bound.is_closed(timeout=0.5),
+              "CONTROL: a bound connection quiet for longer than the deadline is "
+              "kept (a console pings every 40 s)")
+        for c in (silent, prov, again, bound):
+            c.close()
 
     finally:
         proc.terminate()

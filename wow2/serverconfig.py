@@ -8,6 +8,7 @@ documented in wow2-server.example.toml.
 from __future__ import annotations
 
 import os
+import sys
 import tomllib
 from pathlib import Path
 
@@ -21,10 +22,11 @@ _DEFAULT_DATA = (ROOT / "capture" if _RIG_TREE
                  else ROOT / "wow2-data" if _PUBLIC_TREE
                  else Path.cwd() / "wow2-data")
 
+# never the working directory: a CLI run from a checkout read its file, not the server's (§80ac)
 SEARCH = [
     os.environ.get("WOW2_CONFIG"),
-    "wow2-server.toml",
-    str(ROOT / "wow2-server.toml"),
+    str(ROOT / "wow2-server.toml") if _IN_SOURCE_TREE else None,
+    str(Path(sys.prefix).parent / "wow2-server.toml") if sys.prefix != sys.base_prefix else None,
     "/etc/wow2-server.toml",
 ]
 
@@ -40,12 +42,16 @@ DEFAULTS: dict[str, dict] = {
     "logging": {
         "hexdumps": False,
         "level": "info",
+        "session_log_mb": 64,
+        "session_logs_keep": 20,
     },
     "limits": {
         "max_msgs_per_sec": 100,
         "max_conns_per_ip": 16,
         "max_stream_bytes": 4 * 1024 * 1024,
         "max_creates_per_ip_per_hour": 20,
+        "max_files_per_account": 64,
+        "max_storage_mb": 1024,
     },
     "nat": {
         "relay": False,
@@ -157,6 +163,8 @@ _ENV = {
     ("accounts", "create_mode"): ("WOW2_CREATE_MODE", str),
     ("logging", "hexdumps"): ("WOW2_HEXDUMPS", lambda v: v not in ("0", "false", "no")),
     ("logging", "level"): ("WOW2_LOG_LEVEL", str),
+    ("logging", "session_log_mb"): ("WOW2_SESSION_LOG_MB", int),
+    ("logging", "session_logs_keep"): ("WOW2_SESSION_LOGS_KEEP", int),
     ("storage", "data_dir"): ("WOW2_DATA_DIR", str),
     ("stats", "starting_rating"): ("WOW2_STARTING_RATING", int),
     ("stats", "period_boards"): ("WOW2_PERIOD_BOARDS", lambda v: v not in ("0", "false", "no", "off")),
@@ -164,6 +172,8 @@ _ENV = {
     ("limits", "max_conns_per_ip"): ("WOW2_MAX_CONNS_PER_IP", int),
     ("limits", "max_stream_bytes"): ("WOW2_MAX_STREAM_BYTES", int),
     ("limits", "max_creates_per_ip_per_hour"): ("WOW2_MAX_CREATES_PER_IP_PER_HOUR", int),
+    ("limits", "max_files_per_account"): ("WOW2_MAX_FILES_PER_ACCOUNT", int),
+    ("limits", "max_storage_mb"): ("WOW2_MAX_STORAGE_MB", int),
     ("nat", "relay"): ("WOW2_NAT_RELAY", lambda v: v not in ("0", "false", "no", "off")),
     ("nat", "public_address"): ("WOW2_RELAY_PUBLIC_ADDRESS", str),
     ("nat", "relay_port_base"): ("WOW2_RELAY_PORT_BASE", int),
@@ -198,12 +208,16 @@ SHARED_PASSWORD_FALLBACK = bool(get("accounts", "shared_password_fallback"))
 CREATE_MODE = get("accounts", "create_mode")
 HEXDUMPS = bool(get("logging", "hexdumps"))
 LOG_LEVEL = str(get("logging", "level")).lower()
+SESSION_LOG_MB = max(0, int(get("logging", "session_log_mb") or 0))
+SESSION_LOGS_KEEP = max(0, int(get("logging", "session_logs_keep") or 0))
 DEBUG = LOG_LEVEL == "debug"
 DATA_DIR = Path(get("storage", "data_dir"))
 MAX_MSGS_PER_SEC = int(get("limits", "max_msgs_per_sec"))
 MAX_CONNS_PER_IP = int(get("limits", "max_conns_per_ip"))
 MAX_STREAM_BYTES = int(get("limits", "max_stream_bytes"))
 MAX_CREATES_PER_IP_PER_HOUR = int(get("limits", "max_creates_per_ip_per_hour"))
+MAX_FILES_PER_ACCOUNT = max(0, int(get("limits", "max_files_per_account") or 0))
+MAX_STORAGE_MB = max(0, int(get("limits", "max_storage_mb") or 0))
 NAT_RELAY = bool(get("nat", "relay"))
 NAT_TYPE = bool(get("nat", "nat_type"))
 NAT_TYPE_ALT_PORT = int(get("nat", "nat_type_alt_port"))
@@ -246,6 +260,18 @@ def _nat_line() -> str:
             f"-- OPEN THESE IN THE FIREWALL\n")
 
 
+def firewall_ports() -> list[str]:
+    """What a firewall must let in for this configuration, as firewalld spells it
+    (setup.sh opens these; ufw wants the range's dash as a colon)."""
+    out = [f"{PORT}/tcp", f"{PORT}/udp"]
+    if NAT_TYPE:
+        out.append(f"{NAT_TYPE_ALT_PORT}/udp")
+    if NAT_RELAY:
+        base, n = int(get("nat", "relay_port_base")), int(get("nat", "relay_ports"))
+        out.append(f"{base}-{base + n - 1}/udp")
+    return out
+
+
 def _discord_line() -> str:
     if not DISCORD_LOBBY_WEBHOOK and not DISCORD_ANNOUNCE_WEBHOOK \
             and not DISCORD_LEADERBOARD_WEBHOOK and not DISCORD_ALSO:
@@ -284,7 +310,10 @@ def describe() -> str:
             f"{'ON (development)' if SHARED_PASSWORD_FALLBACK else 'off'}, "
             f"create_mode={CREATE_MODE}\n"
             f"  logging: level {LOG_LEVEL}, "
-            f"hexdumps {'on' if HEXDUMPS else 'off'}\n"
+            f"hexdumps {'on' if HEXDUMPS else 'off'}, session logs "
+            + (f"{SESSION_LOG_MB} MB each" if SESSION_LOG_MB else "unbounded")
+            + (f", the newest {SESSION_LOGS_KEEP} kept\n" if SESSION_LOGS_KEEP
+               else ", all kept\n")
             + _nat_line()
             + _nat_type_line()
             + f"  stats: a player with no ranked row is served "
@@ -294,8 +323,12 @@ def describe() -> str:
             + f"  limits: {MAX_MSGS_PER_SEC} msg/s per conn, "
             f"{MAX_CONNS_PER_IP} conns per address, "
             f"{MAX_STREAM_BYTES // 1024} KB per conn, "
-            + (f"{MAX_CREATES_PER_IP_PER_HOUR} new accounts per address per hour\n"
-               if MAX_CREATES_PER_IP_PER_HOUR else "new accounts per address unlimited\n")
+            + (f"{MAX_CREATES_PER_IP_PER_HOUR} new accounts per address per hour, "
+               if MAX_CREATES_PER_IP_PER_HOUR else "new accounts per address unlimited, ")
+            + (f"{MAX_FILES_PER_ACCOUNT} files per account" if MAX_FILES_PER_ACCOUNT
+               else "files per account unlimited")
+            + (f", {MAX_STORAGE_MB} MB of files in all\n" if MAX_STORAGE_MB
+               else ", files in all unlimited\n")
             + _discord_line().rstrip("\n")
             + "".join(f"\n  !! config: unknown key {k} -- ignored"
                       for k in unknown_keys()))

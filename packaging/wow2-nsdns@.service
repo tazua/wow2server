@@ -31,8 +31,9 @@ Wants=network-online.target
 
 [Service]
 Type=simple
-User=wow2
-Group=wow2
+# A user of its own that exists while it runs: it answers the internet on
+# port 53 and has no business near the server's data directory.
+DynamicUser=true
 ExecStart=/opt/wow2-server/bin/wow2-nsdns --bind %i --answer %i
 Restart=on-failure
 RestartSec=5
@@ -42,15 +43,31 @@ AmbientCapabilities=CAP_NET_BIND_SERVICE
 CapabilityBoundingSet=CAP_NET_BIND_SERVICE
 
 # It reads one packaged list of names and writes nothing at all.
+UMask=0077
 NoNewPrivileges=true
 PrivateTmp=true
+PrivateDevices=true
 ProtectSystem=strict
 ProtectHome=true
+ProtectProc=invisible
+ProcSubset=pid
+ProtectClock=true
+ProtectHostname=true
 ProtectKernelTunables=true
 ProtectKernelModules=true
+ProtectKernelLogs=true
 ProtectControlGroups=true
 RestrictAddressFamilies=AF_INET AF_INET6
+RestrictNamespaces=true
+RestrictRealtime=true
+RestrictSUIDSGID=true
+RemoveIPC=true
+LockPersonality=true
 MemoryDenyWriteExecute=true
+SystemCallArchitectures=native
+SystemCallFilter=@system-service
+SystemCallFilter=~@privileged @resources
+SystemCallErrorNumber=EPERM
 
 [Install]
 WantedBy=multi-user.target

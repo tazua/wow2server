@@ -269,6 +269,10 @@ BUFSIZE_ANNOUNCE = 180    # this 2007 SDK's value; the reference emulator's is 2
 
 
 MAX_FRAME = 0x10000
+JUNK_MAX = 512
+JUNK_HOLD = JUNK_MAX + 4 + MAX_FRAME
+JUNK_TRIES = 32
+CHAIN_PROBE = 8
 
 
 AUTH_TYPES = (0x00, 0x0a, 0x0b)
@@ -290,12 +294,13 @@ def _frames_here(buf: bytes, j: int) -> bool:
 
 
 def _chains_to_end(buf: bytes, j: int) -> bool:
-    """Do frames from j consume the rest of the buffer (a trailing partial
-    frame is fine)? One lucky length is a coincidence; a clean chain is not.
+    """Do frames from j chain cleanly to the end of the buffer (a trailing
+    partial frame is fine), or for CHAIN_PROBE frames? One lucky length is a
+    coincidence; a clean chain is not.
     """
     i = j
     seen = 0
-    while i + 4 <= len(buf):
+    while i + 4 <= len(buf) and seen < CHAIN_PROBE:
         ln = int.from_bytes(buf[i:i+4], "little")
         if ln == 0:
             i += 4; seen += 1; continue
@@ -324,10 +329,11 @@ def parse_frame(buf: bytes):
             out.append(("bufsize", buf[i+4:i+8])); i += 8; continue
         if ln > MAX_FRAME:
             j = i + 1
-            while j + 4 <= len(buf) and not (_frames_here(buf, j)
-                                             and _chains_to_end(buf, j)):
+            last = min(len(buf) - 4, i + JUNK_MAX)
+            while j <= last and not (_frames_here(buf, j)
+                                     and _chains_to_end(buf, j)):
                 j += 1
-            if j + 4 > len(buf):
+            if j > last:
                 break
             skipped += buf[i:j]
             i = j
@@ -336,6 +342,25 @@ def parse_frame(buf: bytes):
             break
         out.append(("msg", buf[i+4:i+4+ln])); i += 4 + ln
     return out, buf[i:], skipped
+
+
+def frame_need(buf: bytes) -> int:
+    """How long `buf` must be before parse_frame can make progress on it."""
+    if len(buf) < 4:
+        return 4
+    ln = int.from_bytes(buf[:4], "little")
+    if ln == 0:
+        return 4
+    if ln == BUFSIZE_ANNOUNCE:
+        return 8
+    if ln <= MAX_FRAME:
+        return 4 + ln
+    return len(buf) + 1
+
+
+def starts_with_junk(buf: bytes) -> bool:
+    """Is the head of `buf` something parse_frame has to resynchronise past?"""
+    return len(buf) >= 4 and int.from_bytes(buf[:4], "little") > MAX_FRAME
 
 
 def unwrap_message(msg: bytes):

@@ -13,6 +13,7 @@ import datetime
 import json
 import re
 import threading
+import unicodedata
 import time
 import urllib.error
 import urllib.request
@@ -41,6 +42,7 @@ HTTP_TIMEOUT = 10.0
 RETRY_AFTER_MAX = 30.0
 MAX_ROWS = 25
 MAX_NOTES = 200
+MAX_EVENTS = 100
 LOG_INTERVAL = 60.0
 
 # The boards the leaderboards message shows, in this order: the game's own
@@ -52,7 +54,49 @@ MONTHS = ("January", "February", "March", "April", "May", "June", "July",
           "August", "September", "October", "November", "December")
 
 NO_PINGS = {"parse": []}
-ALL_PINGS = {"parse": ["roles", "users", "everyone"]}
+NAME_MAX = 32
+DESCRIPTION_MAX = 4096
+FIELD_MAX = 1024
+CONTENT_MAX = 2000
+_MARKDOWN = re.compile(r"([\\*_~`|>#\-\[\]()<:])")
+_MENTION = re.compile(r"<@(&|!)?(\d+)>|@(everyone|here)")
+
+
+def allowed_mentions(mention: str) -> dict:
+    """Exactly the pings the operator's `mention` names, and nothing a player
+    can put in a lobby name."""
+    roles, users, parse = [], [], []
+    for amp, ident, word in _MENTION.findall(mention or ""):
+        if word:
+            parse = ["everyone"]
+        elif amp == "&":
+            roles.append(ident)
+        else:
+            users.append(ident)
+    out: dict = {"parse": parse}
+    if roles:
+        out["roles"] = roles
+    if users:
+        out["users"] = users
+    return out
+
+
+def _clean(name) -> str:
+    text = "".join(" " if unicodedata.category(c) in ("Cc", "Cf", "Zl", "Zp") else c
+                   for c in str(name if name is not None else "?"))
+    text = " ".join(text.split()) or "?"
+    return text if len(text) <= NAME_MAX else text[:NAME_MAX - 1] + "\u2026"
+
+
+def discord_name(name) -> str:
+    """A player-chosen name as it may appear in a message: one line, at most
+    NAME_MAX characters, markdown escaped, no mention."""
+    return _MARKDOWN.sub(r"\\\1", _clean(name)).replace("@", "@\u200b")
+
+
+def code_name(name) -> str:
+    """The same for inside a code block, where escapes would show."""
+    return _clean(name).replace("`", "'")
 
 # What the board says, as templates; a deployment gives the poster a voice in
 # [discord] (wow2-server.example.toml lists the fields each one may use).
@@ -155,6 +199,7 @@ def render_board(title: str, rows: tuple, state: str, now: float,
                                         playing=playing, lobbies=lobbies, games=games,
                                         when=when), ""]
     for name, n, mx, ranked, created, full, started in rows[:MAX_ROWS]:
+        name = discord_name(name)
         mode = "ranked" if ranked else "friendly"
         if started:
             lines.append(f"\U0001F3AE **{name}** — {n} playing — {mode} — "
@@ -165,13 +210,19 @@ def render_board(title: str, rows: tuple, state: str, now: float,
         if created:
             line += f" — opened <t:{created}:R>"
         lines.append(line)
-    if len(rows) > MAX_ROWS:
-        lines.append(f"*…and {len(rows) - MAX_ROWS} more*")
-    if not rows:
-        lines.append(text["empty_text"].format(when=when))
-    lines += ["", f"Updated {when}"]
+    shown = min(len(rows), MAX_ROWS)
+    tail = ["", f"Updated {when}"]
+    while True:
+        more = [f"*…and {len(rows) - shown} more*"] if len(rows) > shown else []
+        body = lines[:2 + shown] + more
+        if not rows:
+            body = lines[:2] + [text["empty_text"].format(when=when)]
+        description = "\n".join(body + tail)
+        if len(description) <= DESCRIPTION_MAX or shown == 0:
+            break
+        shown -= 1
     return {"title": title, "color": COLOR_OPEN if rows else COLOR_EMPTY,
-            "description": "\n".join(lines)}
+            "description": description[:DESCRIPTION_MAX]}
 
 
 def count_text(n: int, mx: int) -> str:
@@ -181,16 +232,16 @@ def count_text(n: int, mx: int) -> str:
 def render_announcement(mention: str, name: str, ranked: bool, n: int, mx: int,
                         text: dict | None = None) -> str:
     tmpl = (text or DEFAULT_TEXT)["announce_text"]
-    return tmpl.format(mention=mention or "", name=name,
+    return tmpl.format(mention=mention or "", name=discord_name(name),
                        mode="ranked" if ranked else "friendly",
-                       count=count_text(n, mx), players=n, max=mx).strip()
+                       count=count_text(n, mx), players=n, max=mx).strip()[:CONTENT_MAX]
 
 
 def render_closed(name: str, ranked: bool, now: float, n: int = 0, mx: int = 0,
                   text: dict | None = None) -> str:
     tmpl = (text or DEFAULT_TEXT)["closed_text"]
-    return tmpl.format(name=name, mode="ranked" if ranked else "friendly",
-                       count=count_text(n, mx), when=f"<t:{int(now)}:R>").strip()
+    return tmpl.format(name=discord_name(name), mode="ranked" if ranked else "friendly",
+                       count=count_text(n, mx), when=f"<t:{int(now)}:R>").strip()[:CONTENT_MAX]
 
 
 def period_text(kind: str, now: float) -> str:
@@ -242,15 +293,18 @@ def render_leaderboards(title: str, boards: tuple, state: str, now: float,
                 "description": text["offline_text"].format(when=when)}
     fields = []
     for _board_id, label, period, rows, total in boards:
-        rows = rows[:MAX_ROWS]
-        if rows:
+        rows = [(rank, code_name(name), score) for rank, name, score in rows[:MAX_ROWS]]
+        while rows:
             w = max(len(name) for _rank, name, _score in rows)
             sw = max(len(str(score)) for _rank, _name, score in rows)
             lines = [f"{rank:>2}. {name:<{w}}  {score:>{sw}}" for rank, name, score in rows]
             value = "```\n" + "\n".join(lines) + "\n```"
             if total > len(rows):
                 value += f"*…and {total - len(rows)} more*"
-        else:
+            if len(value) <= FIELD_MAX:
+                break
+            rows = rows[:-1]
+        if not rows:
             value = text["leaderboard_empty_text"].format(when=when)
         fields.append({"name": f"{label} — {period}" if period else label,
                        "value": value, "inline": False})
@@ -267,6 +321,7 @@ class Board:
     and may queue events for `_do_event()` and wake itself with `_due()`."""
 
     KIND = "board"
+    KEEP: tuple = ()        # event kinds a full queue drops last
 
     def __init__(self) -> None:
         self.enabled = False
@@ -286,6 +341,7 @@ class Board:
         self._board_id: str | None = None
         self._muted_until = 0.0
         self.posted = 0
+        self.dropped = 0
         self.label = ""
 
     # ------------------------------------------------------------ the server side
@@ -346,6 +402,14 @@ class Board:
 
     def _queue(self, ev: tuple) -> None:
         with self._cv:
+            if len(self._events) >= MAX_EVENTS:
+                i = next((i for i, e in enumerate(self._events) if e[0] not in self.KEEP), 0)
+                del self._events[i]
+                self._pending = max(0, self._pending - 1)
+                self.dropped += 1
+                self._complain(f"discord: {self.KIND} events arrive faster than Discord "
+                               f"takes them; {self.dropped} dropped so far (at most "
+                               f"{MAX_EVENTS} wait)")
             self._events.append(ev)
             self._pending += 1
             self._cv.notify()
@@ -544,6 +608,8 @@ class LobbyBoard(Board):
     """Who is online and the live session list, and the announcements, on one
     worker."""
 
+    KEEP = ("close",)
+
     def __init__(self) -> None:
         super().__init__()
         self.title = "Open lobbies"
@@ -552,6 +618,7 @@ class LobbyBoard(Board):
         self.cooldown = ANNOUNCE_COOLDOWN
         self._notes: dict[int, tuple[str, str, bool, int, int]] = {}
         self._last_open: dict[str, float] = {}
+        self._last_ip: dict[str, float] = {}
         self._last_sid: dict[str, int] = {}
 
     # ------------------------------------------------------------ the server side
@@ -588,24 +655,40 @@ class LobbyBoard(Board):
 
     def opened(self, rec: dict) -> None:
         """A session was created: a fresh ping, or, inside the host's cooldown, the
-        host's last announcement edited back to open (an edit pings nobody)."""
+        host's last announcement edited back to open (an edit pings nobody). The
+        host is the account and its address, never the lobby's name."""
         if not self.enabled or not self.announce_url:
             return
         name = str(rec.get("name") or "?")
+        host = str(rec.get("host") or name)
+        where = str(rec.get("host_ip") or "")
         sid = int(rec.get("id") or 0)
         ranked = bool(rec.get("points"))
         n, mx = int(rec.get("players") or 0), int(rec.get("max_players") or 0)
         text = render_announcement(self.mention, name, ranked, n, mx, self.text)
         now = time.time()
-        if now - self._last_open.get(name, 0.0) < self.cooldown:
-            prev = self._last_sid.get(name)
+        self._forget(now)
+        if host in self._last_open:
+            prev = self._last_sid.get(host)
             if prev is not None:
                 self._queue(("reopen", sid, name, ranked, text, n, mx, prev))
-                self._last_sid[name] = sid
+                self._last_sid[host] = sid
             return
-        self._last_open[name] = now
-        self._last_sid[name] = sid
+        if where in self._last_ip:
+            return
+        self._last_open[host] = now
+        if where:
+            self._last_ip[where] = now
+        self._last_sid[host] = sid
         self._queue(("open", sid, name, ranked, text, n, mx, None))
+
+    def _forget(self, now: float) -> None:
+        """The hosts and addresses whose cooldown has run out."""
+        for table in (self._last_open, self._last_ip):
+            for key in [k for k, t in table.items() if now - t >= self.cooldown]:
+                del table[key]
+        for host in [h for h in self._last_sid if h not in self._last_open]:
+            del self._last_sid[host]
 
     def closed(self, sid: int) -> None:
         """A session went away: strike its announcement through."""
@@ -621,7 +704,8 @@ class LobbyBoard(Board):
         kind, sid, name, ranked, text, n, mx, prev = ev
         if kind == "open":
             mid = self._send(self.announce_url,
-                             {"content": text, "allowed_mentions": ALL_PINGS})
+                             {"content": text,
+                              "allowed_mentions": allowed_mentions(self.mention)})
             if mid:
                 self._notes[sid] = (mid, name, ranked, n, mx)
                 while len(self._notes) > MAX_NOTES:

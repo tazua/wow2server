@@ -36,7 +36,14 @@ before its bits (`wow2/bdproto.py` is the codec). `1` means encrypted:
 `[u8 1][u32 seed]` then 3DES-CBC ciphertext under a 24-byte key with the IV
 `Tiger192(seed as LE u32)[:8]`. Server replies open with the signature
 `0xDEADBEEF` in the plaintext, which is the client's check that the key was
-right; a reply that fails it closes the connection.
+right; a reply that fails it closes the connection. A client's encrypted
+message opens its plaintext instead with four bytes of HMAC-SHA1, under the
+session key, of everything after the service byte, and the server checks
+them on every RPC.
+
+Bytes that do not frame are skipped, since at a cold boot a console sends
+about a hundred bytes of a raw NAT structure ahead of its first frame. A
+connection that keeps sending them is closed rather than re-scanned.
 
 Tiger192 is the hash under everything: the account id, the IVs, the keys.
 It is implemented in `wow2/tiger.py`.
@@ -47,7 +54,7 @@ It is implemented in `wow2/tiger.py`.
 |---:|---|---|
 | `0x00` | create account: `[seed][title id][64 zero bits][96 bytes ciphertext]` under a constant key the client ships; plaintext is `[magic][username, 64 bytes][Tiger192(password), 24 bytes]` | `0x01` with a code |
 | `0x0a` | login: `[seed][title id][64-bit handle]`, the handle being `Tiger192(username)[:8]` | `0x0b`: `[seed]`, a 128-byte ticket encrypted under `Tiger192(password)`, and a 128-byte proof in clear |
-| `0x02` | change password: `[seed][title id][64-bit handle]` and 32 bytes encrypted under the current `Tiger192(password)`, holding the new digest | `0x03` with a code; the server verifies the current password by decrypting and finding the magic |
+| `0x02` | change password: `[seed][title id][64-bit handle]` and 32 bytes encrypted under the current `Tiger192(password)`, holding the new digest | `0x03` with a code; the server verifies the current password by decrypting and finding the magic. An account with no stored credential has no current password unless `shared_password_fallback` is on |
 
 The codes are the client's own: 700 no error, 707 name exists, 704 bad
 account, 716 incorrect password; the full list is in `wow2/authserver.py`.
@@ -57,14 +64,16 @@ request carries no password proof. It names the account, and the server
 proves it holds the credential by encrypting the ticket with it. The ticket
 holds the 24-byte session key; the clear proof beside it holds an opaque
 handle. The lobby connection presents the proof and is bound provisionally;
-the first RPC that decrypts under the ticket's key completes the binding. So
-a connection that has only seen the reply, and not opened the ticket, is
-served nothing. A refused login is answered with a key the sender cannot
-have, and it is indistinguishable on the wire from a wrong password. A
-handle and its key are honoured for 120 s after the login reply (a console
-presents its handle within a few seconds) and the tables that hold them are
-bounded at 65,536 entries, so a flood of sign-ins costs memory only up to
-that bound.
+the first RPC encrypted under the ticket's key, with the client's MAC under
+it, completes the binding. So a connection that has only seen the reply, and
+not opened the ticket, is served nothing. Every connection whose binding has
+not completed 30 s after it opened is closed; a console's completes within a
+fraction of a second, and a bound one pings every 40 s. A refused login is
+answered with a key the sender cannot have, and it is indistinguishable on
+the wire from a wrong password. A handle and its key are honoured for 120 s
+after the login reply (a console presents its handle within a few seconds)
+and the tables that hold them are bounded at 65,536 entries, so a flood of
+sign-ins costs memory only up to that bound.
 
 There is no lockout, and there cannot be one on this protocol: the server
 never sees a wrong password. Whoever names an account gets its ticket, and
@@ -141,12 +150,28 @@ the table depends on:
   server derives it from the bound connection's name and takes it from no
   request field.
 
-The server enforces what the client does not: a session can be updated or
-deleted only by the connection that created it; clan invites, cancels,
-removals, promotions and transfers need the rank the game shows them for; an
-invite to someone who has blocked the sender is dropped; an account signing
-in a second time signs the first console out; a duplicate account name is
-refused rather than overwritten.
+The server enforces what the client does not:
+
+- a session can be updated or deleted only by the connection that created
+  it, and a session's info or a public profile must have the shape every
+  console sends (24 and 9 fields), or it is answered 106 and not kept;
+- a console writes only its own leaderboard rows (and its clan's on the
+  clan boards); on the ranked boards a fall is filed as a stake into the
+  uploader's own match, and a rise is paid only out of a pot it staked in,
+  at most what that pot holds;
+- clan invites, cancels, removals, promotions and transfers need the rank
+  the game shows them for, and nobody removes the owner or themselves;
+- a buddy accept or decline counts only against an invite the other player
+  sent; an invite to someone who has blocked the sender is dropped; the same
+  match or clan invite twice files one mailbox row, a mailbox keeps the
+  newest 25 (what a console reads), and an invite is pushed at most once
+  every 10 s per sender, target and kind;
+- uploaded files: names a console can send (1 to 64 printable characters,
+  no slash), the two `limits` caps, ids never re-used, a private file its
+  owner's alone, and a file with no owner (the operator's) nobody's to
+  change;
+- an account signing in a second time signs the first console out, and a
+  duplicate account name is refused rather than overwritten.
 
 ### UDP
 
@@ -163,10 +188,18 @@ where each console's socket really is. Nothing inside a bdNAT packet is ever
 rewritten: a 10-byte HMAC covers it under a key only the originator holds,
 so the server changes the transport, never the bytes.
 
+A discovery or NAT-type reply is larger than its request, and UDP sources
+can be forged, so they are budgeted: 60 replies a minute to one address
+(a sign-in needs about three) and 3,000 in all. The session log has a budget
+too, 200 lines a minute about one address's datagrams and 2,000 in all.
+
 ## Configuration
 
-`wow2-server.toml`, found at `$WOW2_CONFIG`, `./wow2-server.toml`, the
-checkout's own, or `/etc/wow2-server.toml`, in that order. The environment
+`wow2-server.toml`, found at `$WOW2_CONFIG`, a source checkout's own (run
+in place), the one beside the venv the program runs from (a local install's
+checkout), or `/etc/wow2-server.toml`, in that order — never the working
+directory, so a CLI run from a checkout on a system install still reads
+`/etc`'s and edits the server's store. The environment
 wins over the file (`WOW2_PORT`, `WOW2_DATA_DIR`, ...). Every key in the
 example file is its default; no file at all gives the same values. The
 server prints what is in force at startup.
@@ -177,12 +210,14 @@ server prints what is in force at startup.
 | `accounts.shared_password_fallback` | `false` | let an account with no stored credential sign in on one shared password. A migration stopgap; see Accounts |
 | `accounts.create_mode` | `refuse_duplicates` | answer 707 to a create for a name that already has a credential |
 | `logging.level` | `info` | `debug` logs every message body |
-| `logging.hexdumps` | `false` | dump every packet to the session log; hundreds of MB per session |
+| `logging.hexdumps` | `false` | dump every packet to the session log, and keep the bytes of whatever does not frame or is not recognised in files; hundreds of MB per session |
+| `logging.session_log_mb`, `logging.session_logs_keep` | `64`, `20` | a session log is closed at this size and a new one begun, and only the newest so many are kept; `0` is no limit |
 | `limits.*` | 100 msg/s, 16 connections per address, 4 MB per connection | per-connection caps; flood protection, not a lockout (see Authentication) |
 | `limits.max_creates_per_ip_per_hour` | `20` | the next create-account from that address is answered 710 (*Unable to create online profile*) until the hour turns; `0` turns it off. A create for a name that already has a credential is answered 707 first, so a sign-in is never blocked by it |
+| `limits.max_files_per_account`, `limits.max_storage_mb` | `64`, `1024` | uploaded files (flags, snapshots, shared schemes and landscapes): a NEW file past the account's cap, or any growth past the server's total, is answered 1002 and the game says *Unable to upload*. A console has about twenty slots and the game has no screen that deletes a file, so an account that reaches its cap can never upload again: keep it well above twenty. `0` turns a cap off |
 | `nat.relay` | `false` | carry matches through the server; see below |
-| `nat.relay_port_base`, `nat.relay_ports` | `40000`, `32` | one UDP port per console ONLINE (held until `relay_idle_timeout` of silence); a console that arrives when all are taken plays direct instead, so size it to the players you expect online together |
-| `nat.relay_idle_timeout` | `600` | seconds before an idle mailbox is reclaimed |
+| `nat.relay_port_base`, `nat.relay_ports` | `40000`, `32` | one UDP port per console ONLINE; a console that arrives when all are taken plays direct instead, so size it to the players you expect online together. See NAT and the relay |
+| `nat.relay_idle_timeout` | `600` | seconds of silence before the mailbox of a console at an address a player is signed in from (or was within the day) is reclaimed; at any other address, 90 s |
 | `nat.public_address` | unset | what to tell consoles the server's address is; set it behind a NAT or on a multi-homed host |
 | `nat.nat_type`, `nat.nat_type_alt_port` | `true`, `3078` | answer the NAT type probe; test 3's reply leaves from the alternate port |
 | `nat.nat_type_alt_address` | unset | a second public address, if there really is one |
@@ -193,13 +228,13 @@ server prints what is in force at startup.
 | `discord.announce_webhook`, `discord.mention` | unset | a webhook URL that gets a message when a lobby opens, and what to put in front of it (`<@&ROLE_ID>` or `@here`) |
 | `discord.title` | `Open lobbies` | the board's heading |
 | `discord.announce_text`, `closed_text`, `empty_text`, `offline_text`, `online_text` | built-in wording | templates for what the poster says; the example file lists each one's fields |
-| `discord.announce_cooldown` | `300` | seconds before the same host name pings again; inside it a new lobby edits the previous announcement back to open |
+| `discord.announce_cooldown` | `300` | seconds before the same host pings again; inside it a new lobby edits the previous announcement back to open. The host is the account (not the lobby's name), and its address keeps the same window: another account hosting from there inside it is listed, not pinged |
 | `discord.leaderboard_webhook` | unset | a webhook URL; the channel gets one message that always shows the top of the Permanent, Weekly, Monthly and Yearly boards. See Discord |
 | `discord.leaderboard_title`, `leaderboard_rows` | `Leader boards`, `10` | the heading, and rows per board (1 to 25) |
 | `discord.leaderboard_text`, `leaderboard_empty_text` | built-in wording | the line under the heading (`{start}` is the starting rating) and what an empty board says |
 | `[[discord.also]]` | none | more Discord servers that get the same boards and pings: one table per server with its own `lobby_webhook`, `announce_webhook`, `leaderboard_webhook`, `mention`, and optionally `name`, `title`, `leaderboard_title`, the seven texts and `announce_cooldown` |
 | `discord.bot_guild` | `0` (off) | the Discord server id the password bot (`wow2-discordbot`) serves; the token comes from the environment. See Discord |
-| `discord.bot_admin_roles`, `bot_help_channel`, `bot_claims_per_day`, `bot_text` | `["Admin", "Moderator"]`, `connection-help`, `3`, built-in wording | who may `/reset`, where a refused player is sent, passwords per person per day (`0` = no limit), the DM as a template (`{name} {password} {server} {help}`) |
+| `discord.bot_admin_roles`, `bot_help_channel`, `bot_claims_per_day`, `bot_text` | `["Admin", "Moderator"]`, `connection-help`, `3`, built-in wording | who may `/reset` and `/account`: role ids, or names, each pinned when the bot starts to the one role carrying it (a name two roles share grants nothing); where a refused player is sent; passwords per person per day (`0` = no limit); the DM as a template (`{name} {password} {server} {help}`) |
 
 The `WOW2_*` environment variables beyond those are not configuration. Each
 switches one behaviour back to an older one so a protocol failure can be
@@ -278,13 +313,17 @@ password.
 `shared_password_fallback = true` is the stopgap for exactly that migration:
 every account without a credential may sign in on one shared password
 (`WOW2_PASSWORD`, default `123456`, which is in this repository). With it on,
-anyone who knows a name is in. Leave it off.
+anyone who knows a name is in, and can give it a password with the game's
+own change-password request. Off, the shared password opens neither. Leave
+it off.
 
 Back up the database (`wow2-db backup PATH`, safe while the server runs)
 before deleting anything. It is the only copy of every credential. On a
 system install run it as root (`sudo /opt/wow2-server/bin/wow2-db backup
 /var/backups/wow2.sqlite3`): the CLI hands the store's files back to the
 service user afterwards, and `/var/backups` is not writable by that user.
+The copy, and every file `wow2-db export` writes, is readable by its owner
+only: the stored digest is all a scripted client needs to sign in.
 
 To start over, stop the server and remove `wow2.sqlite3` (with its `-wal`
 and `-shm` files) and the `storage/` directory from the data directory; the
@@ -313,8 +352,8 @@ per file, and renames each to `<name>.imported-<date>`.
 | player profiles, keyed by account id | `profiles` |
 | uploaded files (flags, shared schemes and landscapes, leaderboard snapshots) | `storage`, with the bytes in `storage/` |
 | every leaderboard upload as received | `stats-uploads.jsonl` |
-| diagnostic: every typed field the client has sent, per RPC, and whether a handler read it | `request-census.json` |
-| one log per server run | `session-*.log` |
+| diagnostic: every typed field the client has sent, per RPC the server answers (32 fields at most), and whether a handler read it | `request-census.json` |
+| the session log, a new file per run and at `logging.session_log_mb` | `session-*.log` |
 
 ```bash
 wow2-db check                 # integrity, row counts, which stores were imported when
@@ -325,29 +364,34 @@ wow2-db import DIR            # JSON files -> a fresh database
 
 On a system install run these as the service user (`sudo -u wow2 ...`), or
 as root: a root-run command gives the database files back to the service
-user, so it cannot lock the server out of its own store.
+user, so it cannot lock the server out of its own store. The data directory
+is 0770 and the database 0660 because the password bot runs as a user of
+its own, `wow2bot`, in the server's group: the server is what the internet
+talks to, and it cannot read the bot's token out of its environment.
 
 Three things about the stores that are not obvious:
 
-- Rank is computed on read from the score order and never stored. Board 5
-  is the ranked rating, boards 2 and 3 weekly and monthly, board 1 games
-  started, 9 to 24 the daily awards. Board 1 rows carry a `tail` the client
-  round-trips (its completion history); clearing it rewrites a player's
-  percentage.
+- Rank is computed on read from the score order and never stored. Board 5 is
+  the ranked rating, boards 2, 3 and 4 Weekly, Monthly and Yearly, board 1
+  games started, 9 to 24 the daily awards. Board 1 rows carry a `tail` the
+  client round-trips (its completion history); clearing it rewrites a
+  player's percentage.
 - A storage row's owner is a 16-hex-digit account id, or NULL for a global
   file. If you insert rows by hand keep it hex; a decimal id makes the file
   invisible to the screen meant to show it. Two rows cannot share an id: the
-  primary key refuses the second.
+  primary key refuses the second. Ids come from a counter and are never
+  handed out again, and a file's bytes go when the last row naming them does.
 - A console asks to *create* its profile at every sign-in. The server
   answers "already exists" once it holds one, which makes the console
   download the server's copy instead of uploading over it, so a profile
   edited on the server survives, except longitude, latitude and six bits of
   two fields the console always supplies itself.
 
-Writes are atomic (a temp file renamed over the target). A store that exists
-and does not parse is kept aside as `<name>.corrupt-<timestamp>` and every
-later write to it is refused for the life of the process, so a bad file
-costs an empty screen and a loud log line, never the data.
+Every write is one SQLite transaction, so a crash or a full disk leaves the
+last committed state; a write that fails is rolled back and logged, and the
+server goes on answering. A database that fails SQLite's own check
+(`PRAGMA quick_check`) at start stops the server with the reason rather than
+serving from it: restore the last `wow2-db backup` copy.
 
 ## NAT and the relay
 
@@ -371,7 +415,18 @@ address a console publishes is decided at sign-in, before anyone knows
 whether a punch would have worked. The relay ports must be open in the
 firewall, and nothing warns you if they are not: sign-in, hosting and the
 browser all work and only the join fails. `setup.sh --open-firewall` opens
-the range the config declares when it sees `relay = true`.
+what the installed server reads in the config — its port, the NAT type
+probe's and the relay range when the relay is on — and without the flag it
+prints the same list.
+
+A mailbox lives on its own console's traffic (a keepalive every 15 s). One
+at an address a player is signed in from, or was within the day, is held
+until `relay_idle_timeout` of silence and never given away while its console
+speaks. One at any other address goes after 90 s of silence, and in a full
+pool a newcomer may take it: at once if the newcomer's address has signed
+in, otherwise once it has been held 300 s. A console's return path moves to
+a new port on its address only after 30 s of silence on it, so a datagram
+from somebody else on that address cannot take it over.
 
 What it costs: the match's own traffic, on the server, for every match. That
 is little bandwidth but it is the server's latency instead of the direct
@@ -409,7 +464,8 @@ message; a message somebody deleted is re-posted. With `announce_webhook`
 set, each lobby opened is a fresh message (`@role 🎮 **name** opened a
 ranked lobby (1/4)`), struck through when the lobby closes; `mention` is
 what goes in front, typically a role people give themselves to be pinged.
-A host name pings at most once per `announce_cooldown` (five minutes);
+A host pings at most once per `announce_cooldown` (five minutes), and so
+does its address;
 inside that window a new lobby from the same host edits the struck-through
 announcement back to open, with the new lobby's mode and count, and an edit
 notifies nobody. All five texts are templates in the
@@ -455,7 +511,11 @@ new webhook in the channel's *Integrations*, put its URL in `[discord]` and
 restart. A webhook URL is a secret — whoever holds it can post to the
 channel — so keep the config file to the operator.
 
-`lobbyboardtest.py` is the feature's own suite: 91 checks against a fake
+Player names come from the consoles, so the boards show each one escaped,
+on one line and at most 32 characters, and the pings allow only the
+configured `mention`: a profile called `@everyone` pings nobody.
+
+`lobbyboardtest.py` is the feature's own suite: 102 checks against a fake
 webhook endpoint in the same process, no Discord needed.
 
 ### The password bot
@@ -474,10 +534,15 @@ temporary password for a profile name the server does not hold.
   screens; if their privacy settings refuse DMs, the same comes back in a
   reply only they can see. The name is then bound to that Discord user:
   a second `/claim` from them resets it again, a `/claim` from anyone
-  else is refused. A name registered from a console is nobody's to claim.
+  else is refused. A name registered from a console is nobody's to claim,
+  and neither is a name with no password that has played here (it has a
+  profile, scores, files, a clan or buddies on this server): the bot
+  cannot tell whose that is, so it sends the player to staff, and
+  `/account` shows staff what the name has.
   A name is 1 to 16 printable ASCII characters: the game says 6 to 12
   letters and digits and does not hold itself to it. Each person gets
-  `bot_claims_per_day` passwords a day. A one-word DM to the bot does the
+  `bot_claims_per_day` passwords a day, counted in the database, so a
+  restart of the bot does not reset it. A one-word DM to the bot does the
   same as `/claim`.
 - `/recover NAME PASSWORD` — anyone. For a password the game will not
   take any more: one changed in the game to more than 12 characters,
@@ -489,8 +554,8 @@ temporary password for a profile name the server does not hold.
   (it asks once) is therefore staff's to reset. Five tries an hour per
   person; a wrong try changes nothing. The password travels through
   Discord's interaction, visible to nobody else, and is never logged.
-- `/reset NAME @player` — staff (a role named in `bot_admin_roles`, or
-  Manage Server): a new password for any name, sent to that player by DM
+- `/reset NAME @player` — staff (a role in `bot_admin_roles`, or Manage
+  Server): a new password for any name, sent to that player by DM
   and bound to them. Discord hides the command from members; a Moderator
   without Manage Server sees it once you allow it under *Server Settings →
   Integrations → the application*.
@@ -499,11 +564,20 @@ temporary password for a profile name the server does not hold.
 
 It is a separate process that shares the data directory with the server
 (the row it writes is the one `wow2-account set` writes, read at the next
-sign-in) and needs three things: `pip install .[bot]` (discord.py;
-`setup.sh` does it), the setup bot's token in the environment as
-`DISCORD_BOT_TOKEN` — never in the config file — and `bot_guild` in
-`[discord]`, the Discord server's id. On a system install the token goes
-in `/etc/wow2-server.env`, one line, mode 600:
+sign-in), as its own user `wow2bot` in the server's group, and needs three
+things: `pip install .[bot]` (discord.py; `setup.sh` does it), the token of
+its own Discord application in the environment as `DISCORD_BOT_TOKEN` —
+never in the config file — and `bot_guild` in `[discord]`, the Discord
+server's id. The bot needs no permissions, so invite it with none, with the
+application's id in place of `APP_ID`:
+
+```
+https://discord.com/oauth2/authorize?client_id=APP_ID&scope=bot%20applications.commands&permissions=0&integration_type=0
+```
+
+It names any permission it holds when it starts. Do not reuse a token that
+can manage the server. On a system install the token goes in
+`/etc/wow2-server.env`, one line, mode 600:
 
 ```bash
 sudo sh -c 'umask 077; printf "DISCORD_BOT_TOKEN=%s\n" "PASTE-THE-TOKEN" > /etc/wow2-server.env'
@@ -519,7 +593,7 @@ restart the unit. Without the env file the unit does not start at all,
 so an install that has no Discord needs nothing. The bot never logs a
 password. `bot_text` replaces the DM's wording with a template
 (`{name}`, `{password}`, `{server}`, `{help}`), checked at start like the
-board's texts. `discordbottest.py` is its suite: 52 checks, no Discord.
+board's texts. `discordbottest.py` is its suite: 68 checks, no Discord.
 
 ## Checks
 
@@ -532,12 +606,12 @@ webhook endpoint, the sixth the password bot's desk and commands with no
 Discord at all.
 
 ```bash
-.venv/bin/python -m wow2.lsgauth      # the credential path, 27 checks
+.venv/bin/python -m wow2.lsgauth      # the credential path, the MAC, the bind deadline, 36 checks
 .venv/bin/python -m wow2.blocktest    # a block stops all three invites, 7 checks
-.venv/bin/python -m wow2.ownertest    # identity, ownership, clans, storage, profiles, UDP, relay and login-table bounds, the create limit, 72 checks
-.venv/bin/python -m wow2.storetest    # the SQLite store: the import keeps everything, the rules hold, the windowed boards, the pot on every board, 49 checks
-.venv/bin/python -m wow2.lobbyboardtest   # the Discord boards: what they post, coalescing, Discord down, other servers, the leaderboards, 91 checks
-.venv/bin/python -m wow2.discordbottest   # the password bot: who gets a password for which name, the DM, 51 checks
+.venv/bin/python -m wow2.ownertest    # identity, ownership, clans, storage, profiles, the pot, invites, UDP, relay and login-table bounds, the create limit, the systemd units, 200 checks
+.venv/bin/python -m wow2.storetest    # the SQLite store: the import keeps everything, the rules hold, the windowed boards, the pot on every board, a failed commit, file modes, 59 checks
+.venv/bin/python -m wow2.lobbyboardtest   # the Discord boards: what they post, coalescing, Discord down, other servers, the leaderboards, names and pings, 102 checks
+.venv/bin/python -m wow2.discordbottest   # the password bot: who gets a password for which name, the DM, who is staff, 68 checks
 .venv/bin/python -m wow2.loadtest --consoles 32 --lifetime 200   # capacity, see below
 .venv/bin/python -m wow2.dbcli roundtrip DIR   # a directory of JSON stores in and out, field by field
 ```
@@ -566,11 +640,15 @@ playing and are recorded as such: a drawn match (the game deals a drawn
 round again) and the client's UPnP path (needs a real router).
 
 The credential and authorization paths have been checked from the side a
-console cannot take, and one outside code review (2026-09-16) has been worked
-through; its six real findings, all in the class of a handler trusting a
-request field, are fixed and each has a check. It has not had a full
-security review, and the sensible assumption is that a second careful
-reader finds one or two more of the same kind, none reachable from a retail
+console cannot take, and two code reviews have been worked through. The
+first (2026-09-16, outside) had six real findings, all in the class of a
+handler trusting a request field. The second (2026-10-01, four read-only
+passes over this package) had 29, from the framing, the bind and the score
+uploads to the relay pool, the Discord side and the install. Every one is
+fixed with a check that fails on the code before it, the server refusing,
+bounding or validating, since the client cannot change. It has not had an
+independent security audit, and the sensible assumption is that another
+careful reader finds more of the same kind, none reachable from a retail
 console.
 
 Scale was measured with synthetic consoles (`python -m wow2.loadtest`), on a

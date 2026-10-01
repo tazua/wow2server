@@ -13,6 +13,8 @@ from __future__ import annotations
 import asyncio
 import atexit
 import datetime
+import hashlib
+import hmac
 import json
 import secrets
 import signal
@@ -38,8 +40,10 @@ CAP = serverconfig.DATA_DIR
 
 
 class _SessionLog:
-    """The session log, opened on the first line written to it."""
+    """The session log, opened on the first line written to it, begun anew at
+    `logging.session_log_mb` and pruned to the newest `session_logs_keep`."""
     _f = None
+    _bytes = 0
 
     @property
     def name(self) -> str:
@@ -47,13 +51,34 @@ class _SessionLog:
 
     def write(self, text: str) -> None:
         self._open().write(text)
+        self._bytes += len(text)
+        cap = serverconfig.SESSION_LOG_MB * 1024 * 1024
+        if cap and self._bytes >= cap:
+            self._f.close()
+            self._f, self._bytes = None, 0
 
     def _open(self):
         if self._f is None:
             CAP.mkdir(parents=True, exist_ok=True)
-            self._f = open(CAP / f"session-{datetime.datetime.now():%Y%m%d-%H%M%S}.log",
-                           "a", buffering=1)
+            stamp = f"{datetime.datetime.now():%Y%m%d-%H%M%S}"
+            path, n = CAP / f"session-{stamp}.log", 1
+            while self._bytes == 0 and path.exists() and path.stat().st_size and n < 100:
+                n += 1
+                path = CAP / f"session-{stamp}-{n}.log"
+            self._f = open(path, "a", buffering=1)
+            self._prune()
         return self._f
+
+    def _prune(self) -> None:
+        keep = serverconfig.SESSION_LOGS_KEEP
+        if keep <= 0:
+            return
+        logs = sorted(CAP.glob("session-*.log"), key=lambda p: p.stat().st_mtime)
+        for old in logs[:-keep]:
+            try:
+                old.unlink()
+            except OSError:
+                pass
 
 
 SESSION_LOG = _SessionLog()
@@ -247,6 +272,7 @@ LSG_SERVICE_MESSAGING = 6
 LSG_SERVICE_PROFILE = 8
 
 LEFTOVER_HEXDUMP_MAX = 96
+UNFRAMED_FILE_MAX = 64 * 1024
 
 LSG_MSG_TASK_REPLY = 1
 LSG_MSG_PUSH_MESSAGE = 2
@@ -412,8 +438,11 @@ _CENSUS_LOGGED: set[str] = set()
 _CENSUS_WRITES = 0
 _CENSUS_LOADED = False
 _CENSUS_SAVED_AT = 0.0
+_CENSUS_DIRTY = False
 CENSUS_MAX_VALUES = 12
+CENSUS_MAX_FIELDS = 32
 CENSUS_SAVE_S = 30.0
+CENSUS_FRESH_S = 5.0
 
 
 def _census_val(v) -> str:
@@ -426,20 +455,18 @@ def _census_val(v) -> str:
 
 
 def census_load() -> None:
-    """Carry the census across restarts: it accumulates what the client has ever sent."""
+    """Carry the census across restarts: it accumulates what the client has ever
+    sent. A file that does not parse is kept aside and not overwritten (§80ah)."""
     global _CENSUS_LOADED
     _CENSUS_LOADED = True
-    try:
-        prev = json.loads(REQ_CENSUS_PATH.read_text())
-    except (OSError, ValueError):
-        return
-    if isinstance(prev, dict):
-        REQ_CENSUS.update(prev)
+    REQ_CENSUS.update(_jload(REQ_CENSUS_PATH, {}))
 
 
-def census_note(svc: int, op: int, dec: dict) -> None:
-    """Record one request's typed fields, and shout once if we ignored any."""
-    global _CENSUS_WRITES
+def census_note(svc: int, op: int, dec: dict, answered: bool = True) -> None:
+    """Record one request's typed fields, and shout once if we ignored any. Only
+    an op the server answers gets a key (the sender picks svc and op), and a key
+    holds at most CENSUS_MAX_FIELDS fields of CENSUS_MAX_VALUES values."""
+    global _CENSUS_WRITES, _CENSUS_DIRTY
     reader = _LAST_READER[-1] if _LAST_READER else None
     del _LAST_READER[:]
     if os.environ.get("WOW2_NO_CENSUS") == "1":
@@ -452,6 +479,8 @@ def census_note(svc: int, op: int, dec: dict) -> None:
     except Exception:
         return
     key = f"{svc}:{op}"
+    if key not in REQ_CENSUS and not answered:
+        return
     fresh = key not in REQ_CENSUS
     rec = REQ_CENSUS.setdefault(key, {"count": 0, "read": 0, "unread": 0,
                                       "fields": []})
@@ -460,18 +489,19 @@ def census_note(svc: int, op: int, dec: dict) -> None:
     if (rec["read"], rec["unread"]) != (nread, nun):
         fresh = True
     rec["read"], rec["unread"] = nread, nun    # the latest reading, not the max: a closed blind spot must clear
-    for i, (t, v) in enumerate(fields):
+    for i, (t, v) in enumerate(fields[:CENSUS_MAX_FIELDS]):
         while len(rec["fields"]) <= i:
             rec["fields"].append({"type": "", "values": [], "more": False})
         f = rec["fields"][i]
         f["type"] = bd.TYPE_NAMES.get(t, f"type{t}")
         s = _census_val(v)
         if s not in f["values"]:
-            fresh = True
             if len(f["values"]) < CENSUS_MAX_VALUES:
                 f["values"].append(s)
-            else:
+                fresh = True
+            elif not f["more"]:
                 f["more"] = True
+                fresh = True
     if tail and key not in _CENSUS_LOGGED:
         _CENSUS_LOGGED.add(key)
         shown = ", ".join(f"{bd.TYPE_NAMES.get(t, f'type{t}')} {_census_val(v)}"
@@ -481,8 +511,10 @@ def census_note(svc: int, op: int, dec: dict) -> None:
             f"{len(tail)}: {shown}")
     global _CENSUS_SAVED_AT
     _CENSUS_WRITES += 1
-    if fresh or time.time() - _CENSUS_SAVED_AT > CENSUS_SAVE_S:
-        _CENSUS_SAVED_AT = time.time()
+    _CENSUS_DIRTY = _CENSUS_DIRTY or fresh
+    now = time.time()
+    if now - _CENSUS_SAVED_AT > (CENSUS_FRESH_S if _CENSUS_DIRTY else CENSUS_SAVE_S):
+        _CENSUS_SAVED_AT, _CENSUS_DIRTY = now, False
         _jsave(REQ_CENSUS_PATH, REQ_CENSUS)
 
 
@@ -505,20 +537,25 @@ for _n in range(3, 9):
 del _n
 
 _AUTO_IDS: dict[str, tuple[str, int]] = {}
+AUTO_IDS_MAX = 4096
+_auto_next = [1 + len(IDENTITIES)]
 
 
 def identity_for(ip: str) -> tuple[str, int]:
-    """(username, user_id) for a console, keyed by where it connects from."""
+    """(username, user_id) for a console, keyed by where it connects from: a
+    rig address's own, else a placeholder numbered by arrival, the newest
+    AUTO_IDS_MAX of them kept (§80w)."""
     if ip in IDENTITIES:
         return IDENTITIES[ip]
+    if ip.startswith("10.42.0."):
+        octet = ip.rsplit(".", 1)[1]
+        if octet.isdigit() and int(octet):
+            return f"player{int(octet)}", int(octet)
     if ip not in _AUTO_IDS:
-        octet = 0
-        if ip.startswith("10.42.0."):
-            try:
-                octet = int(ip.rsplit(".", 1)[1])
-            except ValueError:
-                octet = 0
-        n = octet or (1 + len(IDENTITIES) + len(_AUTO_IDS))
+        while len(_AUTO_IDS) >= AUTO_IDS_MAX:
+            del _AUTO_IDS[next(iter(_AUTO_IDS))]
+        n = _auto_next[0]
+        _auto_next[0] += 1
         _AUTO_IDS[ip] = (f"player{n}", n)
         log(f"  new console at {ip} -> identity {_AUTO_IDS[ip]}")
     return _AUTO_IDS[ip]
@@ -631,6 +668,57 @@ def read_typed_tail(r) -> list:
         out.append([bddump.TYPE_NAMES.get(t, str(t)), v])
 
 
+POT_CHECK = os.environ.get("WOW2_NO_POT_CHECK") != "1"
+MATCH_START_WINDOW = 60
+
+
+def pot_stake(board_id: int, sid: int, entity: int, name: str, before: int,
+              score: int) -> None:
+    """A wagered board went down: a stake, into the pot of the uploader's own match."""
+    where = SIDE_NAMES.get(board_id, "the rating")
+    if not sid:
+        log(f"  POT: {name} staked {before - score} on {where} ({before} -> {score}) "
+            f"-- filed nowhere: no single ranked match of its own has just started")
+        return
+    if board_id == statsdb.RATING_BOARD:
+        stake, pot = potbank.note_stake(sid, entity, name, before, score)
+        log(f"  POT: {name} staked {stake} ({before} -> {score}); "
+            f"session 0x{sid:x} pot is now {pot}")
+    elif potbank.note_side_stake(sid, board_id, entity, name, before, score):
+        log(f"  POT: {name} staked {before - score} on {where} "
+            f"({before} -> {score}) for session 0x{sid:x}")
+
+
+def pot_payout(board_id: int, entity: int, name: str, before: int,
+               score: int) -> int | None:
+    """A wagered board went up: a winner's payout, out of a pot it staked in and
+    no more than that pot holds on this board. The score to store, or None."""
+    for msg in potbank.sweep():
+        log(f"  POT: {msg}")
+        if "REFUNDED" in msg:
+            lobbyboard.BOARD.scored(statsdb.RATING_BOARD)
+    key, rec = potbank.staked_pot(entity)
+    left = potbank.pot_left(rec, board_id) if rec else 0
+    where = SIDE_NAMES.get(board_id, "the rating")
+    if left <= 0:
+        log(f"  (!! stats op1 from {name}: {where} raised {before} -> {score} with "
+            f"no pot of its own left to pay it -- not stored)")
+        return None
+    paid = min(score - before, left)
+    if paid < score - before:
+        log(f"  (!! stats op1 from {name}: {where} raised by {score - before}, its "
+            f"pot holds {left} -- {before + paid} stored)")
+    if board_id == statsdb.RATING_BOARD:
+        log("  POT: " + potbank.note_payout(int(key, 16), entity, name, before, before + paid))
+    else:
+        potbank.note_side_payout(key, board_id, paid)
+        log(f"  POT: {name} paid {paid} on {where} out of session 0x{key}'s pot")
+    return before + paid
+
+
+SIDE_NAMES = dict(potbank.SIDE_BOARDS)
+
+
 def stats_write_upload(dec: dict, who: tuple[str, int] | None = None,
                        peer_ip: str = ""):
     """bdStats op 1 -- writeStats. Returns (0, None) on purpose."""
@@ -647,6 +735,18 @@ def stats_write_upload(dec: dict, who: tuple[str, int] | None = None,
         log(f"  (stats op1 decode failed: {e})")
         return 0, None
 
+    mine = account_for(peer_ip)
+    if board_id not in statsdb.WRITABLE_BOARDS:
+        log(f"  (!! stats op1 from {name}: board {board_id} is not one a console "
+            f"writes -- not stored)")
+        return 0, None
+    if entity and entity != mine and not (
+            board_id in statsdb.CLAN_BOARDS and entity == team_of(mine)[0]):
+        log(f"  (!! stats op1 from {name}: board {board_id} for 0x{entity:016x}, which "
+            f"is neither its own account nor its clan -- not stored)")
+        return 0, None
+    if board_id in statsdb.CLAN_BOARDS and entity and entity != mine:
+        name = team_of(mine)[1].get("name", name)
     if board_id in statsdb.CLAN_BOARDS and not entity:
         tid, trec = team_of(account_for(peer_ip))
         if tid:
@@ -658,7 +758,7 @@ def stats_write_upload(dec: dict, who: tuple[str, int] | None = None,
             log(f"  (board {board_id} is a clan board and this console has no "
                 "clan yet -- upload dropped rather than filed under the player)")
             return 0, None
-    entity = entity or account_for(peer_ip)
+    entity = entity or mine
     blob = " ".join(f"{t}={v}" for t, v in extra)
     log(f"  stats op1 (WRITE): boardID={board_id} score={score} "
         f"entity=0x{entity:016x} ({name}) blob[{len(extra)}]: {blob or '-'}")
@@ -672,7 +772,16 @@ def stats_write_upload(dec: dict, who: tuple[str, int] | None = None,
     if not entity:
         log("  (!! no account id for this console -- upload not stored)")
         return 0, None
-    if board_id == statsdb.RATING_BOARD:
+    wagered = board_id == statsdb.RATING_BOARD or board_id in potbank.SIDE_BOARDS
+    if wagered and POT_CHECK:
+        before, _rank, _n = stats_get(board_id, entity, name)
+        if score > before:
+            score = pot_payout(board_id, entity, name, before, score)
+            if score is None:
+                return 0, None
+        elif score < before:
+            pot_stake(board_id, ranked_session_for(peer_ip), entity, name, before, score)
+    elif board_id == statsdb.RATING_BOARD:
         sid = ranked_session_id()
         if sid:
             before, _rank, _n = stats_get(board_id, entity, name)
@@ -843,6 +952,33 @@ def host_reported_game(host_key: str, before: int, score: int) -> None:
                 f"reports the game over; the session goes when the host deletes it")
 
 
+SHAPE_CHECK = os.environ.get("WOW2_NO_SHAPE_CHECK") != "1"
+BD_PARAM_PARSE_ERROR = 106
+NAME_FIELD_MAX = 64
+SESSION_INFO_SHAPE = ((bd.BD_BLOB, BD_COMMON_ADDR_SIZE), (bd.BD_BLOB, SESSION_ID_BYTES),
+                      (bd.BD_BLOB, SESSION_SECRET_BYTES)) \
+    + ((bd.BD_SINT32, 0),) * 9 + ((bd.BD_STR, 0),) + ((bd.BD_SINT32, 0),) * 5 \
+    + ((bd.BD_SINT64, 0),) * 4 + ((bd.BD_STR, 0),) + ((bd.BD_SINT32, 0),)
+
+
+def shape_problem(fields: list, shape) -> str:
+    """'' when `fields` have the types (and blob sizes) a console sends, else why
+    not: a malformed record replayed to other consoles drops their connection."""
+    if not SHAPE_CHECK:
+        return ""
+    if len(fields) != len(shape):
+        return f"{len(fields)} fields where a console sends {len(shape)}"
+    for i, ((t, v), (want, size)) in enumerate(zip(fields, shape)):
+        if t != want:
+            return (f"field {i} is {bd.TYPE_NAMES.get(t, t)} where a console sends "
+                    f"{bd.TYPE_NAMES.get(want, want)}")
+        if size and len(v) != size:
+            return f"field {i} is {len(v)} bytes where a console sends {size}"
+        if t == bd.BD_STR and len(v) > NAME_FIELD_MAX:
+            return f"field {i} is a {len(v)}-character string"
+    return ""
+
+
 def sessions_create_result(dec: dict, peer_ip: str = "", host_key: str = ""):
     """Result block for Sessions op 1. Returns (num_results, writer-callback)."""
     rec: dict = {"info": [], "name": "", "max_players": 0, "addr": b"",
@@ -862,6 +998,11 @@ def sessions_create_result(dec: dict, peer_ip: str = "", host_key: str = ""):
         rec["points"] = ints[6] if len(ints) > 6 else 0
     except Exception as e:
         log(f"  (session create decode failed: {e})")
+    why = shape_problem(rec["info"], SESSION_INFO_SHAPE)
+    if why:
+        log(f"  (!! session create from {rec['host']!r}: {why} -- not listed, "
+            f"answered {BD_PARAM_PARSE_ERROR})")
+        return 0, None, BD_PARAM_PARSE_ERROR
     for old_sid, old_rec in [(k, v) for k, v in SESSIONS.items()
                              if v.get("host") == rec["host"]]:
         SESSIONS.pop(old_sid, None)
@@ -901,9 +1042,36 @@ def sessions_create_result(dec: dict, peer_ip: str = "", host_key: str = ""):
 
 
 def ranked_session_id() -> int:
-    """The live ranked session a stake belongs to -- the newest `mode=POINTS` one."""
+    """The newest live `mode=POINTS` session: the pre-§80k answer to whose stake
+    this is (WOW2_NO_POT_CHECK=1)."""
     ranked = [sid for sid, rec in SESSIONS.items() if rec.get("points")]
     return max(ranked) if ranked else 0
+
+
+def ranked_session_for(key: str) -> int:
+    """The ranked session an account's stake belongs to: the one it hosts, else
+    the one whose game started in the last minute among those it was shown (a
+    search or an invite), else the only one that started; 0 when none or more
+    than one could be it."""
+    hosted = [sid for sid, rec in SESSIONS.items()
+              if rec.get("points") and rec.get("host") == key]
+    if hosted:
+        return max(hosted)
+    now = time.time()
+    started = [sid for sid, rec in SESSIONS.items()
+               if rec.get("points") and rec.get("started") and not rec.get("finished")
+               and now - rec["started"] <= MATCH_START_WINDOW]
+    shown = [sid for sid in started if key in SESSIONS[sid].get("shown", ())]
+    for pick in (shown, started):
+        if len(pick) == 1:
+            return pick[0]
+    return 0
+
+
+def session_shown(rec: dict, key: str) -> None:
+    """`key` was shown this session: a search row or an invite it opened."""
+    if key:
+        rec.setdefault("shown", set()).add(key)
 
 
 def host_addr_for(host_ip: str, joiner_ip: str) -> str:
@@ -1024,7 +1192,7 @@ def info_with_session_id(rec: dict, joiner_ip: str = ""):
     return out
 
 
-def sessions_search_results(dec: dict, joiner_ip: str = ""):
+def sessions_search_results(dec: dict, joiner_ip: str = "", key: str = ""):
     """Sessions op 5 -- the game browser's search. One result per live session."""
     try:
         r = lsg_request_params(dec)
@@ -1041,6 +1209,8 @@ def sessions_search_results(dec: dict, joiner_ip: str = ""):
                                    rec.get("players", 0) >= rec.get("max_players", 0),
                                    -rec.get("id", 0)))
     rows = live[start:start + want]
+    for rec in rows:
+        session_shown(rec, key)
 
     def emit(w):
         for rec in rows:
@@ -1054,7 +1224,7 @@ def sessions_search_results(dec: dict, joiner_ip: str = ""):
     return len(rows), emit
 
 
-def sessions_get_result(dec: dict, peer_ip: str = ""):
+def sessions_get_result(dec: dict, peer_ip: str = "", key: str = ""):
     """Sessions op 4: fetch one session by id (a match invite opened in View messages)."""
     try:
         r = lsg_request_params(dec)
@@ -1072,6 +1242,7 @@ def sessions_get_result(dec: dict, peer_ip: str = ""):
         return 0, None
     log(f"  session get: 0x{sid:x} {rec['name']!r} "
         f"mode={'POINTS' if rec.get('points') else 'fun'} -> 1 result")
+    session_shown(rec, key)
 
     def emit(w):
         bd.write_fields(w, info_with_session_id(rec, peer_ip))
@@ -1122,6 +1293,11 @@ def sessions_update(dec: dict, peer_ip: str = "", host_key: str = ""):
             f"is where it would show; netrecon §23)")
         return 0, None
 
+    why = shape_problem(fields[1:], SESSION_INFO_SHAPE)
+    if why:
+        log(f"  (!! session update: id=0x{sid:x} from {host_key or peer_ip!r}: {why} "
+            f"-- ignored, the record stays as it was)")
+        return 0, None
     addr = next((b for b in blobs if len(b) == BD_COMMON_ADDR_SIZE), b"")
     names = [v for v in vals if isinstance(v, str)]
     ints = [v for t, v in fields if t == bd.BD_SINT32]
@@ -1572,6 +1748,19 @@ def session_key_is_ours(username: str, key: bytes) -> bool:
 LSG_NO_KEY_CHECK = os.environ.get("WOW2_LSG_NO_KEY_CHECK") == "1"
 
 PROOF_HANDLE = os.environ.get("WOW2_NO_PROOF_HANDLE") != "1"
+LSG_MAC = os.environ.get("WOW2_NO_LSG_MAC") != "1"
+BIND_DEADLINE = float(os.environ.get("WOW2_BIND_DEADLINE", "30"))
+
+
+def lsg_mac(key: bytes, plain: bytes) -> bytes:
+    """The client's message authentication: HMAC-SHA1 under the session key of
+    everything after the service byte, padding included, cut to 4 bytes."""
+    return hmac.new(key, plain[5:], hashlib.sha1).digest()[:4]
+
+
+def lsg_message_authentic(dec: dict, key: bytes) -> bool:
+    plain = dec["plain"]
+    return len(plain) >= 5 and hmac.compare_digest(plain[:4], lsg_mac(key, plain))
 
 
 def lsg_message_readable(dec: dict, strict: bool = False) -> bool:
@@ -1661,6 +1850,7 @@ def _write_field(w, t: int, v) -> bool:
 PROFILE_EMPTY = [[bd.BD_SINT64, 0], [bd.BD_SINT64, 0], [bd.BD_SINT64, 0],
                  [bd.BD_SINT64, 0], [bd.BD_F64, 0.0], [bd.BD_F64, 0.0],
                  [bd.BD_SINT64, 0], [bd.BD_STR, ""], [bd.BD_SINT32, 0]]
+PROFILE_SHAPE = tuple((t, 0) for t, _v in PROFILE_EMPTY)
 
 
 def profile_upload(dec: dict, who=None, peer_ip: str = "", create: bool = False):
@@ -1678,6 +1868,11 @@ def profile_upload(dec: dict, who=None, peer_ip: str = "", create: bool = False)
     key = f"{entity:016x}"
     name = (who[0] if who else "") or name_of(entity)
     old = profile_get(key)
+    why = shape_problem(fields, PROFILE_SHAPE)
+    if why:
+        log(f"  (!! profile {'op1' if create else 'op4'} from {name or key}: {why} -- "
+            f"not stored, answered {BD_PARAM_PARSE_ERROR})")
+        return 0, None, BD_PARAM_PARSE_ERROR
     if create and old is not None:
         if NO_PROFILE_EXISTS:
             log(f"  profile op1 (create): {name or key} already has a profile -- "
@@ -1741,6 +1936,10 @@ def profile_read_public(dec: dict, who=None, peer_ip: str = ""):
         log(f"  (profile read decode failed: {e})")
         return 0, None
     rec = profile_get(f"{target:016x}")
+    if rec and shape_problem([(int(t), v) for t, v in rec["fields"]], PROFILE_SHAPE):
+        log(f"  (!! the stored profile of 0x{target:016x} is not the shape a console "
+            f"reads -- serving the empty one in its place)")
+        rec = None
     fields = rec["fields"] if rec else [list(f) for f in PROFILE_EMPTY]
     name = (rec or {}).get("name") or name_of(target)
     if not rec:
@@ -1952,9 +2151,47 @@ def friends_match_invite(dec: dict, who=None, peer_ip: str = ""):
         f" ({name_of(theirs) or 'unknown account'}) for session 0x{sid:x}"
         + (f" ({rec['name']!r}, mode={'POINTS' if rec.get('points') else 'fun'})"
            if rec else " -- NO SUCH LIVE SESSION, relaying the id anyway"))
+    if INVITE_LIMITS:
+        with store.tx() as conn:
+            mine, theirs_hex = f"{me:016x}", f"{target:016x}"
+            old = conn.execute("SELECT session FROM messages WHERE to_e = ? AND from_e = ? "
+                               "AND type = ?", (theirs_hex, mine, PUSH_MATCH_INVITE)).fetchall()
+            if any(r["session"] == bytes(session_id).hex() for r in old):
+                log("  (already invited to this session -- nothing filed, nothing pushed)")
+                return 0, None
+            conn.execute("DELETE FROM messages WHERE to_e = ? AND from_e = ? AND type = ?",
+                         (theirs_hex, mine, PUSH_MATCH_INVITE))
+            if old:
+                log(f"  ({len(old)} older match invite(s) from {name} withdrawn: a host "
+                    f"invites to one lobby at a time)")
     mid = message_add(target, PUSH_MATCH_INVITE, me, name, session_id)
-    push_to_account(target, PUSH_MATCH_INVITE, me, name, mid, session_id)
+    if invite_push_due(me, target, PUSH_MATCH_INVITE):
+        push_to_account(target, PUSH_MATCH_INVITE, me, name, mid, session_id)
     return 0, None
+
+
+INVITE_LIMITS = os.environ.get("WOW2_NO_INVITE_LIMITS") != "1"
+MAILBOX_MAX = 25            # Messaging op 1 asks for 25 from 0, every time
+INVITE_PUSH_COOLDOWN = 10.0
+_INVITE_PUSHED: dict[tuple[int, int, int], float] = {}
+
+
+def invite_push_due(sender: int, target: int, type_id: int) -> bool:
+    """One invite push per sender, target and kind every INVITE_PUSH_COOLDOWN:
+    a filed invite still waits in the mailbox."""
+    if not INVITE_LIMITS:
+        return True
+    now = time.time()
+    key = (sender, target, type_id)
+    if now - _INVITE_PUSHED.get(key, 0.0) < INVITE_PUSH_COOLDOWN:
+        log(f"  (invite push held back: the last one to 0x{target:016x} went "
+            f"{now - _INVITE_PUSHED[key]:.1f}s ago; it is in the mailbox)")
+        return False
+    if len(_INVITE_PUSHED) > 4096:
+        for k in [k for k, t in _INVITE_PUSHED.items() if now - t >= INVITE_PUSH_COOLDOWN]:
+            del _INVITE_PUSHED[k]
+    _INVITE_PUSHED[key] = now
+    return True
 
 
 def friends_match_decline(dec: dict, who=None, peer_ip: str = ""):
@@ -2155,6 +2392,15 @@ def message_add(to_entity: int, type_id: int, sender: int, sender_name: str,
                      "clan, at) VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
                      (mid, f"{to_entity:016x}", type_id, f"{sender:016x}", sender_name,
                       bytes(session_id).hex(), clan_name, store.now_iso()))
+        gone = 0
+        if INVITE_LIMITS:
+            gone = conn.execute(
+                "DELETE FROM messages WHERE to_e = ? AND id NOT IN (SELECT id FROM "
+                "messages WHERE to_e = ? ORDER BY id DESC LIMIT ?)",
+                (f"{to_entity:016x}", f"{to_entity:016x}", MAILBOX_MAX)).rowcount
+    if gone:
+        log(f"  (0x{to_entity:016x}'s mailbox is full: {gone} oldest message(s) dropped "
+            f"to keep the {MAILBOX_MAX} a console reads at sign-in)")
     return mid
 
 
@@ -2259,10 +2505,14 @@ def messages_delete(dec: dict, who=None, peer_ip: str = ""):
         return 0, None
     before = _count("messages")
     with store.tx() as conn:
-        conn.execute("DELETE FROM messages WHERE id = ? AND to_e = ?", (mid, f"{me:016x}"))
+        if store.fits(mid):
+            conn.execute("DELETE FROM messages WHERE id = ? AND to_e = ?", (mid, f"{me:016x}"))
     log(f"  messaging op4: 0x{me:016x} deleted message {mid} "
         f"({before} -> {_count('messages')} stored)")
     return 0, None
+
+
+ANSWER_CHECK = os.environ.get("WOW2_NO_ANSWER_CHECK") != "1"
 
 
 def friends_answer(dec: dict, accept: bool, who=None, peer_ip: str = ""):
@@ -2278,6 +2528,13 @@ def friends_answer(dec: dict, accept: bool, who=None, peer_ip: str = ""):
         return 0, None
     mine, theirs = f"{me:016x}", f"{sender:016x}"
     with store.tx() as conn:
+        asked = conn.execute("SELECT 1 FROM friend_invites WHERE from_e = ? AND to_e = ?",
+                             (theirs, mine)).fetchone()
+        if not asked and ANSWER_CHECK:
+            log(f"  friends op{2 if accept else 3}: {name} answered an invite from "
+                f"0x{sender:016x} ({name_of(theirs) or 'unknown account'}) that was "
+                f"never sent -- nothing changed, nobody told")
+            return 0, None
         _drop_invites_between(conn, mine, theirs)
         if accept:
             _add_pair(conn, mine, theirs)
@@ -2483,7 +2740,12 @@ def teams_invite(dec: dict, who=None, peer_ip: str = ""):
     if invite_blocked(target, me, "teams op6 (CLAN INVITE)"):
         return 0, None
     props = rec.setdefault("proposals", [])
-    if not any(p.get("to") == theirs for p in props):
+    if any(p.get("to") == theirs for p in props):
+        if INVITE_LIMITS:
+            log(f"  teams op6 (CLAN INVITE): 0x{theirs} already has an invite to "
+                f"{rec.get('name')!r} -- nothing filed, nothing pushed")
+            return 0, None
+    else:
         props.append({"to": theirs, "from": f"{me:016x}", "from_name": name,
                       "at": store.now_iso()})
         team_put(key, rec)
@@ -2500,8 +2762,9 @@ def teams_invite(dec: dict, who=None, peer_ip: str = ""):
     cname = rec.get("name", "")
     tname = name_of(theirs)
     mid = message_add(target, ptype, me, name, blob, cname)
-    push_to_account(target, ptype, me, name, mid, blob, cname,
-                    target=target, target_name=tname)
+    if invite_push_due(me, target, ptype):
+        push_to_account(target, ptype, me, name, mid, blob, cname,
+                        target=target, target_name=tname)
     return 0, None
 
 
@@ -2655,6 +2918,23 @@ def teams_set_rank(promote: bool, dec: dict, who=None, peer_ip: str = ""):
     return 0, None
 
 
+def clan_remove_refusal(rec: dict, mine: str, them: str) -> str:
+    """Why `mine` may not remove `them` from this clan; "" if it may. The
+    client's own rule for its Remove row (§80v): an administrator removes
+    ordinary members, the owner members and administrators, and nobody the
+    owner or themselves."""
+    rank = team_rank(rec, mine)
+    if rank < TEAM_RANK_ADMIN:
+        return "an ordinary member removes nobody"
+    if them == mine:
+        return "removing yourself is leaving (op 5)"
+    if them == rec.get("owner"):
+        return f"0x{them} OWNS it, and an owner leaves only by disbanding or handing it over"
+    if rank < TEAM_RANK_OWNER and team_rank(rec, them) >= TEAM_RANK_ADMIN:
+        return f"an administrator removes ordinary members only, and 0x{them} is an administrator"
+    return ""
+
+
 def teams_remove_member(dec: dict, who=None, peer_ip: str = ""):
     """Teams op 4 -- remove a member from the clan ("Remove from clan")."""
     me, name = _teams_actor(peer_ip, who)
@@ -2668,9 +2948,9 @@ def teams_remove_member(dec: dict, who=None, peer_ip: str = ""):
     if rec is None:
         log(f"  teams op4 (REMOVE): no such clan 0x{key} -- ignored")
         return 0, None
-    if team_rank(rec, mine) < TEAM_RANK_ADMIN:
-        log(f"  teams op4 (REMOVE): {name} 0x{mine} is an ordinary member of "
-            f"{rec.get('name')!r} -- REFUSED")
+    if why := clan_remove_refusal(rec, mine, them):
+        log(f"  teams op4 (REMOVE): {name} 0x{mine} in {rec.get('name')!r}: {why} "
+            f"-- REFUSED")
         return 0, None
     if not _team_drop(rec, them):
         log(f"  teams op4 (REMOVE): 0x{them} is not in {rec.get('name')!r} "
@@ -2708,9 +2988,9 @@ def teams_leave(dec: dict, who=None, peer_ip: str = ""):
         return 0, None
     cname = rec.get("name")
     if target and them != mine:
-        if team_rank(rec, mine) < TEAM_RANK_ADMIN:
-            log(f"  teams op5 (REMOVE): {name} 0x{mine} is an ordinary member "
-                f"of {cname!r} -- REFUSED")
+        if why := clan_remove_refusal(rec, mine, them):
+            log(f"  teams op5 (REMOVE): {name} 0x{mine} in {cname!r}: {why} "
+                f"-- REFUSED")
             return 0, None
         if not _team_drop(rec, them):
             log(f"  teams op5 (REMOVE): 0x{them} is not in {cname!r} -- ignored")
@@ -2825,6 +3105,70 @@ def teams_proposals_result(dec: dict, who=None, peer_ip: str = ""):
 # ------------------------------------------------------------- downloads
 STORAGE_DIR = CAP / "storage"
 STORAGE_FIRST_ID = 0x5001
+STORAGE_RULES = os.environ.get("WOW2_NO_STORAGE_RULES") != "1"
+_STORAGE_SUM = [-1e9, 0]
+
+
+def storage_name_ok(name: str) -> bool:
+    """A name a console could send: the flag, a snapshot and the shared slots
+    are constants or six or seven generated characters plus an extension."""
+    return (0 < len(name) <= 64 and all(" " <= c <= "~" for c in name)
+            and "/" not in name and "\\" not in name)
+
+
+def storage_total() -> int:
+    """Bytes on file in all, summed at most once a second."""
+    now = time.monotonic()
+    if now - _STORAGE_SUM[0] >= 1.0:
+        _STORAGE_SUM[:] = [now, int(store.db().execute(
+            "SELECT COALESCE(SUM(size), 0) FROM storage").fetchone()[0])]
+    return _STORAGE_SUM[1]
+
+
+def storage_refusal(mine: str, new_file: bool, grow: int) -> str:
+    """Why a write is refused, or "": a new file past the account's cap, or
+    any growth past the server's."""
+    cap = serverconfig.MAX_FILES_PER_ACCOUNT
+    if new_file and cap and store.db().execute(
+            "SELECT COUNT(*) FROM storage WHERE owner = ?", (mine,)).fetchone()[0] >= cap:
+        return f"the account already holds {cap} files"
+    room = serverconfig.MAX_STORAGE_MB * 1024 * 1024
+    if room and grow > 0 and storage_total() + grow > room:
+        return f"the server holds {storage_total()} of its {room} bytes"
+    return ""
+
+
+def storage_next_id(conn) -> int:
+    """A file id never handed out before: a delete does not wind `next_file`
+    back, so an id a console still holds cannot come to name a new file."""
+    with store.tx(conn):
+        top = conn.execute("SELECT MAX(id) FROM storage").fetchone()[0] or 0
+        fid = max(STORAGE_FIRST_ID, int(store.meta_get(conn, "next_file", "0")), int(top) + 1)
+        store.meta_set(conn, "next_file", str(fid + 1))
+    return fid
+
+
+def storage_writable(rec: dict, me: int) -> bool:
+    """Op 2 and op 4 are the owner's, and a row with no owner is the server's."""
+    owner = _storage_owner(rec)
+    if not STORAGE_RULES:
+        return not owner or owner == me
+    return bool(owner) and owner == me
+
+
+def storage_unlink_orphan(file: str | None) -> bool:
+    """Delete storage/<file> once no row names it."""
+    if not file or store.db().execute("SELECT 1 FROM storage WHERE file = ?",
+                                      (file,)).fetchone():
+        return False
+    p = STORAGE_DIR / file
+    if p.parent != STORAGE_DIR:
+        return False
+    try:
+        p.unlink()
+        return True
+    except OSError:
+        return False
 
 
 def _storage_row(r) -> dict:
@@ -2839,19 +3183,22 @@ def _storage_row(r) -> dict:
 
 
 def storage_row(fid: int) -> dict | None:
+    if not store.fits(fid):
+        return None
     r = store.db().execute("SELECT * FROM storage WHERE id = ?", (fid,)).fetchone()
     return _storage_row(r) if r else None
 
 
-def storage_rows(owner: int | None, everyone: bool = False) -> list:
+def storage_rows(owner: int | None, everyone: bool = False, private: bool = True) -> list:
     """The rows one list op serves: op 8 the GLOBAL rows (no owner), op 7 the
-    global rows plus `owner`'s. In id order, which is upload order for
-    anything the server allocated.
+    global rows plus `owner`'s, its private ones only if `private`. In id
+    order, which is upload order for anything the server allocated.
     """
     conn = store.db()
     if everyone:
-        cur = conn.execute("SELECT * FROM storage WHERE owner IS NULL OR owner = ? "
-                           "ORDER BY id", (f"{owner:016x}",))
+        cur = conn.execute("SELECT * FROM storage WHERE owner IS NULL OR (owner = ? "
+                           + ("" if private else "AND private = 0") + ") ORDER BY id",
+                           (f"{owner:016x}",))
     else:
         cur = conn.execute("SELECT * FROM storage WHERE owner IS NULL ORDER BY id")
     return [_storage_row(r) for r in cur]
@@ -2874,7 +3221,8 @@ def storage_list_result(op: int, dec: dict, who=None, peer_ip: str = ""):
         filt = next((v for t, v in bd.read_fields(r) if t == bd.BD_STR and v), "")
     except Exception as e:
         log(f"  (storage op{op} request decode failed: {e}; serving unwindowed)")
-    files = storage_rows(owner, everyone=(op == 7))
+    files = storage_rows(owner, everyone=(op == 7),
+                         private=(owner == me or not STORAGE_RULES))
     total = len(files)
     if count > 0:
         files = files[start:start + count]
@@ -2914,6 +3262,7 @@ def storage_get_result(dec: dict, who=None, peer_ip: str = ""):
     0x08c275bc calls the container with a hard-coded count of 1, so this reply
     must NOT carry a numResults field (same trap as Teams op 1).
     """
+    me = account_for(peer_ip)
     try:
         r = lsg_request_params(dec)
         r.u8()
@@ -2922,6 +3271,10 @@ def storage_get_result(dec: dict, who=None, peer_ip: str = ""):
         log(f"  (storage op5 decode failed: {e})")
         return 0, None
     f = storage_row(fid)
+    if f and STORAGE_RULES and f.get("private") and _storage_owner(f) != me:
+        log(f"  storage op5 (get file 0x{fid:x}): private to "
+            f"0x{_storage_owner(f):016x}, asked by 0x{me:016x} -- served as no such file")
+        f = None
     body = storage_bytes(f) if f else b""
     blob_only = os.environ.get("WOW2_STORAGE_BLOB_ONLY") == "1"
     log(f"  storage op5 (get file 0x{fid:x}): "
@@ -2979,10 +3332,22 @@ def storage_upload_result(dec: dict, who=None, peer_ip: str = ""):
         return 0, None
     conn = store.db()
     mine = f"{me:016x}"
-    r = conn.execute("SELECT id FROM storage WHERE name = ? AND owner = ? ORDER BY id "
-                     "LIMIT 1", (name, mine)).fetchone()
-    fid = int(r["id"]) if r else 0
-    if not fid:
+    if STORAGE_RULES and not storage_name_ok(name):
+        log(f"  storage op1 (UPLOAD): {name!r} from 0x{me:016x} is no name a "
+            f"console sends -- REFUSED")
+        return 0, None, BD_PERMISSION_DENIED
+    was = conn.execute("SELECT id, file, size FROM storage WHERE name = ? AND owner = ? "
+                       "ORDER BY id LIMIT 1", (name, mine)).fetchone()
+    fid = int(was["id"]) if was else 0
+    if STORAGE_RULES:
+        why = storage_refusal(mine, not fid, len(data) - int((was and was["size"]) or 0))
+        if why:
+            log(f"  storage op1 (UPLOAD): {name!r} {len(data)} bytes from "
+                f"0x{me:016x} -- REFUSED, {why}")
+            return 0, None, BD_FILESIZE_LIMIT_EXCEEDED
+    if not fid and STORAGE_RULES:
+        fid = storage_next_id(conn)
+    elif not fid:
         used = {int(x[0]) for x in conn.execute("SELECT id FROM storage WHERE id >= ?",
                                                  (STORAGE_FIRST_ID,))}
         fid = next(i for i in range(STORAGE_FIRST_ID, STORAGE_FIRST_ID + 65536)
@@ -3005,6 +3370,8 @@ def storage_upload_result(dec: dict, who=None, peer_ip: str = ""):
                      "private = excluded.private, size = excluded.size, "
                      "created = excluded.created, modified = excluded.modified",
                      (fid, name, mine, blob_name, 1 if private else 0, len(data), now, now))
+    if STORAGE_RULES and was and was["file"] != blob_name:
+        storage_unlink_orphan(was["file"])
     log(f"  storage op1 (UPLOAD): {name!r} {len(data)} bytes from "
         f"0x{me:016x} -> file id 0x{fid:x} "
         f"(published={published} private={private})")
@@ -3030,10 +3397,17 @@ def storage_overwrite_result(dec: dict, who=None, peer_ip: str = ""):
         log(f"  storage op2 (OVERWRITE): no file 0x{fid:x} -- ignored")
         return 0, None
     owner = _storage_owner(rec)
-    if owner and owner != me:
+    if not storage_writable(rec, me):
         log(f"  storage op2 (OVERWRITE): file 0x{fid:x} {rec.get('name')!r} "
-            f"belongs to 0x{owner:016x}, not 0x{me:016x} -- REFUSED")
+            f"belongs to {f'0x{owner:016x}' if owner else 'the server'}, not "
+            f"0x{me:016x} -- REFUSED")
         return 0, None
+    if STORAGE_RULES:
+        why = storage_refusal(f"{me:016x}", False, len(data) - int(rec.get("size", 0) or 0))
+        if why:
+            log(f"  storage op2 (OVERWRITE): file 0x{fid:x} {rec.get('name')!r} to "
+                f"{len(data)} bytes from 0x{me:016x} -- REFUSED, {why}")
+            return 0, None, BD_FILESIZE_LIMIT_EXCEEDED
     blob_name = rec.get("file") or f"{fid:x}-{rec.get('name', 'file')}"
     try:
         STORAGE_DIR.mkdir(parents=True, exist_ok=True)
@@ -3071,15 +3445,18 @@ def storage_delete_result(dec: dict, who=None, peer_ip: str = ""):
         log(f"  storage op4 (DELETE): no file 0x{fid:x} -- ignored")
         return 0, None
     owner = _storage_owner(rec)
-    if owner and owner != me:
+    if not storage_writable(rec, me):
         log(f"  storage op4 (DELETE): file 0x{fid:x} {rec.get('name')!r} "
-            f"belongs to 0x{owner:016x}, not 0x{me:016x} -- REFUSED")
+            f"belongs to {f'0x{owner:016x}' if owner else 'the server'}, not "
+            f"0x{me:016x} -- REFUSED")
         return 0, None
     with store.tx() as conn:
         conn.execute("DELETE FROM storage WHERE id = ?", (fid,))
         left = conn.execute("SELECT COUNT(*) FROM storage").fetchone()[0]
+    gone = STORAGE_RULES and storage_unlink_orphan(rec.get("file"))
     log(f"  storage op4 (DELETE): file 0x{fid:x} {rec.get('name')!r} removed by "
-        f"0x{me:016x} ({left} file(s) left; the blob is kept on disk)")
+        f"0x{me:016x} ({left} file(s) left; "
+        + ("its bytes deleted)" if gone else "the blob is kept on disk)"))
     return 0, None
 
 
@@ -3131,6 +3508,9 @@ def teams_create_result(dec: dict, who=None, peer_ip: str = ""):
     return None, emit
 
 
+LSG_UNANSWERED = (0, None)
+
+
 def lsg_result_block(svc: int, op: int, dec: dict,
                      who: tuple[str, int] | None = None,
                      peer_ip: str = "", ident_key: str = ""):
@@ -3152,9 +3532,9 @@ def lsg_result_block(svc: int, op: int, dec: dict,
     if svc == LSG_SERVICE_SESSIONS and op == 3:
         return sessions_delete(dec, ident_key)
     if svc == LSG_SERVICE_SESSIONS and op == 4:
-        return sessions_get_result(dec, peer_ip)
+        return sessions_get_result(dec, peer_ip, ident_key)
     if svc == LSG_SERVICE_SESSIONS and op == 5:
-        return sessions_search_results(dec, peer_ip)
+        return sessions_search_results(dec, peer_ip, ident_key)
     if svc == LSG_SERVICE_FRIENDS and op in (5, 7, 19):
         return friends_list_result(op, dec, who, ident_key)
     if svc == LSG_SERVICE_FRIENDS and op == 1:
@@ -3223,7 +3603,7 @@ def lsg_result_block(svc: int, op: int, dec: dict,
         return storage_overwrite_result(dec, who, ident_key)
     if svc == LSG_SERVICE_STORAGE and op == 4:
         return storage_delete_result(dec, who, ident_key)
-    return 0, None
+    return LSG_UNANSWERED
 
 
 def parse_auth_header(body: bytes):
@@ -3342,7 +3722,9 @@ class AuthConnection(asyncio.Protocol):
         self.peer_ip, self.peer_port = transport.get_extra_info("peername")[:2]
         self.peer = f"{self.peer_ip}:{self.peer_port}"
         self.ident = identity_for(self.peer_ip)
-        self.buf = b""
+        self.buf = bytearray()
+        self.need = 4
+        self.junk_tries = 0
         self.rx_bytes = 0
         self.msg_window = [0.0, 0]
         self.counted = False
@@ -3350,9 +3732,11 @@ class AuthConnection(asyncio.Protocol):
         self.is_lsg = False
         self.account = None
         self.session_key = None
-        self.authenticated = True
+        self.authenticated = False
+        self.relay_noted = False
         self.proof_handle = None
         self.pending_ident = None
+        self.overdue = None
         live = CONNS_PER_IP.get(self.peer_ip, 0)
         if live >= serverconfig.MAX_CONNS_PER_IP:
             log(f"TCP connect from {self.peer} REFUSED: {live} connections already "
@@ -3362,6 +3746,35 @@ class AuthConnection(asyncio.Protocol):
         CONNS_PER_IP[self.peer_ip] = live + 1
         self.counted = True
         log(f"TCP connect from {self.peer} (console identity {self.ident[0]!r} id={self.ident[1]})")
+        self.arm_deadline()
+
+    def arm_deadline(self) -> None:
+        """Close this connection BIND_DEADLINE s from now unless a bind completes."""
+        if BIND_DEADLINE <= 0 or LSG_NO_KEY_CHECK or self.overdue is not None:
+            return
+        try:
+            loop = asyncio.get_running_loop()
+        except RuntimeError:
+            return
+        self.overdue = loop.call_later(BIND_DEADLINE, self.bind_overdue)
+
+    def disarm_deadline(self) -> None:
+        if self.overdue is not None:
+            self.overdue.cancel()
+            self.overdue = None
+
+    def bind_overdue(self) -> None:
+        self.overdue = None
+        if self.authenticated or self.t.is_closing():
+            return
+        what = (f"still provisional for {self.pending_ident[0]!r} (the clear proof, "
+                f"and nothing under the ticket key)" if self.pending_ident
+                else "an LSG connection that never presented a proof" if self.is_lsg
+                else "a sign-in connection still open" if self.rx_bytes
+                else "a connection that has sent nothing")
+        log(f"  (!! {self.peer}: {what} {BIND_DEADLINE:.0f} s after it opened -- a "
+            f"console is bound or has hung up within a second; closing)")
+        self.t.close()
 
     def over_limit(self, data: bytes) -> bool:
         """Per-connection caps. A peer that misbehaves loses its OWN connection."""
@@ -3397,7 +3810,6 @@ class AuthConnection(asyncio.Protocol):
             if acct:
                 name, uid = acct["name"], acct["user_id"] or self.ident[1]
                 self.ident = (name, uid)
-                self.account = name
                 if acct["pwhash"]:
                     return name, uid, acct["pwhash"], \
                         f"handle {req['handle'].hex()}, stored credential", False
@@ -3411,7 +3823,6 @@ class AuthConnection(asyncio.Protocol):
                     f"handle {req['handle'].hex()}, NO CREDENTIAL", True
             if not serverconfig.SHARED_PASSWORD_FALLBACK:
                 uname, uid = self.ident
-                self.account = uname
                 log(f"  (!! login handle {req['handle'].hex()} is not an account "
                     f"we know and the shared password fallback is off -> "
                     f"refusing by answering with a key it cannot have)")
@@ -3420,7 +3831,6 @@ class AuthConnection(asyncio.Protocol):
             log(f"  (!! login handle {req['handle'].hex()} is not an account we "
                 f"know -- falling back to the source address, which is a GUESS)")
         uname, uid = self.ident
-        self.account = uname
         if not serverconfig.SHARED_PASSWORD_FALLBACK:
             log(f"  (!! the login request could not be decoded and the shared "
                 f"password fallback is off -> refusing by answering with a "
@@ -3458,6 +3868,7 @@ class AuthConnection(asyncio.Protocol):
             self.session_key = proof["session_key"]
             if self.proof_handle:
                 self.authenticated = False
+                self.arm_deadline()
                 log(f"  LSG connect: account {name!r} id={proof['user_id']} "
                     f"presents the handle we issued -> provisional; the first "
                     f"RPC that decrypts under the ticket key completes it")
@@ -3483,8 +3894,12 @@ class AuthConnection(asyncio.Protocol):
         if self.is_lsg:
             LSG_CONNS[self.ident_key] = self
         self.authenticated = True
+        self.disarm_deadline()
         log(f"  LSG connect: account {name!r} id={uid} ({why})")
         if self.is_lsg:
+            if not self.relay_noted:
+                natrelay.RELAY.note_sign_in(self.peer_ip)
+                self.relay_noted = True
             board_refresh()
 
     @property
@@ -3499,13 +3914,27 @@ class AuthConnection(asyncio.Protocol):
         self.buf += data
         debug(f"TCP {self.peer} +{len(data)}B (buf={len(self.buf)}, "
               f"stream={self.rx_bytes})")
-        frames, self.buf, skipped = bd.parse_frame(self.buf)
+        if len(self.buf) < self.need:
+            return
+        frames, rest, skipped = bd.parse_frame(bytes(self.buf))
+        self.buf = bytearray(rest)
+        self.need = bd.frame_need(rest)
+        if bd.starts_with_junk(rest):
+            self.junk_tries += 1
+            if self.junk_tries > bd.JUNK_TRIES or len(rest) > bd.JUNK_HOLD:
+                log(f"  (!! {self.peer} sent {len(rest)}B that do not frame, "
+                    f"after {self.junk_tries} reads spent resynchronising -- closing)")
+                self.t.close()
+                return
         if skipped:
             path = CAP / f"unframed-{self.peer_ip.replace('.', '_')}.bin"
-            with open(path, "ab") as f:
-                f.write(skipped)
-            log(f"  (!! {len(skipped)}B could not be framed; resynchronised past it "
-                f"-> {path.name}: {skipped[:32].hex()}...)")
+            kept = ""
+            if _HEXDUMPS[0] and (not path.exists() or path.stat().st_size < UNFRAMED_FILE_MAX):
+                with open(path, "ab") as f:
+                    f.write(skipped)
+                kept = f" -> {path.name}"
+            log(f"  (!! {len(skipped)}B could not be framed; resynchronised past it"
+                f"{kept}: {skipped[:32].hex()}...)")
         if self.buf:
             head = self.buf[:LEFTOVER_HEXDUMP_MAX]
             debug(f"  (leftover {len(self.buf)}B in parse buffer: {head.hex()}"
@@ -3581,11 +4010,13 @@ class AuthConnection(asyncio.Protocol):
                         f"closing)")
                     self.t.close()
                     return
-                if not lsg_message_readable(dec, strict=first):
-                    log(f"  (!! an encrypted message that does not decrypt under "
-                        f"the ticket key (seed={dec['seed']}) -- this connection "
-                        f"presented the clear proof without ever opening the "
-                        f"ticket; closing)")
+                if not (lsg_message_authentic(dec, session_key) if LSG_MAC
+                        else lsg_message_readable(dec, strict=first)):
+                    log(f"  (!! an encrypted message whose MAC does not verify under "
+                        f"the ticket key (seed={dec['seed']}) -- "
+                        + ("this connection presented the clear proof without ever "
+                           "opening the ticket" if first else "not this sign-in's")
+                        + "; closing)")
                     self.t.close()
                     return
                 if first:
@@ -3603,7 +4034,7 @@ class AuthConnection(asyncio.Protocol):
                 nres, results, err = block
             else:
                 nres, results = block
-            census_note(svc, op, dec)
+            census_note(svc, op, dec, answered=block is not LSG_UNANSWERED)
             reply = build_lsg_taskreply_encrypted(session_key, transaction_id=txn,
                                                   error_code=err, operation_id=op or 0,
                                                   num_results=nres, results=results)
@@ -3641,30 +4072,33 @@ class AuthConnection(asyncio.Protocol):
                 log(f"  (couldn't decode the create-account request: {e})")
                 req = None
             name = (req or {}).get("username")
-            taken = bool(name) and stored_credential(name) is not None
-            if CREATE_MODE == "name_exists" or (
-                    CREATE_MODE == "refuse_duplicates" and taken):
-                reply = build_auth_reply(AUTH_CREATE_ACCOUNT_REPLY,
-                                         BD_AUTH_CREATE_USERNAME_EXISTS)
-                log(f"  -> send CreateAccountReply (0x01, error 707 name-exists"
-                    + (f"; {name!r} already has a credential and this request "
-                       f"does not get to replace it" if taken else "")
-                    + f") {len(reply)}B")
-                if taken:
-                    log(f"     ({name!r} will now be retried as a sign-in; it "
-                        f"succeeds only for whoever set that password)")
-            elif name and not create_allowed(self.peer_ip):
-                reply = build_auth_reply(AUTH_CREATE_ACCOUNT_REPLY,
-                                         BD_AUTH_CREATE_MAX_ACC_EXCEEDED)
-                log(f"  -> send CreateAccountReply (0x01, error 710 max-accounts; "
-                    f"{self.peer_ip} has already created "
-                    f"{serverconfig.MAX_CREATES_PER_IP_PER_HOUR} online profiles "
-                    f"this hour, limits.max_creates_per_ip_per_hour) {len(reply)}B")
-            else:
-                if name:
-                    note_account(name, req["password_hash"], self.peer_ip)
-                reply = build_auth_reply(AUTH_CREATE_ACCOUNT_REPLY, BD_AUTH_NO_ERROR)
-                log(f"  -> send CreateAccountReply (0x01, SUCCESS 700, no body) {len(reply)}B")
+            # the bot writes credentials too: the 707 is decided under the lock that writes (§80ae)
+            with store.tx():
+                taken = bool(name) and stored_credential(name) is not None
+                if CREATE_MODE == "name_exists" or (
+                        CREATE_MODE == "refuse_duplicates" and taken):
+                    reply = build_auth_reply(AUTH_CREATE_ACCOUNT_REPLY,
+                                             BD_AUTH_CREATE_USERNAME_EXISTS)
+                    log(f"  -> send CreateAccountReply (0x01, error 707 name-exists"
+                        + (f"; {name!r} already has a credential and this request "
+                           f"does not get to replace it" if taken else "")
+                        + f") {len(reply)}B")
+                    if taken:
+                        log(f"     ({name!r} will now be retried as a sign-in; it "
+                            f"succeeds only for whoever set that password)")
+                elif name and not create_allowed(self.peer_ip):
+                    reply = build_auth_reply(AUTH_CREATE_ACCOUNT_REPLY,
+                                             BD_AUTH_CREATE_MAX_ACC_EXCEEDED)
+                    log(f"  -> send CreateAccountReply (0x01, error 710 max-accounts; "
+                        f"{self.peer_ip} has already created "
+                        f"{serverconfig.MAX_CREATES_PER_IP_PER_HOUR} online profiles "
+                        f"this hour, limits.max_creates_per_ip_per_hour) {len(reply)}B")
+                else:
+                    if name:
+                        note_account(name, req["password_hash"], self.peer_ip)
+                    reply = build_auth_reply(AUTH_CREATE_ACCOUNT_REPLY, BD_AUTH_NO_ERROR)
+                    log(f"  -> send CreateAccountReply (0x01, SUCCESS 700, no body) "
+                        f"{len(reply)}B")
             self.t.write(reply)
         elif auth_type == 0x0A:
             uname, uid, kc, how, refused = self.resolve_login(body)
@@ -3698,31 +4132,41 @@ class AuthConnection(asyncio.Protocol):
             err = BD_AUTH_UNKNOWN_ERROR
             try:
                 req = parse_change_password(body)
-                acct = account_by_handle(req["user_hash"])
-                name = acct["name"] if acct else None
-                current = (acct and acct["pwhash"]) or account_key(ACCOUNT_PASSWORD)
-                log(f"  change-password request: iv_seed=0x{req['iv_seed']:08x} "
-                    f"titleId=0x{req['title_id']:04x} "
-                    f"userHash={req['user_hash'].hex()} "
-                    f"account={name!r}")
-                pt = auth_payload_decrypt(req["ciphertext"], current, req["iv_seed"])
-                if name is None:
-                    err = BD_AUTH_BAD_ACCOUNT
-                    log("    no account with that handle -> 704 "
-                        "BD_AUTH_BAD_ACCOUNT")
-                    log("    (the name is not recoverable from a handle. If you "
-                        "know it: wow2-account set <name>, then have the console "
-                        "sign in with that password)")
-                elif pt is None:
-                    err = BD_AUTH_INCORRECT_PASSWORD
-                    log("    current password does NOT match -> 716 "
-                        "BD_AUTH_INCORRECT_PASSWORD")
-                else:
-                    new_hash = pt[4:28]
-                    set_account_password(name, new_hash, self.peer_ip)
-                    err = BD_AUTH_NO_ERROR
-                    log(f"    current password verified; {name!r} password hash "
-                        f"-> {new_hash.hex()} (stored)")
+                # the password on file is checked under the lock that replaces it (§80ae)
+                with store.tx():
+                    acct = account_by_handle(req["user_hash"])
+                    name = acct["name"] if acct else None
+                    current = (acct and acct["pwhash"]) or (
+                        account_key(ACCOUNT_PASSWORD)
+                        if serverconfig.SHARED_PASSWORD_FALLBACK else None)
+                    log(f"  change-password request: iv_seed=0x{req['iv_seed']:08x} "
+                        f"titleId=0x{req['title_id']:04x} "
+                        f"userHash={req['user_hash'].hex()} "
+                        f"account={name!r}")
+                    pt = (auth_payload_decrypt(req["ciphertext"], current, req["iv_seed"])
+                          if current else None)
+                    if name is None:
+                        err = BD_AUTH_BAD_ACCOUNT
+                        log("    no account with that handle -> 704 "
+                            "BD_AUTH_BAD_ACCOUNT")
+                        log("    (the name is not recoverable from a handle. If you "
+                            "know it: wow2-account set <name>, then have the console "
+                            "sign in with that password)")
+                    elif current is None:
+                        err = BD_AUTH_INCORRECT_PASSWORD
+                        log(f"    {name!r} has no stored credential and the shared "
+                            f"password fallback is off, so no current password "
+                            f"matches -> 716 BD_AUTH_INCORRECT_PASSWORD")
+                    elif pt is None:
+                        err = BD_AUTH_INCORRECT_PASSWORD
+                        log("    current password does NOT match -> 716 "
+                            "BD_AUTH_INCORRECT_PASSWORD")
+                    else:
+                        new_hash = pt[4:28]
+                        set_account_password(name, new_hash, self.peer_ip)
+                        err = BD_AUTH_NO_ERROR
+                        log(f"    current password verified; {name!r} password hash "
+                            f"-> {new_hash.hex()} (stored)")
             except Exception as e:
                 log(f"  (couldn't decode the change-password request: {e})")
             err = int(os.environ.get("WOW2_CHANGE_PW_ERR", err))
@@ -3734,6 +4178,7 @@ class AuthConnection(asyncio.Protocol):
             log(f"  (no handler yet for auth type 0x{auth_type:02x} — logging only)")
 
     def connection_lost(self, exc):
+        self.disarm_deadline()
         if self.counted:
             CONNS_PER_IP[self.peer_ip] = max(0, CONNS_PER_IP.get(self.peer_ip, 1) - 1)
             if not CONNS_PER_IP[self.peer_ip]:
@@ -3742,6 +4187,9 @@ class AuthConnection(asyncio.Protocol):
         was_lsg = LSG_CONNS.get(self.ident_key) is self
         if was_lsg:
             del LSG_CONNS[self.ident_key]
+        if self.relay_noted:
+            natrelay.RELAY.note_sign_out(self.peer_ip)
+            self.relay_noted = False
         log(f"TCP {self.peer} closed ({exc})")
         if was_lsg:
             sessions_host_gone(self.ident_key)
@@ -3785,6 +4233,14 @@ def server_address_for(client_ip: str) -> str:
     return ip
 
 
+def relay_host_aliases() -> dict[str, str]:
+    """Where a console on this machine dials the mailboxes from, when it is not
+    where it reaches 3074 from: the bridge, for loopback (server_address_for)."""
+    if BRIDGE_UP and not NO_SELF_REWRITE and not natrelay.PUBLIC_ADDRESS:
+        return {rigconfig.NETNS_BRIDGE_IP: "127.0.0.1"}
+    return {}
+
+
 def discovered_endpoint(addr: tuple[str, int]) -> tuple[str, int]:
     """The (ip, port) to tell a console its own public address is."""
     mb = natrelay.RELAY.mailbox_for(addr)
@@ -3810,8 +4266,8 @@ class NatTypeSocket(asyncio.DatagramProtocol):
         self.t = transport
 
     def datagram_received(self, data, addr):
-        log(f"UDP {addr[0]}:{addr[1]} -> {self.name} socket, {len(data)}B "
-            f"(unexpected): {data[:32].hex()}")
+        udp_log(addr[0], f"UDP {addr[0]}:{addr[1]} -> {self.name} socket, {len(data)}B "
+                f"(unexpected): {data[:32].hex()}")
 
 
 NAT_TYPE_PORT_SOCK: NatTypeSocket | None = None
@@ -3831,6 +4287,59 @@ UNKNOWN_UDP_FILES_MAX = 16
 UNKNOWN_UDP_FILE_BYTES = 65536
 _unknown_udp_minute = [0.0, 0, 0, set()]
 _unknown_udp_files: set[str] = set()
+
+
+UDP_LOG_PER_ADDRESS = 200
+UDP_LOG_TOTAL = 2000
+_udp_log_minute: list = [0.0, 0, {}, 0]
+
+
+def udp_log(ip: str, msg: str) -> None:
+    """log() for a line about a datagram, which nothing authenticated: at most
+    UDP_LOG_PER_ADDRESS lines a minute per address and UDP_LOG_TOTAL in all."""
+    now = time.time()
+    win = _udp_log_minute
+    if now - win[0] >= 60:
+        if win[3]:
+            log(f"UDP {win[3]} more line(s) about datagrams in the last minute were "
+                f"not printed ({len(win[2])} address(es) printed)")
+        win[0], win[1], win[3] = now, 0, 0
+        win[2].clear()
+    n = win[2].get(ip, 0)
+    if n >= UDP_LOG_PER_ADDRESS or win[1] >= UDP_LOG_TOTAL:
+        win[3] += 1
+        return
+    win[2][ip] = n + 1
+    win[1] += 1
+    log(msg)
+
+
+UDP_REPLIES_PER_ADDRESS = 60
+UDP_REPLIES_TOTAL = 3000
+_udp_reply_minute: list = [0.0, 0, {}, 0]
+
+
+def udp_reply_due(ip: str) -> bool:
+    """May a reply go to a source nothing authenticated? Discovery and the NAT
+    type probe answer with more bytes than they were sent (3 -> 9, 4 -> 15), so a
+    forged source makes them a reflector: UDP_REPLIES_PER_ADDRESS a minute per
+    address (a sign-in needs about three), UDP_REPLIES_TOTAL in all."""
+    now = time.time()
+    win = _udp_reply_minute
+    if now - win[0] >= 60:
+        if win[3]:
+            log(f"UDP {win[3]} discovery / NAT type repl(ies) not sent in the last minute "
+                f"(over the budget: {UDP_REPLIES_PER_ADDRESS} an address, "
+                f"{UDP_REPLIES_TOTAL} in all)")
+        win[0], win[1], win[3] = now, 0, 0
+        win[2].clear()
+    n = win[2].get(ip, 0)
+    if n >= UDP_REPLIES_PER_ADDRESS or win[1] >= UDP_REPLIES_TOTAL:
+        win[3] += 1
+        return False
+    win[2][ip] = n + 1
+    win[1] += 1
+    return True
 
 
 def unknown_udp_note(peer: str, data: bytes, addr: tuple[str, int]) -> None:
@@ -3940,15 +4449,16 @@ class Discovery(asyncio.DatagramProtocol):
                 self.nat_type(data, addr)
                 return
         if reply:
-            self.t.sendto(reply, addr)
-            log(f"UDP {peer} disc 0x{data[0]:02x} -> reply {reply.hex()}")
+            if udp_reply_due(addr[0]):
+                self.t.sendto(reply, addr)
+                udp_log(addr[0], f"UDP {peer} disc 0x{data[0]:02x} -> reply {reply.hex()}")
             return
 
         msg = nat_parse(data)
         if msg and msg[0] == NAT_KEEPALIVE:
             nat_peers_sweep()
             if addr not in NAT_PEERS:
-                log(f"UDP {peer} bdNAT keepalive -- console registered "
+                udp_log(addr[0], f"UDP {peer} bdNAT keepalive -- console registered "
                     f"(now {len(NAT_PEERS) + 1} known)")
             NAT_PEERS[addr] = time.time()
             natrelay.RELAY.mailbox_for(addr)
@@ -3966,7 +4476,7 @@ class Discovery(asyncio.DatagramProtocol):
         name = {NAT_CHANGE_NONE: "test 1", NAT_CHANGE_PORT: "test 3 (change port)",
                 NAT_CHANGE_BOTH: "test 2 (change ip+port)"}.get(flags, f"flags {flags}")
         if not serverconfig.NAT_TYPE:
-            log(f"UDP {peer} NAT type {name} -- ignored (type discovery off)")
+            udp_log(addr[0], f"UDP {peer} NAT type {name} -- ignored (type discovery off)")
             return
         mine = discovered_self(addr[0])
         body = (bytes([NAT_TYPE_REPLY, 0x02, 0x00])
@@ -3984,7 +4494,7 @@ class Discovery(asyncio.DatagramProtocol):
                    else "second-public-address")
             ours = {server_address_for(addr[0]), natrelay.server_addr_for(addr[0])}
             if sock is not None and serverconfig.NAT_TYPE_ALT_ADDRESS in ours:
-                log(f"UDP {peer} NAT type {name} -- NOT answered: "
+                udp_log(addr[0], f"UDP {peer} NAT type {name} -- NOT answered: "
                     f"nat_type_alt_address is {serverconfig.NAT_TYPE_ALT_ADDRESS}, "
                     f"which is an address this console already reaches us on "
                     f"({'/'.join(sorted(ours))}). Test 2 needs a DIFFERENT public "
@@ -3992,28 +4502,32 @@ class Discovery(asyncio.DatagramProtocol):
                     f"address-restricted NAT")
                 return
         else:
-            log(f"UDP {peer} NAT type {name} -- unknown change flags, ignored")
+            udp_log(addr[0], f"UDP {peer} NAT type {name} -- unknown change flags, ignored")
             return
         if sock is None:
-            log(f"UDP {peer} NAT type {name} -- NOT answered "
+            udp_log(addr[0], f"UDP {peer} NAT type {name} -- NOT answered "
                 f"(no {via} socket; the console will retry, time out and "
                 f"fall through to the next test)")
             return
+        if not udp_reply_due(addr[0]):
+            return
         sock.sendto(body, addr)
-        log(f"UDP {peer} NAT type {name} -> reply via {via}: {body.hex()}")
+        udp_log(addr[0], f"UDP {peer} NAT type {name} -> reply via {via}: {body.hex()}")
 
     def introduce(self, data, msg, addr):
         """Relay a NAT-traversal introduction to the peer the joiner asked for."""
         _, hmac, ident, a_addr, b_addr = msg
         mode = nat_broker_mode()
-        log(f"UDP {addr[0]}:{addr[1]} bdNAT INTRO REQ id=0x{ident:08x} "
+        udp_log(addr[0], f"UDP {addr[0]}:{addr[1]} bdNAT INTRO REQ id=0x{ident:08x} "
             f"A={a_addr[0]}:{a_addr[1]} B={b_addr[0]}:{b_addr[1]} "
             f"hmac={hmac.hex()} [{mode}]")
 
         if mode == "reply":
+            if not udp_reply_due(addr[0]):
+                return
             out = bytes([NAT_INTRO_REPLY]) + data[1:]
             self.t.sendto(out, addr)
-            log(f"    0x0c -> {addr[0]}:{addr[1]} (we look like the peer)")
+            udp_log(addr[0], f"    0x0c -> {addr[0]}:{addr[1]} (we look like the peer)")
             return
 
         target = None
@@ -4022,19 +4536,19 @@ class Discovery(asyncio.DatagramProtocol):
             if owner is not None:
                 natrelay.RELAY.pair(natrelay.RELAY.console_at(addr), owner)
                 target = owner.key
-                log(f"    [relay] B names mailbox :{b_addr[1]} -> {owner}")
+                udp_log(addr[0], f"    [relay] B names mailbox :{b_addr[1]} -> {owner}")
             else:
-                log(f"    [relay] B={b_addr[0]}:{b_addr[1]} is not one of our "
+                udp_log(addr[0], f"    [relay] B={b_addr[0]}:{b_addr[1]} is not one of our "
                     f"mailboxes; falling back to the port match")
         if target is None:
             target = nat_endpoint_for(b_addr, addr)
         if target is None:
-            log(f"    no bdNAT socket known for {b_addr[0]}:{b_addr[1]} "
-                f"-- seen: {sorted(NAT_PEERS)}")
+            udp_log(addr[0], f"    no bdNAT socket known for {b_addr[0]}:{b_addr[1]} "
+                    f"({len(NAT_PEERS)} known)")
             return
         out = bytes([NAT_INTRO_RELAY]) + data[1:]
         self.t.sendto(out, target)
-        log(f"    0x0b -> {target[0]}:{target[1]}  {out.hex()}")
+        udp_log(addr[0], f"    0x0b -> {target[0]}:{target[1]}  {out.hex()}")
 
 
 TIGER_EMPTY = tiger.TIGER_EMPTY
@@ -4089,7 +4603,8 @@ async def main():
     bind, port = serverconfig.BIND, serverconfig.PORT
     server = await loop.create_server(AuthConnection, bind, port)
     await loop.create_datagram_endpoint(lambda: Discovery(), local_addr=(bind, port))
-    natrelay.set_logger(log)
+    natrelay.set_logger(log, udp_log)
+    natrelay.HOST_ALIASES.update(relay_host_aliases())
     await natrelay.RELAY.start(bind)
     await start_nat_type_sockets(loop, bind)
     lobbyboard.set_logger(log)

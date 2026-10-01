@@ -31,7 +31,8 @@ port = 3074
 # actually created itself (auth 0x00, which stores Tiger192(password)) can sign
 # in. A known name with no credential, an unknown handle and a login too short
 # to decode are all answered with a key the sender cannot hold, so the console
-# draws "The online profile name or password is incorrect" and never connects.
+# draws "The online profile name or password is incorrect" and never connects;
+# a password change for a name with no credential is refused (716) as well.
 #
 # TRUE lets an account with NO stored credential sign in on one shared password
 # (`WOW2_PASSWORD`, default 123456 -- and that default is in the public
@@ -68,6 +69,12 @@ hexdumps = false
 # and every reply -- ten times the volume, and what a bug report wants.
 level = "info"
 
+# The server writes the same lines to the journal and to session-*.log in the
+# data directory. A session log is closed at this size and a new one begun,
+# and only the newest `session_logs_keep` are kept (0 = unbounded / keep all).
+session_log_mb = 64
+session_logs_keep = 20
+
 [limits]
 # The caps a peer runs into, each per connection or per address, and each
 # closing only the offender's own connection: messages a second on one
@@ -85,6 +92,15 @@ level = "info"
 # credential is answered 707 first, so a sign-in is never blocked by it.
 # 0 turns it off.
 # max_creates_per_ip_per_hour = 20
+#
+# Uploaded files (flags, snapshots, shared schemes and landscapes). A console
+# holds about twenty -- one per slot, one more while it replaces one -- and
+# the game has no screen that deletes a file, so the per-account cap is far
+# above that: an account that met it could never upload again. A file is at
+# most 64 KB (one message). Past either cap an upload is answered 1002 and
+# nothing is written. 0 turns a cap off.
+# max_files_per_account = 64
+# max_storage_mb = 1024
 
 [nat]
 # Carry the peer session through the server instead of relying on a NAT punch.
@@ -122,8 +138,11 @@ relay = false
 relay_port_base = 40000
 relay_ports = 32
 
-# Seconds a mailbox may sit idle before it can be handed to someone else. Only
-# consulted when the pool is full.
+# Seconds a console may be silent before its mailbox goes back to the pool,
+# once an account has signed in from its address. A console sends a keepalive
+# every 15 s, so a silent one has gone. One from an address nobody has signed
+# in from goes after 90 s of silence, and in a full pool gives way to a
+# newcomer once it has held its mailbox 300 s.
 relay_idle_timeout = 600
 
 # What to tell a console the server's address is. Empty means "ask the routing
@@ -267,11 +286,14 @@ empty_text = ""
 offline_text = ""
 online_text = ""
 
-# Seconds after a host's ping before the same host name pings again. Inside
-# the window a new lobby from that host EDITS the previous announcement back
-# from closed to open (with the new lobby's mode and count; an edit notifies
+# Seconds after a host's ping before the same host pings again. Inside the
+# window a new lobby from that host EDITS the previous announcement back from
+# closed to open (with the new lobby's mode and count; an edit notifies
 # nobody), so a host who opens a friendly lobby, quits and opens a ranked one
-# pages the role once and the message still reads as open. 0 pings every time.
+# pages the role once and the message still reads as open. The host is the
+# account, not the lobby's name, and its address keeps the same window: a
+# second account hosting from there inside it is listed, not pinged. 0 pings
+# every time.
 announce_cooldown = 300
 
 # ---- THE LEADERBOARDS ----
@@ -331,14 +353,19 @@ leaderboard_empty_text = ""
 # resets any name and DMs that player; `/account NAME` (staff) says what the
 # store holds.
 #
-# It is a separate process (`wow2-discordbot`, its own systemd unit) that
-# shares the data directory; it needs the setup bot's token in the environment
-# as DISCORD_BOT_TOKEN (never here: /etc/wow2-server.env on a system install)
+# It is a separate process (`wow2-discordbot`, its own systemd unit and its
+# own user, wow2bot) that shares the data directory; it needs its OWN application's token, invited with
+# no permissions, in the environment as DISCORD_BOT_TOKEN (never here:
+# /etc/wow2-server.env on a system install)
 # and the application added to the server with the `applications.commands`
 # scope (discord/README.md step 9 in the source repository). 0 turns it off.
 #
 # bot_guild:          the server's id (Developer Mode > right-click the server > Copy Server ID)
-# bot_admin_roles:    who may /reset and /account (by role name; Manage Server always may)
+# bot_admin_roles:    who may /reset and /account: role ids (Developer Mode >
+#                     right-click the role > Copy Role ID), or names, each
+#                     resolved to the ONE role carrying it when the bot starts
+#                     (a name two roles share grants nothing); Manage Server
+#                     always may
 # bot_help_channel:   where a refused player is sent (a channel name; the
 #                     emoji a setup put in front of it does not matter)
 # bot_claims_per_day: passwords one person may be given per day; 0 = no limit

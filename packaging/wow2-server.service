@@ -4,6 +4,7 @@
 #                                     # the server under /opt/wow2-server
 #
 #   sudo useradd --system --home /var/lib/wow2-server --create-home wow2
+#   sudo chmod 770 /var/lib/wow2-server        # the bot's user shares the group
 #   sudo cp wow2-server.example.toml /etc/wow2-server.toml    # and EDIT it
 #   sudo cp packaging/wow2-server.service /etc/systemd/system/
 #   sudo systemctl enable --now wow2-server
@@ -41,23 +42,38 @@ RestartSec=5
 # population near 300.
 LimitNOFILE=65536
 
-# The server writes JSON databases and uploaded blobs under storage.data_dir, and
-# nothing else. Everything below is what it does not need.
+# The server writes its database, logs and uploaded blobs under
+# storage.data_dir, and nothing else. Everything below is what it does not need.
+# The database is created 0660 in the 0770 directory setup.sh makes, because the
+# password bot (its own user, this group) writes it too; the rest is 0600.
+UMask=0077
+CapabilityBoundingSet=
 NoNewPrivileges=true
 PrivateTmp=true
+PrivateDevices=true
 ProtectSystem=strict
 ProtectHome=true
 ReadWritePaths=/var/lib/wow2-server
+ProtectProc=invisible
+ProcSubset=pid
+ProtectClock=true
+ProtectHostname=true
 ProtectKernelTunables=true
 ProtectKernelModules=true
+ProtectKernelLogs=true
 ProtectControlGroups=true
 RestrictAddressFamilies=AF_INET AF_INET6 AF_UNIX
 RestrictNamespaces=true
+RestrictRealtime=true
+RestrictSUIDSGID=true
+RemoveIPC=true
 LockPersonality=true
 
 # NOTE: no MemoryDenyWriteExecute -- CPython's own allocator trips it on some
 # builds, and a unit that refuses to start is worse than one hardening flag short.
+SystemCallArchitectures=native
 SystemCallFilter=@system-service
+SystemCallFilter=~@privileged @resources
 SystemCallErrorNumber=EPERM
 
 [Install]

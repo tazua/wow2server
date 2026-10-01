@@ -193,6 +193,12 @@ CREATE TABLE IF NOT EXISTS discord_claims (
     user_id TEXT NOT NULL,
     name    TEXT NOT NULL,
     at      TEXT NOT NULL);
+
+-- One row per password the bot issued through /claim, kept a day: its limit.
+CREATE TABLE IF NOT EXISTS discord_issued (
+    user_id TEXT NOT NULL,
+    at      REAL NOT NULL);
+CREATE INDEX IF NOT EXISTS discord_issued_user ON discord_issued (user_id, at);
 """
 
 
@@ -210,6 +216,7 @@ def connect(db_path: Path | str) -> sqlite3.Connection:
     """Open (creating if needed) one database and make sure its schema is there."""
     p = Path(db_path)
     p.parent.mkdir(parents=True, exist_ok=True)
+    _create_file(p)
     conn = sqlite3.connect(str(p), isolation_level=None)
     conn.row_factory = sqlite3.Row
     try:
@@ -290,6 +297,24 @@ def _statements(script: str) -> list[str]:
     return out
 
 
+def _create_file(p: Path) -> None:
+    """Make a new database file before SQLite does (it would ask for 0644): its
+    owner's, and its group's too where the directory is group-writable (a system
+    install shares it with the password bot), never anyone else's, whatever the
+    umask. The -wal and -shm take its mode (§80aa)."""
+    if os.name != "posix":
+        return
+    try:
+        mode = 0o660 if p.parent.stat().st_mode & 0o020 else 0o600
+        fd = os.open(p, os.O_WRONLY | os.O_CREAT | os.O_EXCL, mode)
+    except OSError:
+        return
+    try:
+        os.fchmod(fd, mode)
+    finally:
+        os.close(fd)
+
+
 def _same_owner_as_directory(p: Path) -> None:
     """Give the database and its -wal/-shm to the data directory's owner when run as
     root, or a root-run CLI leaves the service unable to open its own store."""
@@ -338,7 +363,9 @@ def close() -> None:
 
 @contextlib.contextmanager
 def tx(conn: sqlite3.Connection | None = None):
-    """One transaction. Nest freely: only the outermost begins and commits."""
+    """One transaction. Nest freely: only the outermost begins and commits. A
+    COMMIT that fails is rolled back too, or every later tx() on the
+    connection would join the open one and never commit (§80x)."""
     conn = conn or db()
     if conn.in_transaction:
         yield conn
@@ -346,10 +373,26 @@ def tx(conn: sqlite3.Connection | None = None):
     conn.execute("BEGIN IMMEDIATE")
     try:
         yield conn
+        conn.execute("COMMIT")
     except BaseException:
-        conn.execute("ROLLBACK")
+        _abandon(conn)
         raise
-    conn.execute("COMMIT")
+
+
+def _abandon(conn: sqlite3.Connection) -> None:
+    """Roll back whatever is open; a connection that cannot is closed, and the
+    process's own is opened afresh at the next db()."""
+    global _CONN
+    if not conn.in_transaction:
+        return
+    try:
+        conn.execute("ROLLBACK")
+    except sqlite3.Error:
+        pass
+    if conn.in_transaction:
+        if conn is _CONN:
+            _CONN = None
+        conn.close()
 
 
 def meta_get(conn: sqlite3.Connection, key: str, default: str | None = None) -> str | None:
@@ -380,6 +423,12 @@ def canonical_name(name: str) -> str:
 def account_handle(name: str) -> str:
     """Tiger192(lowercased name)[:8], hex -- the 8 bytes a login request carries."""
     return tiger192(canonical_name(name).encode())[:8].hex()
+
+
+def fits(v: int) -> bool:
+    """Can an INTEGER column hold v? A client's u64 can be past it, and binding
+    one raises (§80af); no id or rank the server wrote is."""
+    return -(1 << 63) <= v < 1 << 63
 
 
 def now_iso() -> str:
@@ -883,14 +932,18 @@ EXPORTERS = {
 
 def export_dir(conn: sqlite3.Connection, dst: Path,
                stores: tuple[str, ...] | None = None) -> dict[str, Path]:
-    """`wow2-db export DIR`: the seven JSON files, written atomically."""
+    """`wow2-db export DIR`: the seven JSON files, written atomically and
+    readable by their owner only -- the accounts file holds every credential."""
     dst = Path(dst)
     dst.mkdir(parents=True, exist_ok=True)
     written = {}
     for s in stores or tuple(STORES):
         p = dst / STORES[s]
         tmp = p.with_name(p.name + f".tmp-{os.getpid()}")
-        tmp.write_text(json.dumps(EXPORTERS[s](conn), indent=1, sort_keys=True) + "\n")
+        tmp.unlink(missing_ok=True)
+        fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+        with os.fdopen(fd, "w") as f:
+            f.write(json.dumps(EXPORTERS[s](conn), indent=1, sort_keys=True) + "\n")
         os.replace(tmp, p)
         written[s] = p
     return written
@@ -912,10 +965,18 @@ def check(conn: sqlite3.Connection, data_dir: Path) -> tuple[list[str], list[str
                                             "   (not imported: this build still "
                                             "reads its JSON file)"))
     blobs = Path(data_dir) / "storage"
+    named = set()
     for r in conn.execute("SELECT id, name, file FROM storage ORDER BY id"):
+        named.add(r["file"])
         if not r["file"] or not (blobs / r["file"]).is_file():
             bad.append(f"storage row 0x{r['id']:x} {r['name']!r}: no bytes at "
                        f"storage/{r['file'] or '?'} (served as an empty file)")
+    loose = sorted(p.name for p in blobs.iterdir()
+                   if p.is_file() and p.name not in named) if blobs.is_dir() else []
+    if loose:
+        notes.append(f"storage/  {len(loose)} file(s) no row names, so nothing serves them "
+                     f"(a delete by an older build kept its bytes): "
+                     + ", ".join(loose[:3]) + (", ..." if len(loose) > 3 else ""))
     for t in conn.execute("SELECT id, name, owner FROM teams"):
         if not conn.execute("SELECT 1 FROM team_members WHERE team = ? AND entity = ?",
                             (t["id"], t["owner"])).fetchone():

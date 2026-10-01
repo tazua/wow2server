@@ -13,6 +13,7 @@ import asyncio
 import os
 import random
 import shutil
+import sqlite3
 import sys
 import tempfile
 import time
@@ -170,6 +171,25 @@ def run(keep: bool) -> int:
     check(r.outcome is bot.Outcome.CLAIMED and pwhash("noticed1") == digest(r.password),
           "a name an older server only noticed in passing (no digest) is free to claim")
 
+    vet = store.account_handle("veteran1")
+    ent = f"{int.from_bytes(bytes.fromhex(vet), 'little'):016x}"
+    with store.tx() as conn:
+        conn.execute("INSERT INTO profiles (entity, kind, name, at, fields) "
+                     "VALUES (?, 'public', 'veteran1', ?, '[]')", (ent, store.now_iso()))
+        conn.execute("INSERT INTO stats (board, entity, score, name) "
+                     "VALUES (5, ?, 777, 'veteran1')", (ent,))
+    r = desk.claim("veteran1", Q)
+    check(r.outcome is getattr(bot.Outcome, "HISTORY", None) and pwhash("veteran1") is None
+          and bound_to("veteran1") is None,
+          "a name with no password but a profile and a rating here is not handed out (§80q)")
+    d = desk.lookup("veteran1")
+    check(d.get("history") == ["a profile", "scores"] and not d["registered"],
+          "...and lookup shows staff what it has here")
+    r = desk.reset("veteran1", C)
+    check(r.outcome in (bot.Outcome.CLAIMED, bot.Outcome.RESET)
+          and pwhash("veteran1") == digest(r.password) and bound_to("veteran1") == C,
+          "CONTROL: staff may still give it to a player they have checked")
+
     print("the daily limit")
     # A has two successes today (the claim and the reset); B one (noticed1) and one refusal
     r = desk.claim("newname01", A)
@@ -177,6 +197,10 @@ def run(keep: bool) -> int:
     r = desk.claim("newname02", A)
     check(r.outcome is bot.Outcome.TOO_MANY and pwhash("newname02") is None,
           "A's fourth is refused and nothing is written")
+    again = bot.Desk(claims_per_day=3, rng=random.Random(9), clock=clock)
+    check(again.claim("newname09", A).outcome is bot.Outcome.TOO_MANY
+          and pwhash("newname09") is None,
+          "...and so is it by a restarted bot: the count is in the store, not the process (§80q)")
     check(desk.claim("newname02", B).outcome is bot.Outcome.CLAIMED
           and desk.claim("newname03", B).outcome is bot.Outcome.CLAIMED
           and desk.claim("newname04", B).outcome is bot.Outcome.TOO_MANY,
@@ -217,6 +241,73 @@ def run(keep: bool) -> int:
     clock.t += 3601
     check(fresh.recover("changed1", B, "guess7").outcome is bot.Outcome.WRONG, "an hour later, again")
 
+    print("a decision and its write are one transaction (§80ae)")
+    db_file = store.db().execute("PRAGMA database_list").fetchone()[2]
+
+    def server_writes(name: str, password: str) -> bool:
+        """A credential written from another connection, as the server's create or
+        an in-game change; False when the write lock is held (the server waits)."""
+        c = sqlite3.connect(db_file, timeout=0, isolation_level=None)
+        c.row_factory = sqlite3.Row
+        try:
+            c.execute("BEGIN IMMEDIATE")
+            srv._write_credential(c, name, srv.tiger192(password.encode()), "10.0.0.9")
+            c.execute("COMMIT")
+            return True
+        except sqlite3.OperationalError:
+            return False
+        finally:
+            c.close()
+
+    real_new_password = bot.new_password
+    landed: list[bool] = []
+
+    def meanwhile(name: str, password: str):
+        """The desk has decided and is about to write: the server writes first."""
+        def new_password(rng=None):
+            landed.append(server_writes(name, password))
+            return real_new_password(rng)
+        return new_password
+
+    R = "1006"
+    race = bot.Desk(claims_per_day=3, rng=random.Random(11), clock=clock)
+    check(server_writes("racer0", "console0") and pwhash("racer0") == digest("console0"),
+          "CONTROL: with no command being decided, the other connection's write goes in at once")
+    bot.new_password = meanwhile("racer1", "console1")
+    try:
+        r = race.claim("racer1", R)
+    finally:
+        bot.new_password = real_new_password
+    check(landed == [False] and r.outcome is bot.Outcome.CLAIMED
+          and pwhash("racer1") == digest(r.password),
+          "a console's create cannot land between /claim's check that a name is free and its "
+          "write, to be overwritten: the server waits for the claim's lock, then answers 707")
+    landed.clear()
+    srv.set_account_password("racer2", srv.tiger192(b"first222"))
+    bot.new_password = meanwhile("racer2", "second22")
+    try:
+        r = race.recover("racer2", R, "first222")
+    finally:
+        bot.new_password = real_new_password
+    check(landed == [False] and r.outcome is bot.Outcome.RESET
+          and pwhash("racer2") == digest(r.password),
+          "nor can the owner's in-game change land between /recover's check of the password "
+          "on file and its write: it waits, and is then checked against the new password")
+
+    def broken(_user_id):
+        raise sqlite3.OperationalError("disk I/O error")
+    race._count = broken
+    try:
+        race.claim("racer3", R)
+        raised = False
+    except sqlite3.OperationalError:
+        raised = True
+    del race._count
+    check(raised and pwhash("racer3") is None and bound_to("racer3") is None
+          and not store.db().in_transaction,
+          "a store that fails while counting a password writes none of it: no password that "
+          "nobody was sent, no claim")
+
     print("the commands")
     files = bot.guide_files()
     ctx = FakeCtx(P)
@@ -240,6 +331,15 @@ def run(keep: bool) -> int:
     ctx = FakeCtx(B)
     text = asyncio.run(bot.do_claim(desk, ctx, "a" * 17))
     check("not a profile name" in text and "1 to 16" in text, "/claim on a bad name says the rule")
+    with store.tx() as conn:
+        conn.execute("INSERT INTO profiles (entity, kind, name, at, fields) "
+                     "VALUES (?, 'public', 'veteran2', ?, '[]')",
+                     (f"{int.from_bytes(bytes.fromhex(store.account_handle('veteran2')), 'little'):016x}",
+                      store.now_iso()))
+    ctx = FakeCtx(B)
+    text = asyncio.run(bot.do_claim(desk, ctx, "veteran2"))
+    check(not ctx.dms and "played on" in text and "<#555>" in text and pwhash("veteran2") is None,
+          "/claim on a name that has played here: no DM, sent to staff in the help channel")
 
     ctx = FakeCtx(Q)
     text = asyncio.run(bot.do_recover(desk, ctx, "changed1", "wrong"))
@@ -283,6 +383,9 @@ def run(keep: bool) -> int:
           and store.account_handle("recruit01") in text, "/account: registered, by whom, the handle")
     text = asyncio.run(bot.do_account(desk, ctx, "nobody99"))
     check("no password on file" in text, "/account on a name never seen")
+    text = asyncio.run(bot.do_account(desk, ctx, "veteran2"))
+    check("no password on file" in text and "on the server: a profile" in text,
+          "/account on a name with history says what it has")
 
     print("the pictures")
     names = [p.name for p in files]
@@ -290,6 +393,38 @@ def run(keep: bool) -> int:
           f"four PNGs ship beside the module: {', '.join(names)}")
     check(names == sorted(names) and [n[0] for n in names] == ["1", "2", "3", "4"],
           "...numbered in the order the kit names them")
+
+    print("what the bot holds (§80h)")
+    check("permissions=0&" in bot.invite_url(123),
+          "the password bot's invite asks for no permissions")
+    extra = getattr(bot, "excess_permissions", lambda _v: [])
+    check(extra(8) == ["Administrator"] and extra(0x20 | 0x10000000)
+          == ["Manage Server", "Manage Roles"] and extra(0x400 | 0x800) == [],
+          "a token with Administrator or Manage Server/Roles is named at the start; "
+          "View Channels and Send Messages are not")
+
+    print("who is staff (§80f)")
+    resolve = getattr(bot, "staff_role_ids", None)
+    staff = getattr(bot, "is_staff", None)
+    if resolve is None or staff is None:
+        check(False, "staff is decided by role id, not by a role's name")
+    else:
+        roles = [(11, "Admin"), (12, "Moderator"), (13, "member")]
+        ids, problems = resolve(["Admin", "Moderator"], roles)
+        check(ids == {11, 12} and not problems,
+              "names in bot_admin_roles resolve to the one role carrying each")
+        check(not staff(False, [13, 14], ids),
+              "a member holding a role made AFTER the start under the name Moderator "
+              "(id 14) is not staff")
+        ids, problems = resolve(["Admin", "Moderator"], roles + [(14, "Moderator")])
+        check(ids == {11} and any("2 roles are called 'Moderator'" in p for p in problems),
+              "...and if a second Moderator role already exists at the start, the name "
+              "grants nothing and the log says to give the id")
+        ids, problems = resolve(["12", "99"], roles)
+        check(ids == {12} and any("no role with id 99" in p for p in problems),
+              "a role id is taken as itself; an id the server has not got is named")
+        check(staff(True, [], set()) and staff(False, [12], {12}),
+              "Manage Server is always staff, and so is a pinned role")
 
     passed = sum(1 for ok, _ in RESULTS if ok)
     print(f"\n{passed} of {len(RESULTS)} passed")

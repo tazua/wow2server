@@ -62,7 +62,8 @@ sudo ./setup.sh --system --dns <SERVER_IP> --open-firewall
 ```
 
 That installs both processes as systemd units under `/opt/wow2-server`
-(running as a `wow2` user, config in `/etc/wow2-server.toml`, data in
+(the server as a `wow2` user, the DNS responder as a throwaway one, both
+sandboxed; config in `/etc/wow2-server.toml`, data in
 `/var/lib/wow2-server`), starts them, and opens the ports in ufw or
 firewalld. `<SERVER_IP>` is the public address the consoles will be told.
 Check with `systemctl status wow2-server wow2-nsdns@<SERVER_IP>`.
@@ -98,7 +99,8 @@ Network Settings, your connection, Address Settings, Custom, DNS Setting,
 Manual. The PSP's own connection test will say there is no internet, because
 the responder answers nothing but the four names; the game works. Without
 the responder the game says "Unable to connect to WormNet" before it has sent
-the server a single packet.
+the server a single packet. The responder answers only queries, and at most
+60 a minute to one address (3,000 in all), so it cannot be turned on anyone.
 
 On an emulator, either do the same in the emulator's network settings, or
 put the names in `/etc/hosts`, all pointing at the server:

@@ -177,9 +177,13 @@ def utc(*ymdhm) -> float:
     return datetime.datetime(*ymdhm, tzinfo=datetime.timezone.utc).timestamp()
 
 
-def rec(sid: int, name: str, players=1, max_players=4, points=0, created=None) -> dict:
-    return {"id": sid, "name": name, "players": players, "max_players": max_players,
-            "points": points, "created": created or int(time.time()) - 60}
+def rec(sid: int, name: str, players=1, max_players=4, points=0, created=None,
+        host=None, ip=None) -> dict:
+    r = {"id": sid, "name": name, "players": players, "max_players": max_players,
+         "points": points, "created": created or int(time.time()) - 60}
+    if host is not None:
+        r["host"], r["host_ip"] = host, ip or ""
+    return r
 
 
 def embed_of(call) -> dict:
@@ -338,8 +342,9 @@ def run(keep: bool) -> int:
         c = posts[0][2]["content"] if posts else ""
         check(len(posts) == 1 and c.startswith("<@&424242> ") and "**player1**" in c
               and "ranked lobby (4/4)" in c
-              and posts[0][2]["allowed_mentions"]["parse"] == ["roles", "users", "everyone"],
-              "a new lobby is announced with the mention first and pings allowed")
+              and posts[0][2]["allowed_mentions"] == {"parse": [], "roles": ["424242"]},
+              "a new lobby is announced with the mention first, and the only ping "
+              "allowed is the configured role (§80e)")
         note_id = str(fake.next_id)
         fake.reset()
         b.closed(0x5701)
@@ -399,6 +404,75 @@ def run(keep: bool) -> int:
         check(b7.cooldown == 0 and len(fake.of("POST", LFG_HOOK)) == 3,
               "announce_cooldown = 0 pings every time")
         b7.stop(2)
+
+        print("-- whose cooldown it is: the host's, not the lobby name's (§80u)")
+        b9 = board(fake, None, lobby=None)
+        b9.flush(3)
+        fake.reset()
+        for i in range(3):
+            b9.opened(rec(0x6100 + i, f"trick{i}", host="flooder", ip="10.9.0.1"))
+        b9.flush(3)
+        check(len(fake.of("POST", LFG_HOOK)) == 1 and len(fake.of("PATCH", LFG_HOOK)) == 2,
+              "one host renaming its lobby inside the cooldown pings once, and each "
+              "rename edits that one announcement (it used to ping per name)")
+        fake.reset()
+        b9.opened(rec(0x6110, "samename", host="alice", ip="10.9.0.2"))
+        b9.opened(rec(0x6111, "samename", host="bob", ip="10.9.0.3"))
+        b9.flush(3)
+        check(len(fake.of("POST", LFG_HOOK)) == 2 and fake.of("PATCH", LFG_HOOK) == [],
+              "two hosts whose lobbies share a name are each pinged, and neither's "
+              "announcement is edited into the other's")
+        fake.reset()
+        b9.opened(rec(0x6120, "carols", host="carol", ip="10.9.0.2"))
+        b9.flush(3)
+        check(fake.calls == [],
+              "another account at an address that has just pinged is listed, not "
+              "pinged -- the create limit is per address (§71)")
+        fake.reset()
+        b9.opened(rec(0x6130, "dave", host="dave", ip="10.9.0.4"))
+        b9.flush(3)
+        check(len(fake.of("POST", LFG_HOOK)) == 1,
+              "CONTROL: a new host at a new address inside everybody else's cooldown "
+              "is pinged")
+        time.sleep(0.7)
+        fake.reset()
+        b9.opened(rec(0x6140, "carols", host="carol", ip="10.9.0.2"))
+        b9.flush(3)
+        check(len(fake.of("POST", LFG_HOOK)) == 1
+              and set(b9._last_open) == {"carol"} and set(b9._last_sid) == {"carol"},
+              "once the window has run out that account is pinged, and the cooldown "
+              "tables hold only who is inside one (they kept every lobby name for ever)")
+        b9.stop(2)
+
+        print("-- the announcement queue is bounded (§80u)")
+        cap = getattr(lobbyboard, "MAX_EVENTS", 100)
+        b10 = board(fake, None, lobby=None)
+        b10.flush(3)
+        fake.reset()
+        b10.opened(rec(0x6200, "keeper", host="keeper", ip="10.9.1.1"))
+        b10.flush(3)
+        keeper_id = str(fake.next_id)
+        LOGGED.clear()
+        fake.delay = 0.02
+        for i in range(1000):
+            b10.opened(rec(0x6300 + i, f"flood{i}", host=f"flood{i}",
+                           ip=f"10.8.{i // 250}.{i % 250}"))
+        for i in range(1000):
+            b10.closed(0x6300 + i)
+        b10.closed(0x6200)
+        waiting = len(b10._events)
+        check(waiting <= cap and getattr(b10, "dropped", 0) > 0
+              and len([m for m in LOGGED if "dropped" in m]) == 1,
+              f"2,001 lobby events against a slow Discord: at most {cap} wait "
+              f"({waiting} did), and one '!!' line says how many were dropped")
+        b10.flush(10)
+        struck = [c for c in fake.of("PATCH", LFG_HOOK)
+                  if c[1].endswith(f"/messages/{keeper_id}") and "closed" in c[2]["content"]]
+        check(bool(struck),
+              "...and a close waiting behind them is kept: the first lobby's "
+              "announcement is struck through")
+        fake.delay = 0.0
+        b10.stop(3)
 
         print("-- the message survives a restart")
         b.stop(timeout=3)
@@ -503,6 +577,41 @@ def run(keep: bool) -> int:
               and any("does not exist any more (404 on GET)" in m for m in LOGGED),
               "...and a deleted PINGS webhook is found by a GET at start, before any lobby")
         b4.stop(timeout=2)
+
+        print("-- names a player chose (§80e)")
+        fake.reset()
+        bn = board(fake, None, lobby=None)
+        bn.opened(rec(0x5711, "@everyone", players=1))
+        bn.flush(3)
+        posts = fake.of("POST", LFG_HOOK)
+        c = posts[0][2]["content"] if posts else ""
+        check(len(posts) == 1 and "@everyone" not in c and "@\u200beveryone" in c
+              and posts[0][2]["allowed_mentions"] == {"parse": [], "roles": ["424242"]},
+              "a lobby named @everyone is announced with the mention broken, and the "
+              "post allows the configured role and nothing else")
+        bn.stop(timeout=2)
+        nasty = {1: rec(1, "[Free Nitro](https://example.invalid)"),
+                 2: rec(2, "x\n\U0001F7E2 **fake** \u2014 1/4"),
+                 3: rec(3, "<@&99> ```")}
+        d = lobbyboard.render_board("Open lobbies", lobbyboard.snapshot(nasty)[0], "up",
+                                    1_700_000_000)["description"]
+        check("](" not in d.replace("\\](", "") and "\n\U0001F7E2 **fake**" not in d
+              and "<@&99>" not in d and "```" not in d,
+              "on the board a masked link, a newline that would add a fake row, a "
+              "mention and a code fence in a lobby name all come out as text")
+        many = {i: rec(i, "w" * 512, players=1) for i in range(1, 26)}
+        d = lobbyboard.render_board("Open lobbies", lobbyboard.snapshot(many)[0], "up",
+                                    1_700_000_000)["description"]
+        check(len(d) <= 4096 and d.count("\U0001F7E2") == 25,
+              f"25 hosts with 512-character names fit Discord's 4096 ({len(d)}), each "
+              f"name cut to {getattr(lobbyboard, 'NAME_MAX', '?')}")
+        rows = tuple((i, "```" + "n" * 60, 10 ** 9) for i in range(1, 26))
+        e = lobbyboard.render_leaderboards("Leader boards", ((5, "Permanent", "", rows, 25),),
+                                           "up", 1_700_000_000)
+        v = e["fields"][0]["value"]
+        check(len(v) <= 1024 and v.count("```") == 2 and v.startswith("```\n"),
+              f"a leaderboard field of 25 long names fits Discord's 1024 ({len(v)}) and a "
+              f"name's backticks cannot close its code block")
 
         print("-- the poster's voice")
         sarge = {"announce_text": "{mention} Listen up! {name} opened a {mode} lobby, {count}. Move it!",

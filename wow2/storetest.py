@@ -10,8 +10,10 @@ from __future__ import annotations
 
 import argparse
 import json
+import os
 import shutil
 import sqlite3
+import subprocess
 import sys
 import tempfile
 import time
@@ -166,6 +168,11 @@ def run(keep: bool) -> int:
         bad, notes = store.check(conn, root / "rt")
         check(any("readme.txt" in b for b in bad) and any("wormstest" in b for b in bad),
               "check reports a row with no bytes and a proposal with no mailbox row")
+        (root / "rt" / "storage" / "5003-dcacny.ss0").write_bytes(b"left behind")
+        bad, notes = store.check(conn, root / "rt")
+        check(any("5003-dcacny.ss0" in n and "1 file(s)" in n for n in notes)
+              and not any("5003-dcacny" in b for b in bad),
+              "...and notes the bytes no row names, a delete by an older build (§80o)")
         conn.close()
 
         # ---------------------------------------------------------- startup
@@ -398,10 +405,19 @@ def run(keep: bool) -> int:
               "...and every board is back where it was, not just Permanent")
         potbank.open_pot(0x5707, "snailhead")
         potbank.settle_unresolved(0x5707)                            # gone with nothing staked: settled
+        potbank.open_pot(0x570b, "snailhead")
+        potbank.note_stake(0x570b, sorer, "snailhead", 400, 360)
+        potbank.settle_unresolved(0x570b)                            # gone with a stake: pending
         check(potbank.note_side_stake(0x5707, 2, wormy, "wormy", 360, 436) == 0
-              and potbank.note_side_stake(0x5708, 2, wormy, "wormy", 400, 360) == 0
-              and potbank._find_live("5708") == (None, None),
-              "a rise on a side board is never a stake, and nothing is recorded for a pot that is not open")
+              and potbank.note_side_stake(0x570b, 2, wormy, "wormy", 400, 360) == 0
+              and potbank._find_live("570b")[1]["stakes"].keys() == {f"{sorer:016x}"},
+              "a rise on a side board is never a stake, and a pot whose session has "
+              "gone takes none")
+        check(potbank.note_side_stake(0x5708, 2, wormy, "wormy", 400, 360) == 40
+              and potbank._find_live("5708")[0] == "open",
+              "a side stake for a live session with no pot -- its next match, whose "
+              "Weekly stake comes before the rating's -- opens one (§80k)")
+        potbank.settle_unresolved(0x570b, policy_override="refund")
         start(0x5709)
         report = potbank.award(["wormy"], "5709")
         check("Weekly +80, Monthly +76, Yearly +76" in report
@@ -471,6 +487,99 @@ def run(keep: bool) -> int:
               and any("Wormgamer98" in ln for ln in printed) and any("Lukas1" in ln for ln in printed),
               "...the version is 2 and both changes were said out loud")
         conn.close()
+
+        # --------------------------------------------------- a failed COMMIT
+        print("\na COMMIT that fails (§80x)")
+        cdb = root / "commit" / store.DB_NAME
+        c1, c2 = store.connect(cdb), store.connect(cdb)
+        c1.execute("PRAGMA foreign_keys = ON")
+        c1.execute("CREATE TABLE parent (id INTEGER PRIMARY KEY)")
+        c1.execute("CREATE TABLE child (p INTEGER REFERENCES parent (id) "
+                   "DEFERRABLE INITIALLY DEFERRED)")
+        with store.tx(c1):
+            c1.execute("INSERT INTO parent VALUES (1)")
+        check(c2.execute("SELECT COUNT(*) FROM parent").fetchone()[0] == 1,
+              "CONTROL: a transaction commits and another connection sees it")
+        raised = False
+        try:
+            with store.tx(c1):
+                c1.execute("INSERT INTO child VALUES (99)")
+        except sqlite3.IntegrityError:
+            raised = True
+        left_open = c1.in_transaction
+        with store.tx(c1):
+            c1.execute("INSERT INTO parent VALUES (2)")
+        seen = c2.execute("SELECT COUNT(*) FROM parent").fetchone()[0]
+        check(raised and not left_open and seen == 2,
+              f"a COMMIT that fails (a deferred foreign key) raises, leaves no "
+              f"transaction open, and the next tx() commits for real "
+              f"(raised={raised}, left open={left_open}, rows seen={seen})")
+        c1.close()
+        c2.close()
+
+        # ------------------------------------------ what a copy leaves readable
+        print("\nwhat a backup and an export leave readable (§80z)")
+        dbcli = Path(__file__).resolve().parent / "dbcli.py"
+        src_db = root / "rt" / store.DB_NAME
+        out = root / "perm"
+        out.mkdir()
+        older = out / "b.sqlite3"
+        mask = os.umask(0o022)
+        try:
+            sqlite3.connect(str(older)).close()
+            b = subprocess.run([sys.executable, str(dbcli), "--db", str(src_db), "backup",
+                                str(older), "--force"], capture_output=True, text=True)
+            e = subprocess.run([sys.executable, str(dbcli), "--db", str(src_db), "export",
+                                str(out / "exp")], capture_output=True, text=True)
+        finally:
+            os.umask(mask)
+        want = sqlite3.connect(str(src_db)).execute("SELECT COUNT(*) FROM accounts").fetchone()[0]
+        try:
+            got = sqlite3.connect(str(older)).execute("SELECT COUNT(*) FROM accounts").fetchone()[0]
+        except sqlite3.Error:
+            got = None
+        check(b.returncode == 0 and got == want,
+              f"CONTROL: a backup is the database, accounts and all ({got} of {want})")
+        mode = older.stat().st_mode & 0o777
+        check(not mode & 0o077,
+              f"a backup under a 022 umask, over an older world-readable copy, is "
+              f"readable by its owner only ({oct(mode)})")
+        modes = {p.name: oct(p.stat().st_mode & 0o777) for p in sorted((out / "exp").glob("*.json"))}
+        check(e.returncode == 0 and modes and all(int(m, 8) & 0o077 == 0 for m in modes.values()),
+              f"...and so is every file an export writes ({modes})")
+
+        # ------------------------------------------ who a new database is for
+        print("\nwho a new database file is readable by (§80aa)")
+        own, shared, kept_dir = root / "own", root / "shared", root / "kept"
+        for d, m in ((own, 0o755), (shared, 0o770), (kept_dir, 0o755)):
+            d.mkdir()
+            os.chmod(d, m)
+        kept = kept_dir / store.DB_NAME
+        sqlite3.connect(str(kept)).close()
+        os.chmod(kept, 0o640)
+        conns = []
+        for d, umask in ((own, 0o000), (shared, 0o077), (kept_dir, 0o077)):
+            mask = os.umask(umask)
+            try:
+                conns.append(store.connect(d / store.DB_NAME))
+            finally:
+                os.umask(mask)
+
+        def mode(f: Path) -> int:
+            return f.stat().st_mode & 0o777
+        n = conns[2].execute("SELECT COUNT(*) FROM accounts").fetchone()[0]
+        check(mode(kept) == 0o640 and n == 0,
+              f"CONTROL: an existing database keeps its mode, and opens ({oct(mode(kept))})")
+        o = mode(own / store.DB_NAME)
+        check(o == 0o600, f"a new database in a directory only its owner writes is its "
+                          f"owner's alone, even under a 000 umask ({oct(o)})")
+        sh = {f.name: oct(mode(f)) for f in sorted(shared.iterdir())}
+        check(len(sh) == 3 and set(sh.values()) == {"0o660"},
+              f"...in a group-writable one (a system install's, which the password bot "
+              f"shares) it and its -wal and -shm are the group's too, even under a 077 "
+              f"umask ({sh})")
+        for c in conns:
+            c.close()
 
     finally:
         store.close()

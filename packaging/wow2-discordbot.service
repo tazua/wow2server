@@ -6,8 +6,9 @@
 # NAME` in the community Discord sets a random password for a name the server
 # does not hold and DMs it with the steps to sign in and change it.
 #
-# It needs the setup bot's token, which is a secret and lives in ONE file that
-# only root reads -- never in wow2-server.toml, never in the repository:
+# It needs its own application's token (no server permissions: discord/README.md),
+# which is a secret and lives in ONE file that only root reads -- never in
+# wow2-server.toml, never in the repository:
 #
 #   sudo sh -c 'umask 077; printf "DISCORD_BOT_TOKEN=%s\n" "PASTE-THE-TOKEN" > /etc/wow2-server.env'
 #   [discord] bot_guild = <the server id> in /etc/wow2-server.toml
@@ -16,7 +17,12 @@
 # Without the file the unit does not start (ConditionPathExists), so an install
 # that does not want the bot needs nothing. It shares the data directory with
 # the server: the credential it writes is the same row `wow2-account set`
-# writes, read by the server at the next sign-in.
+# writes, read by the server at the next sign-in. It runs as its own user,
+# wow2bot, in the server's group, so the server -- the process the internet
+# talks to -- cannot read this one's environment, and with it the token:
+#
+#   sudo useradd --system --gid wow2 --no-create-home --home-dir /nonexistent \
+#       --shell /usr/sbin/nologin wow2bot          # setup.sh --system does it
 
 [Unit]
 Description=WOW2 password bot (Discord; a temporary password for a profile the server never saw)
@@ -26,7 +32,7 @@ ConditionPathExists=/etc/wow2-server.env
 
 [Service]
 Type=simple
-User=wow2
+User=wow2bot
 Group=wow2
 WorkingDirectory=/var/lib/wow2-server
 Environment=WOW2_CONFIG=/etc/wow2-server.toml
@@ -35,18 +41,31 @@ ExecStart=/opt/wow2-server/bin/wow2-discordbot
 Restart=on-failure
 RestartSec=30
 
+UMask=0077
+CapabilityBoundingSet=
 NoNewPrivileges=true
 PrivateTmp=true
+PrivateDevices=true
 ProtectSystem=strict
 ProtectHome=true
 ReadWritePaths=/var/lib/wow2-server
+ProtectProc=invisible
+ProcSubset=pid
+ProtectClock=true
+ProtectHostname=true
 ProtectKernelTunables=true
 ProtectKernelModules=true
+ProtectKernelLogs=true
 ProtectControlGroups=true
 RestrictAddressFamilies=AF_INET AF_INET6 AF_UNIX
 RestrictNamespaces=true
+RestrictRealtime=true
+RestrictSUIDSGID=true
+RemoveIPC=true
 LockPersonality=true
+SystemCallArchitectures=native
 SystemCallFilter=@system-service
+SystemCallFilter=~@privileged @resources
 SystemCallErrorNumber=EPERM
 
 [Install]

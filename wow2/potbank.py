@@ -181,17 +181,20 @@ def note_stake(sid: int, entity: int, name: str, before: int, after: int,
 def note_side_stake(sid: int, board_id: int, entity: int, name: str, before: int,
                     after: int, when: str | None = None) -> int:
     """Record the same player's stake on a side board (Weekly, Monthly, Yearly),
-    which the client places a second or two BEFORE the rating's. Only while the
-    pot is open: after the session is gone an upload here is the client's own
-    payout, not a stake. Returns the stake, 0 if nothing was recorded."""
+    which the client places a second or two BEFORE the rating's -- so it may be
+    the first stake of a session's next match, and open its pot. Never into a
+    pot whose session has gone. Returns the stake, 0 if nothing was recorded."""
     stake = int(before) - int(after)
     if board_id not in SIDE_BOARDS or stake <= 0:
         return 0
     k = f"{sid:x}"
     with store.tx():
         state, rec = _find_live(k)
-        if state != "open":
+        if state == "pending":
             return 0
+        if rec is None:
+            state, rec = "open", {"session": k, "opened": _when(when), "host": "",
+                                  "stakes": {}}
         entry = rec.setdefault("stakes", {}).setdefault(
             f"{entity:016x}", {"name": name, "before": 0, "after": 0, "stake": 0,
                                "at": _when(when)})
@@ -237,6 +240,35 @@ def note_payout(sid: int, entity: int, name: str, before: int, after: int,
 
 
 RATING_BOARD_NAME = "5"
+
+
+def staked_pot(entity: int) -> tuple[str, dict] | tuple[None, None]:
+    """The newest open or pending pot holding a stake from `entity`: the only
+    pot its payout can come out of."""
+    eh = f"{entity:016x}"
+    for _state, k, rec in reversed(_live()):
+        if eh in rec.get("stakes", {}):
+            return k, rec
+    return None, None
+
+
+def pot_left(rec: dict, board_id: int) -> int:
+    """What a payout on `board_id` may still take out of this pot."""
+    if board_id == statsdb.RATING_BOARD:
+        return _pot_of(rec)
+    b = str(board_id)
+    return _side_pots(rec).get(b, 0) - int(rec.get("paid", {}).get(b, 0))
+
+
+def note_side_payout(k: str, board_id: int, amount: int) -> None:
+    """The client paid `amount` of a side board's pot out; it is not there twice."""
+    with store.tx():
+        state, rec = _find_live(k)
+        if rec is None:
+            return
+        paid = rec.setdefault("paid", {})
+        paid[str(board_id)] = int(paid.get(str(board_id), 0)) + int(amount)
+        _write_live(k, state, rec)
 
 
 def newest_open() -> tuple[str, dict] | tuple[None, None]:

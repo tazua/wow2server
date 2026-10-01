@@ -23,7 +23,7 @@ HERE = Path(__file__).resolve().parent
 sys.path.insert(0, str(HERE))
 
 import bdproto as bd                                        # noqa: E402
-from lsgauth import (Peer, bufsize_announce, lsg_connect, login,  # noqa: E402
+from lsgauth import (Peer, bufsize_announce, lsg_connect, lsg_mac, login,  # noqa: E402
                      ticket_key, tiger192)
 
 PORT = 3875
@@ -82,11 +82,13 @@ def req_clan_invite(team_id: int, target: int) -> bytes:
 
 
 def encrypt_rpc(key: bytes, seed: int, payload: bytes) -> bytes:
-    """Frame `payload` the way a console sends a service RPC (§60): [u8 1][u32 seed]
-    then 3DES-CBC under the session key, padded with the seed's low byte."""
+    """Frame `payload` the way a console sends a service RPC (§60, §80d): [u8 1]
+    [u32 seed] then 3DES-CBC under the session key of [4-byte MAC][payload],
+    padded with the seed's low byte."""
     from authserver import session_cbc_encrypt, tiger_iv
     plain = struct.pack("<I", 0) + payload
     plain += bytes([seed & 0xFF]) * ((-len(plain)) % 8)
+    plain = lsg_mac(key, plain) + plain[4:]
     body = b"\x01" + struct.pack("<I", seed) + session_cbc_encrypt(plain, key, tiger_iv(seed))
     return struct.pack("<I", len(body)) + body
 
@@ -108,6 +110,10 @@ class Console:
         self.p.send(lsg_connect(proof))
         if not self.p.frames(timeout=3.0):
             raise SystemExit(f"{account}: the server refused the LSG connect")
+        first = _rpc(10, 8)
+        first.u32(0)
+        first.u16(50)
+        self.send(first.getvalue())   # a console's first RPC; it completes the bind (§80t)
 
     def send(self, payload: bytes) -> None:
         self.seed += 1

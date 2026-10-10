@@ -68,7 +68,14 @@ the first RPC encrypted under the ticket's key, with the client's MAC under
 it, completes the binding. So a connection that has only seen the reply, and
 not opened the ticket, is served nothing. Every connection whose binding has
 not completed 30 s after it opened is closed; a console's completes within a
-fraction of a second, and a bound one pings every 40 s. A refused login is
+fraction of a second, and a bound one pings every 40 s. A bound console
+that stops answering altogether (a PSP put to sleep or switched off, a
+network gone) is found by the kernel's keepalive probes, after 60 s of
+quiet and six probes 10 s apart, and closed about two minutes after it last
+spoke: it leaves the online count and its lobby leaves the search. A paused
+emulator still answers, through its host. `ss -tni state established
+'( sport = :3074 )'` shows how long ago each connection last sent anything
+(`lastrcv`, in milliseconds). A refused login is
 answered with a key the sender cannot have, and it is indistinguishable on
 the wire from a wrong password. A handle and its key are honoured for 120 s
 after the login reply (a console presents its handle within a few seconds)
@@ -576,8 +583,19 @@ https://discord.com/oauth2/authorize?client_id=APP_ID&scope=bot%20applications.c
 ```
 
 It names any permission it holds when it starts. Do not reuse a token that
-can manage the server. On a system install the token goes in
-`/etc/wow2-server.env`, one line, mode 600:
+can manage the server. A bot moved to a new application leaves its
+commands behind under the old one: Discord keeps an application's
+commands until that application removes them, and nothing answers them.
+So remove them with the OLD application's token (its id is on the
+developer portal's General Information page):
+
+```bash
+curl -X PUT -H "Authorization: Bot $OLD_TOKEN" -H "Content-Type: application/json" \
+  -d '[]' https://discord.com/api/v10/applications/OLD_APP_ID/guilds/GUILD_ID/commands
+```
+
+On a system install the token goes in `/etc/wow2-server.env`, one line,
+mode 600:
 
 ```bash
 sudo sh -c 'umask 077; printf "DISCORD_BOT_TOKEN=%s\n" "PASTE-THE-TOKEN" > /etc/wow2-server.env'
@@ -606,9 +624,9 @@ webhook endpoint, the sixth the password bot's desk and commands with no
 Discord at all.
 
 ```bash
-.venv/bin/python -m wow2.lsgauth      # the credential path, the MAC, the bind deadline, 36 checks
+.venv/bin/python -m wow2.lsgauth      # the credential path, the MAC, the bind deadline, a console that vanishes, 39 checks
 .venv/bin/python -m wow2.blocktest    # a block stops all three invites, 7 checks
-.venv/bin/python -m wow2.ownertest    # identity, ownership, clans, storage, profiles, the pot, invites, UDP, relay and login-table bounds, the create limit, the systemd units, 200 checks
+.venv/bin/python -m wow2.ownertest    # identity, ownership, clans, storage, profiles, the pot, invites, UDP, relay and login-table bounds, the create limit, the systemd units, 202 checks
 .venv/bin/python -m wow2.storetest    # the SQLite store: the import keeps everything, the rules hold, the windowed boards, the pot on every board, a failed commit, file modes, 59 checks
 .venv/bin/python -m wow2.lobbyboardtest   # the Discord boards: what they post, coalescing, Discord down, other servers, the leaderboards, names and pings, 102 checks
 .venv/bin/python -m wow2.discordbottest   # the password bot: who gets a password for which name, the DM, who is staff, 68 checks

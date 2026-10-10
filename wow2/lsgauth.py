@@ -44,6 +44,11 @@ LEGACY_ACCOUNT = "oldworm1"    # a row with no digest: an import from the fallba
 UNKNOWN_ACCOUNT = "nobodyatall"
 BIND_DEADLINE = 3.0    # the isolated server's; a deployment's is 30 s
 DEADLINE_ACCOUNT = "quietworm"
+KEEPALIVE = "2,1,2"    # the namespace server's probes; a deployment's are 60,10,6
+KEEPALIVE_WAIT = 7.0
+TIMER_ACCOUNT = "probedworm"
+GONE_ACCOUNT = "vanishedworm"
+STAYS_ACCOUNT = "sleepyworm"
 
 
 # ------------------------------------------------------------------ the wire
@@ -365,6 +370,87 @@ def present(host: str, port: int, proof: bytes) -> tuple[bool, list]:
     return closed, replies
 
 
+def bound_console(host: str, port: int, account: str,
+                  password: str) -> tuple["Peer", bytes | None, bool]:
+    """A new account, signed in and bound the way a console binds (§60)."""
+    create_account(host, port, account, password)
+    ticket, proof = login(host, port, account)
+    key = ticket_key(ticket, password)
+    p = Peer(host, port)
+    p.send(bufsize_announce())
+    p.send(lsg_connect(proof))
+    p.frames(timeout=2.0)
+    if key:
+        p.send(lsg_rpc_encrypted(key, 0, 10, 7))
+    served = bool(key) and any(kind == "msg" and reply_opens(d, key)
+                               for kind, d in p.frames(timeout=2.0))
+    return p, key, served
+
+
+def keepalive_timer(port: int, client_port: int) -> str | None:
+    """The server's side of one connection as `ss -o` prints it, timer and all."""
+    try:
+        return subprocess.run(["ss", "-tnoH", "state", "established",
+                               f"( sport = :{port} and dport = :{client_port} )"],
+                              capture_output=True, text=True, timeout=5).stdout
+    except (OSError, subprocess.TimeoutExpired):
+        return None
+
+
+def keepalive_probe() -> dict:
+    """Run inside a network namespace of our own: a server with short probes, two
+    bound consoles, one of them silenced by nft as a vanished PSP is (§81)."""
+    try:
+        subprocess.run(["ip", "link", "set", "lo", "up"], check=True,
+                       capture_output=True, timeout=5)
+    except (OSError, subprocess.SubprocessError) as e:
+        return {"skip": f"cannot bring up the namespace's loopback ({e})"}
+    tmp = Path(tempfile.mkdtemp(prefix="lsgauth-keepalive-"))
+    os.environ["WOW2_TCP_KEEPALIVE"] = KEEPALIVE
+    proc = start_server(tmp, False)
+    try:
+        gone, _kg, gone_bound = bound_console("127.0.0.1", PORT, GONE_ACCOUNT, NEW_PASSWORD)
+        stays, ks, stays_bound = bound_console("127.0.0.1", PORT, STAYS_ACCOUNT, NEW_PASSWORD)
+        gport, sport = gone.s.getsockname()[1], stays.s.getsockname()[1]
+        rules = [["nft", "add", "table", "inet", "lsgauth"],
+                 ["nft", "add", "chain", "inet", "lsgauth", "in",
+                  "{ type filter hook input priority 0; }"],
+                 ["nft", "add", "rule", "inet", "lsgauth", "in", "tcp", "sport",
+                  str(gport), "drop"]]
+        for r in rules:
+            if subprocess.run(r, capture_output=True, timeout=5).returncode:
+                return {"skip": "nft cannot add a rule in this namespace"}
+        time.sleep(KEEPALIVE_WAIT)
+        stays.send(lsg_rpc_encrypted(ks, 1, 10, 7)) if ks else None
+        stays_served = bool(ks) and any(kind == "msg" and reply_opens(d, ks)
+                                        for kind, d in stays.frames(timeout=2.0))
+    finally:
+        proc.terminate()
+        out = proc.stdout.read()
+        proc.wait(timeout=10)
+        import shutil
+        shutil.rmtree(tmp, ignore_errors=True)
+    closed = [ln for ln in out.splitlines() if f"127.0.0.1:{gport} closed" in ln]
+    return {"gone_bound": gone_bound, "stays_bound": stays_bound,
+            "gone_closed": closed[0].split("] ", 1)[-1] if closed else "",
+            "stays_closed": any(f"127.0.0.1:{sport} closed" in ln for ln in out.splitlines()),
+            "stays_served": stays_served}
+
+
+def run_keepalive_probe() -> dict:
+    """keepalive_probe() under `unshare -rn`, where an unprivileged namespace is allowed."""
+    try:
+        r = subprocess.run(["unshare", "-rn", sys.executable, str(Path(__file__).resolve()),
+                            "--keepalive-probe"], capture_output=True, text=True, timeout=90)
+    except (OSError, subprocess.TimeoutExpired) as e:
+        return {"skip": f"unshare -rn did not run ({e})"}
+    try:
+        return json.loads(r.stdout.strip().splitlines()[-1])
+    except (IndexError, ValueError):
+        why = (r.stderr.strip().splitlines() or ["no output"])[-1]
+        return {"skip": f"no network namespace of our own here ({why})"}
+
+
 # ---------------------------------------------------------------- the server
 def start_server(tmp: Path, revert: bool) -> subprocess.Popen:
     env = dict(os.environ,
@@ -488,7 +574,11 @@ def main() -> int:
                          "of them should then FAIL, which is what makes them "
                          "worth running")
     ap.add_argument("--keep", action="store_true", help="keep the scratch data dir")
+    ap.add_argument("--keepalive-probe", action="store_true", help=argparse.SUPPRESS)
     args = ap.parse_args()
+    if args.keepalive_probe:
+        print(json.dumps(keepalive_probe()))
+        return 0
     if args.as_account:
         return sign_in_as(args.host, args.port, args.as_account, args.hold,
                           args.bad_key, args.password)
@@ -749,6 +839,33 @@ def main() -> int:
               "kept (a console pings every 40 s)")
         for c in (silent, prov, again, bound):
             c.close()
+
+        # ---- §81: a console that vanishes is dropped, a quiet one is kept ----
+        print("\n  -- a bound console that stops answering is dropped, one that is "
+              "only quiet is kept (§81) --")
+        probed, _kp, probed_served = bound_console(host, PORT, TIMER_ACCOUNT, NEW_PASSWORD)
+        time.sleep(0.3)
+        timer = keepalive_timer(PORT, probed.s.getsockname()[1])
+        if timer is None:
+            print("  (ss is not installed here, so the probe timer cannot be read)")
+        else:
+            check(probed_served and "timer:(keepalive" in timer,
+                  "the server's side of a bound connection carries a keepalive timer "
+                  "(ss -o), so the kernel probes a console that has gone quiet")
+        probed.close()
+        probe = run_keepalive_probe()
+        if "skip" in probe:
+            print(f"  (the namespace half is skipped: {probe['skip']})")
+        else:
+            idle, intvl, cnt = (int(x) for x in KEEPALIVE.split(","))
+            check(probe["gone_bound"] and "stopped answering the keepalive probes"
+                  in probe["gone_closed"],
+                  f"a bound console whose packets stop arriving (nft drops them, as a "
+                  f"PSP put to sleep) is closed within {KEEPALIVE_WAIT:.0f} s with probes "
+                  f"at {idle}+{intvl}x{cnt} s: {probe['gone_closed'] or 'still open'}")
+            check(probe["stays_bound"] and not probe["stays_closed"] and probe["stays_served"],
+                  "CONTROL: a bound console that is only quiet (its kernel answers the "
+                  "probes, as a paused emulator's does) is kept, and served afterwards")
 
     finally:
         proc.terminate()

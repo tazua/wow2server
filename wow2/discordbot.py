@@ -498,7 +498,7 @@ def run_bot(token: str, guild_id: int, desk: Desk, admin_roles: list[str],
             if g is None:
                 failed.append("guild")
                 log(f"!! the bot is not in guild {guild_id}; check [discord] bot_guild and "
-                    f"that the setup bot was added to that server")
+                    f"that this bot was added to that server (its invite: permissions=0, §80h)")
                 await self.close()
                 return
             ids, problems = staff_role_ids(admin_roles, [(r.id, r.name) for r in g.roles])

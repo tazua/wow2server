@@ -1750,6 +1750,32 @@ LSG_NO_KEY_CHECK = os.environ.get("WOW2_LSG_NO_KEY_CHECK") == "1"
 PROOF_HANDLE = os.environ.get("WOW2_NO_PROOF_HANDLE") != "1"
 LSG_MAC = os.environ.get("WOW2_NO_LSG_MAC") != "1"
 BIND_DEADLINE = float(os.environ.get("WOW2_BIND_DEADLINE", "30"))
+TCP_KEEPALIVE = tuple(int(x) for x in os.environ.get("WOW2_TCP_KEEPALIVE", "60,10,6").split(","))
+_KEEPALIVE_UNSET: list[str] = []
+
+
+def keep_alive(sock) -> None:
+    """Have the kernel probe a peer that has gone quiet and drop it when nothing
+    answers. Nothing is written to a console that has stopped talking, so one
+    that vanishes without a FIN (a PSP put to sleep, its WLAN switched off, its
+    network gone) otherwise stays bound, counted online and hosting for ever;
+    a paused emulator still answers, through its host's kernel (§81)."""
+    if sock is None or TCP_KEEPALIVE[0] <= 0:
+        return
+    idle, intvl, cnt = TCP_KEEPALIVE
+    opts = [(socket.SOL_SOCKET, "SO_KEEPALIVE", 1),
+            (socket.IPPROTO_TCP, "TCP_KEEPIDLE", idle),
+            (socket.IPPROTO_TCP, "TCP_KEEPINTVL", intvl),
+            (socket.IPPROTO_TCP, "TCP_KEEPCNT", cnt),
+            (socket.IPPROTO_TCP, "TCP_USER_TIMEOUT", (idle + intvl * cnt) * 1000)]
+    for level, name, value in opts:
+        try:
+            sock.setsockopt(level, getattr(socket, name), value)
+        except (AttributeError, OSError) as e:
+            if name not in _KEEPALIVE_UNSET:
+                _KEEPALIVE_UNSET.append(name)
+                log(f"!! {name} could not be set ({e}); a console that vanishes without "
+                    f"hanging up may stay counted online")
 
 
 def lsg_mac(key: bytes, plain: bytes) -> bytes:
@@ -3745,6 +3771,7 @@ class AuthConnection(asyncio.Protocol):
             return
         CONNS_PER_IP[self.peer_ip] = live + 1
         self.counted = True
+        keep_alive(transport.get_extra_info("socket"))
         log(f"TCP connect from {self.peer} (console identity {self.ident[0]!r} id={self.ident[1]})")
         self.arm_deadline()
 
@@ -4190,7 +4217,9 @@ class AuthConnection(asyncio.Protocol):
         if self.relay_noted:
             natrelay.RELAY.note_sign_out(self.peer_ip)
             self.relay_noted = False
-        log(f"TCP {self.peer} closed ({exc})")
+        log(f"TCP {self.peer} closed ({exc})"
+            + (f" -- {self.account or 'the peer'} stopped answering the keepalive probes"
+               if isinstance(exc, TimeoutError) else ""))
         if was_lsg:
             sessions_host_gone(self.ident_key)
             if self.account:

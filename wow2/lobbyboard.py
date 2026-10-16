@@ -104,6 +104,7 @@ DEFAULT_TEXT = {
     "announce_text": "{mention} \U0001F3AE **{name}** opened a {mode} lobby ({count}) "
                      "— sign in and join it from Find Game!",
     "closed_text": "~~\U0001F3AE **{name}** opened a {mode} lobby~~ — closed {when}",
+    "started_text": "~~\U0001F3AE **{name}** opened a {mode} lobby~~ — the game started {when}",
     "empty_text": "*No open lobbies. Host one from the Infrastructure menu and it "
                   "appears here.*",
     "online_text": "\U0001F465 **{online}** online — {in_lobby} in a lobby, {playing} "
@@ -117,6 +118,7 @@ TEXT_FIELDS = {
     "announce_text": {"mention": "<@&1>", "name": "x", "mode": "ranked", "count": "1/4",
                       "players": 1, "max": 4},
     "closed_text": {"name": "x", "mode": "ranked", "count": "1/4", "when": "<t:0:R>"},
+    "started_text": {"name": "x", "mode": "ranked", "count": "1/4", "when": "<t:0:R>"},
     "empty_text": {"when": "<t:0:R>"},
     "online_text": {"online": 5, "waiting": 1, "in_lobby": 2, "playing": 2, "lobbies": 1,
                     "games": 1, "when": "<t:0:R>"},
@@ -238,8 +240,8 @@ def render_announcement(mention: str, name: str, ranked: bool, n: int, mx: int,
 
 
 def render_closed(name: str, ranked: bool, now: float, n: int = 0, mx: int = 0,
-                  text: dict | None = None) -> str:
-    tmpl = (text or DEFAULT_TEXT)["closed_text"]
+                  text: dict | None = None, key: str = "closed_text") -> str:
+    tmpl = (text or DEFAULT_TEXT)[key]
     return tmpl.format(name=discord_name(name), mode="ranked" if ranked else "friendly",
                        count=count_text(n, mx), when=f"<t:{int(now)}:R>").strip()[:CONTENT_MAX]
 
@@ -608,7 +610,7 @@ class LobbyBoard(Board):
     """Who is online and the live session list, and the announcements, on one
     worker."""
 
-    KEEP = ("close",)
+    KEEP = ("close", "start")
 
     def __init__(self) -> None:
         super().__init__()
@@ -696,6 +698,13 @@ class LobbyBoard(Board):
             return
         self._queue(("close", int(sid), "", False, "", 0, 0, None))
 
+    def started(self, sid: int) -> None:
+        """A session's game started, and it left the search (§79): strike its
+        announcement through as started."""
+        if not self.enabled or not self.announce_url:
+            return
+        self._queue(("start", int(sid), "", False, "", 0, 0, None))
+
     def _on_start(self) -> None:
         if self.announce_url:
             self._call("GET", self.announce_url, None)    # a deleted webhook answers 404 now, not at the first lobby
@@ -718,13 +727,14 @@ class LobbyBoard(Board):
             if self._edit(self.announce_url, mid,
                           {"content": text, "allowed_mentions": NO_PINGS}) == 200:
                 self._notes[sid] = (mid, name, ranked, n, mx)
-        elif kind == "close":
+        elif kind in ("close", "start"):
             note = self._notes.get(sid)       # kept: a re-host inside the cooldown edits it back
             if note:
                 mid, name, ranked, n, mx = note
+                key = "closed_text" if kind == "close" else "started_text"
                 self._edit(self.announce_url, mid,
                            {"content": render_closed(name, ranked, time.time(), n, mx,
-                                                     self.text),
+                                                     self.text, key),
                             "allowed_mentions": NO_PINGS})
 
 
@@ -888,6 +898,10 @@ class Fanout:
     def closed(self, sid: int) -> None:
         for b in self.boards:
             b.closed(sid)
+
+    def started(self, sid: int) -> None:
+        for b in self.boards:
+            b.started(sid)
 
     def scored(self, board_id: int) -> None:
         for b in self.leaders:

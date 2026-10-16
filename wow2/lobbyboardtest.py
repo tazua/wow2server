@@ -388,6 +388,30 @@ def run(keep: bool) -> int:
         b.closed(0x9999)
         b.flush(3)
         check(fake.calls == [], "closing a session that was never announced sends nothing")
+        b.opened(rec(0x5740, "player4", host="player4", ip="10.9.9.4"))
+        b.flush(3)
+        game_id = str(fake.next_id)
+        fake.reset()
+        b.started(0x5740)
+        b.flush(3)
+        edits = fake.of("PATCH", LFG_HOOK)
+        c = edits[0][2]["content"] if edits else ""
+        check(len(edits) == 1 and edits[0][1].endswith(f"/messages/{game_id}")
+              and c.startswith("~~") and "the game started <t:" in c and "<@&" not in c
+              and edits[0][2]["allowed_mentions"] == {"parse": []} and not fake.of("POST"),
+              "a lobby whose game started is struck through as started, the mention gone: "
+              "the search no longer offers it (§79), so nobody is told to fall in (§82)")
+        fake.reset()
+        b.closed(0x5740)
+        b.flush(3)
+        edits = fake.of("PATCH", LFG_HOOK)
+        check(len(edits) == 1 and edits[0][1].endswith(f"/messages/{game_id}")
+              and "closed <t:" in edits[0][2]["content"],
+              "...and when the host deletes it after the game, the same message says closed")
+        fake.reset()
+        b.started(0x9998)
+        b.flush(3)
+        check(fake.calls == [], "a game starting in a lobby that was never announced sends nothing")
         time.sleep(0.7)
         fake.reset()
         b.opened(sessions[0x5701])
@@ -459,6 +483,7 @@ def run(keep: bool) -> int:
                            ip=f"10.8.{i // 250}.{i % 250}"))
         for i in range(1000):
             b10.closed(0x6300 + i)
+        b10.started(0x6200)
         b10.closed(0x6200)
         waiting = len(b10._events)
         check(waiting <= cap and getattr(b10, "dropped", 0) > 0
@@ -467,10 +492,11 @@ def run(keep: bool) -> int:
               f"({waiting} did), and one '!!' line says how many were dropped")
         b10.flush(10)
         struck = [c for c in fake.of("PATCH", LFG_HOOK)
-                  if c[1].endswith(f"/messages/{keeper_id}") and "closed" in c[2]["content"]]
-        check(bool(struck),
-              "...and a close waiting behind them is kept: the first lobby's "
-              "announcement is struck through")
+                  if c[1].endswith(f"/messages/{keeper_id}")]
+        check([c for c in struck if "the game started" in c[2]["content"]]
+              and [c for c in struck if "closed" in c[2]["content"]],
+              "...and a start and a close waiting behind them are kept: the first lobby's "
+              "announcement is struck through as started, then as closed")
         fake.delay = 0.0
         b10.stop(3)
 
@@ -616,18 +642,21 @@ def run(keep: bool) -> int:
         print("-- the poster's voice")
         sarge = {"announce_text": "{mention} Listen up! {name} opened a {mode} lobby, {count}. Move it!",
                  "closed_text": "At ease. {name}'s {mode} lobby closed {when}.",
+                 "started_text": "{name}'s {mode} lobby ({count}) moved out {when}.",
                  "empty_text": "Nothing on the board. Host one, recruit.",
                  "offline_text": "Server down since {when}. Stand by."}
         b5 = lobbyboard.LobbyBoard()
         bad = b5.configure(fake.url(BOARD_HOOK), fake.url(LFG_HOOK), "<@&7>", "Sitrep", sarge)
         check(bad == [] and b5.text == {**lobbyboard.DEFAULT_TEXT, **sarge},
-              "four templates from the config replace the defaults")
+              "five templates from the config replace the defaults")
         a = lobbyboard.render_announcement("<@&7>", "player1", True, 1, 4, b5.text)
         c = lobbyboard.render_closed("player1", False, 1_700_000_000, 2, 4, b5.text)
+        g = lobbyboard.render_closed("player1", False, 1_700_000_000, 1, 2, b5.text, "started_text")
         e = lobbyboard.render_board("Sitrep", (), "up", 1_700_000_000, b5.text)["description"]
         o = lobbyboard.render_board("Sitrep", (), "offline", 1_700_000_000, b5.text)["description"]
         check(a == "<@&7> Listen up! player1 opened a ranked lobby, 1/4. Move it!"
               and c == "At ease. player1's friendly lobby closed <t:1700000000:R>."
+              and g == "player1's friendly lobby (1/2) moved out <t:1700000000:R>."
               and e.split("\n")[2] == "Nothing on the board. Host one, recruit."
               and o == "Server down since <t:1700000000:R>. Stand by.",
               "...and every field fills in: mention, name, mode, count, when")
@@ -656,16 +685,17 @@ def run(keep: bool) -> int:
               and "lobbyboard.BOARD.refresh(SESSIONS, online_count())" in src,
               "authserver imports the board and refreshes it with the session table and "
               "the number of consoles signed in")
-        check(src.count("board_refresh()") - 1 == 7
+        check(src.count("board_refresh()") - 1 == 8
               and src.count("lobbyboard.BOARD.closed(") == 3
+              and src.count("lobbyboard.BOARD.started(") == 1
               and src.count("lobbyboard.BOARD.opened(") == 1
               and src.index("board_refresh()", src.index("def complete_bind(")) <
               src.index("def data_received(")
               and src.index("board_refresh()", src.index("def connection_lost(")) <
               src.index("# ----", src.index("def connection_lost(")),
-              "...create, update, delete, host-gone, a game started, a bind completed and a "
-              "bound connection lost all refresh; create announces; delete, host-gone and "
-              "a replaced session close")
+              "...create, update, delete, host-gone, a game started, a joiner counted in it, "
+              "a bind completed and a bound connection lost all refresh; create announces; "
+              "delete, host-gone and a replaced session close; a start strikes through")
         said = []
         authserver.log = said.append
         Conn = type("Conn", (), {})
@@ -677,28 +707,78 @@ def run(keep: bool) -> int:
                                      "10.0.0.9": conn(None, authenticated=False)})
         check(authserver.online_count() == 2,
               "online_count() is the bound LSG connections; a provisional one (§60) is not in")
+        struck = []
+        Stub = type("Stub", (), {"refresh": lambda self, *a: None,
+                                 "started": lambda self, sid: struck.append(sid)})
+        real_board, authserver.lobbyboard.BOARD = authserver.lobbyboard.BOARD, Stub()
+
+        def lobby(sid, host, players, mx, shown=(), before=0):
+            authserver.SESSIONS[sid] = {"id": sid, "name": host, "host": host, "players": players,
+                                        "max_players": mx, "points": 0,
+                                        "created": 1_700_000_000, "shown": set(shown),
+                                        "players_before": before}    # what §78's op 2 kept
+            return authserver.SESSIONS[sid]
+
         authserver.SESSIONS.clear()
-        live = {"id": 0x5731, "name": "player1", "host": "player1", "players": 4, "max_players": 4,
-                "players_before": 2, "points": 0, "created": 1_700_000_000}
-        authserver.SESSIONS[0x5731] = live
-        authserver.host_reported_game("player2", 8, 9)
+        live = lobby(0x5731, "player1", 2, 2, {"player2"}, 1)
+        authserver.game_reported("player3", 8, 8)
         check(not live.get("started"), "a game reported by somebody who is not the host changes nothing")
-        authserver.host_reported_game("player1", 8, 9)
-        check(live.get("started") and live.get("playing") == 2
-              and any("session STARTED" in m and "2 playing" in m for m in said),
-              "the host's board 1 going up by one starts the session, with the players it "
-              "advertised before the start's own 4/4 (§63d), and says so in the log")
+        authserver.game_reported("player1", 8, 9)
+        check(live.get("started") and live.get("playing") == 1 and struck == [0x5731]
+              and any("session STARTED" in m and "1 playing" in m for m in said),
+              "the host's board 1 going up by one starts the session with the host in it, "
+              "strikes its announcement through, and says so in the log")
+        authserver.game_reported("player2", 4, 5)
+        check(live.get("playing") == 2
+              and any("player2 is in the game too; 2 playing" in m for m in said),
+              "a lobby the joins filled (2/2, no re-publish at the start): the joiner's own "
+              "board 1 a moment later counts it -- 2 playing, not the 1 the VPS showed (§82)")
+        authserver.game_reported("player2", 4, 5)
+        check(live.get("playing") == 2, "...and the same joiner twice is one player")
         said.clear()
-        authserver.host_reported_game("player1", 9, 9)
-        check(live.get("started") and any("session FINISHED" in m for m in said),
-              "...the same score again is logged as the finish; the session stays until "
-              "the host deletes it")
-        lobby = {"id": 0x5732, "name": "player2", "host": "player2", "players": 3, "max_players": 4,
-                 "players_before": 2, "points": 1, "created": 1_700_000_000}
-        authserver.SESSIONS[0x5732] = lobby
-        authserver.host_reported_game("player2", 0, 1)
-        check(lobby.get("playing") == 3,
-              "a host whose count never reached the maximum started with the count as it stands")
+        authserver.game_reported("player2", 5, 5)
+        authserver.game_reported("player1", 9, 9)
+        check(live.get("started") and live.get("playing") == 2
+              and [m for m in said if "session FINISHED" in m] and len(said) == 1,
+              "...a joiner's same score again is nothing; the host's is logged as the finish "
+              "and the session stays until the host deletes it")
+        authserver.SESSIONS.clear()
+        three = lobby(0x5732, "player1", 3, 3, {"player2", "player3"}, 2)
+        for who in ("player1", "player2", "player3"):
+            authserver.game_reported(who, 0, 1)
+        check(three.get("playing") == 3, "a 3/3 lobby filled by joins starts with 3 playing "
+              f"(the VPS said 2) ({three.get('playing')})")
+        authserver.SESSIONS.clear()
+        duel = lobby(0x5733, "player1", 4, 4, {"player2", "player4"}, 2)
+        authserver.game_reported("player1", 0, 1)
+        authserver.game_reported("player2", 0, 1)
+        check(duel.get("playing") == 2, "a 1v1 in a 4-max lobby, whose start re-published 4/4 "
+              f"(§63d), is 2 playing ({duel.get('playing')})")
+        authserver.SESSIONS.clear()
+        first = lobby(0x5734, "player1", 2, 2, {"player2"}, 1)
+        other = lobby(0x5735, "player5", 1, 4, {"player2"})
+        authserver.game_reported("player2", 0, 1)
+        check(not first.get("started") and not first.get("playing"),
+              "a joiner's board 1 ahead of its host's starts nothing...")
+        authserver.game_reported("player1", 0, 1)
+        check(first.get("playing") == 2 and not other.get("started"),
+              "...and is counted the moment the host's arrives")
+        for k in other.get("early", {}):
+            other["early"][k] -= authserver.START_BURST + 1
+        authserver.game_reported("player5", 0, 1)
+        check(other.get("playing") == 1, "a joiner's upload older than START_BURST is not "
+              "counted in a game that starts later")
+        authserver.SESSIONS.clear()
+        a = lobby(0x5736, "player1", 2, 4, {"player2", "player6"})
+        b = lobby(0x5737, "player3", 2, 4, {"player6"})
+        authserver.game_reported("player1", 0, 1)
+        authserver.game_reported("player3", 0, 1)
+        authserver.game_reported("player7", 0, 1)
+        authserver.game_reported("player6", 0, 1)
+        check(a.get("playing") == 1 and b.get("playing") == 1,
+              "a console never shown the game, or shown two that started together, is "
+              "counted in neither")
+        authserver.lobbyboard.BOARD = real_board
         authserver.SESSIONS.clear()
         authserver.LSG_CONNS.clear()
         put = src[src.index("def stats_put("):src.index("def read_typed_tail(")]

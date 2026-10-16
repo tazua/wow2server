@@ -234,7 +234,7 @@ server prints what is in force at startup.
 | `discord.lobby_webhook` | unset | a Discord webhook URL; the channel gets one message that always shows who is online, the open lobbies and the games in progress. See Discord |
 | `discord.announce_webhook`, `discord.mention` | unset | a webhook URL that gets a message when a lobby opens, and what to put in front of it (`<@&ROLE_ID>` or `@here`) |
 | `discord.title` | `Open lobbies` | the board's heading |
-| `discord.announce_text`, `closed_text`, `empty_text`, `offline_text`, `online_text` | built-in wording | templates for what the poster says; the example file lists each one's fields |
+| `discord.announce_text`, `closed_text`, `started_text`, `empty_text`, `offline_text`, `online_text` | built-in wording | templates for what the poster says; the example file lists each one's fields |
 | `discord.announce_cooldown` | `300` | seconds before the same host pings again; inside it a new lobby edits the previous announcement back to open. The host is the account (not the lobby's name), and its address keeps the same window: another account hosting from there inside it is listed, not pinged |
 | `discord.leaderboard_webhook` | unset | a webhook URL; the channel gets one message that always shows the top of the Permanent, Weekly, Monthly and Yearly boards. See Discord |
 | `discord.leaderboard_title`, `leaderboard_rows` | `Leader boards`, `10` | the heading, and rows per board (1 to 25) |
@@ -461,7 +461,8 @@ opened, with full lobbies after the open ones; a game in progress as
 `🎮 **name** — 2 playing — friendly — started 5 minutes ago`, last. A
 game is in progress from the moment its host reports a game started
 (the score every player sends a second after the start) until the host
-ends the session. *No open lobbies* when there is none; *Server offline*
+ends the session, and the players in it are the consoles that sent that
+score. *No open lobbies* when there is none; *Server offline*
 in red on a clean stop. Every sign-in and sign-out, every create,
 update, delete, match start and expiry the server sees repaints it, a
 burst coalesced into one edit two seconds later, so a lobby filling up
@@ -469,15 +470,16 @@ is one edit and not four. The message id is kept in the store, so a
 restart edits the same
 message; a message somebody deleted is re-posted. With `announce_webhook`
 set, each lobby opened is a fresh message (`@role 🎮 **name** opened a
-ranked lobby (1/4)`), struck through when the lobby closes; `mention` is
+ranked lobby (1/4)`), struck through when its game starts (Find Game no
+longer offers it) and again when the lobby closes; `mention` is
 what goes in front, typically a role people give themselves to be pinged.
 A host pings at most once per `announce_cooldown` (five minutes), and so
 does its address;
 inside that window a new lobby from the same host edits the struck-through
 announcement back to open, with the new lobby's mode and count, and an edit
-notifies nobody. All five texts are templates in the
-config (`announce_text`, `closed_text`, `empty_text`, `offline_text`,
-`online_text`), so a
+notifies nobody. All six texts are templates in the
+config (`announce_text`, `closed_text`, `started_text`, `empty_text`,
+`offline_text`, `online_text`), so a
 server whose webhook is a character can give it lines; a template with a
 field that does not exist is named at startup and the built-in wording is
 used.

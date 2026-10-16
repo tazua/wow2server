@@ -670,6 +670,7 @@ def read_typed_tail(r) -> list:
 
 POT_CHECK = os.environ.get("WOW2_NO_POT_CHECK") != "1"
 MATCH_START_WINDOW = 60
+START_BURST = 10
 
 
 def pot_stake(board_id: int, sid: int, entity: int, name: str, before: int,
@@ -801,7 +802,7 @@ def stats_write_upload(dec: dict, who: tuple[str, int] | None = None,
                     f"({before} -> {score}) for session 0x{sid:x}")
     elif board_id == statsdb.GAMES_BOARD:
         before, _rank, _n = stats_get(board_id, entity, name)
-        host_reported_game(peer_ip, before, score)
+        game_reported(peer_ip, before, score)
     stats_put(board_id, entity, score, name, extra)
     return 0, None
 
@@ -929,27 +930,48 @@ def board_refresh() -> None:
     lobbyboard.BOARD.refresh(SESSIONS, online_count())
 
 
-def host_reported_game(host_key: str, before: int, score: int) -> None:
-    """Board 1 from a session's host: one more game started puts the session in
-    progress with the players it had before the start's own re-publish (which
-    says maxPlayers, §63d); the same score again is the match's end (§48)."""
+def game_reported(key: str, before: int, score: int) -> None:
+    """Board 1 from a console (§78, §82). The host's going up by one puts the
+    session it hosts in progress, and every player in the game is one console
+    whose own board 1 went up: the host, and each joiner, counted in the one
+    started game it was shown (§80k's rule) or, arriving first, held for
+    START_BURST. The host's same score again is the match's end (§48)."""
+    now = time.time()
+    hosted = False
     for sid, rec in SESSIONS.items():
-        if rec.get("host") != host_key:
+        if rec.get("host") != key:
             continue
+        hosted = True
         if score > before and (not rec.get("started") or rec.get("finished")):
-            n = rec.get("players") or 0
-            if rec.get("max_players") and n >= rec["max_players"] and rec.get("players_before"):
-                n = rec["players_before"]
-            rec["started"] = int(time.time())
+            early = {k for k, t in rec.pop("early", {}).items() if now - t <= START_BURST}
+            rec["started"] = int(now)
             rec["finished"] = 0
-            rec["playing"] = int(n)
+            rec["in_game"] = {key} | early
+            rec["playing"] = len(rec["in_game"])
             log(f"  session STARTED: id=0x{sid:x} {rec.get('name')!r} -- its host "
-                f"reports a game started; {n} playing")
+                f"reports a game started; {rec['playing']} playing")
+            lobbyboard.BOARD.started(sid)
             board_refresh()
         elif score == before and rec.get("started") and not rec.get("finished"):
-            rec["finished"] = int(time.time())
+            rec["finished"] = int(now)
             log(f"  session FINISHED: id=0x{sid:x} {rec.get('name')!r} -- its host "
                 f"reports the game over; the session goes when the host deletes it")
+    if hosted or score <= before:
+        return
+    games = [(sid, rec) for sid, rec in SESSIONS.items()
+             if rec.get("started") and not rec.get("finished")
+             and now - rec["started"] <= MATCH_START_WINDOW and key in rec.get("shown", ())]
+    if len(games) == 1:
+        sid, rec = games[0]
+        rec["in_game"].add(key)
+        rec["playing"] = len(rec["in_game"])
+        log(f"  session 0x{sid:x} {rec.get('name')!r}: {key} is in the game too; "
+            f"{rec['playing']} playing")
+        board_refresh()
+    elif not games:
+        for rec in SESSIONS.values():
+            if (not rec.get("started") or rec.get("finished")) and key in rec.get("shown", ()):
+                rec.setdefault("early", {})[key] = now
 
 
 SHAPE_CHECK = os.environ.get("WOW2_NO_SHAPE_CHECK") != "1"
@@ -1311,7 +1333,6 @@ def sessions_update(dec: dict, peer_ip: str = "", host_key: str = ""):
     if len(ints) > 10:
         rec["max_players"] = ints[10]
     if len(ints) > 1:
-        rec["players_before"] = int(rec.get("players") or 0)
         rec["players"] = ints[1]
     if len(ints) > 6:
         rec["points"] = ints[6]

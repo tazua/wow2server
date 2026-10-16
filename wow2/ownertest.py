@@ -2177,14 +2177,14 @@ def run_search_started_checks(check: Checks) -> None:
                                    "players": 1, "max_players": 4, "info": []}
     n, _ = authserver.sessions_search_results({})
     check(n == 2, f"CONTROL: two open lobbies are both listed ({n})")
-    authserver.host_reported_game("wormy", 0, 1)
+    authserver.game_reported("wormy", 0, 1)
     n, _ = authserver.sessions_search_results({})
     check(n == 1, "a lobby whose host reported a game started is left out of the "
           f"search, so nobody is offered a join the host will refuse ({n})")
-    authserver.host_reported_game("wormy", 1, 1)
+    authserver.game_reported("wormy", 1, 1)
     n, _ = authserver.sessions_search_results({})
     check(n == 2, f"...and listed again once the host reports the game over ({n})")
-    authserver.host_reported_game("wormy", 1, 2)
+    authserver.game_reported("wormy", 1, 2)
     n, _ = authserver.sessions_search_results({})
     check(n == 1, f"...and hidden again when the same session starts its next game ({n})")
     authserver.SESSIONS.clear()
